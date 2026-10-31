@@ -1361,6 +1361,7 @@ class ToolRouter:
                 "price": c.get("price"),
                 "qty": c.get("qty"),
                 "source": c.get("source"),
+                "url": c.get("url"),
                 "score": c.get("score"),
                 "why": c.get("why"),
                 "in_stock": c.get("qty") or None,

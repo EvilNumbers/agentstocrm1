@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import threading
 import secrets
 from dataclasses import dataclass, field
 from typing import Any
@@ -214,10 +215,8 @@ _QTY_WORDS = {
 def qty_in_text(text: str) -> int | None:
     """Количество, названное в просьбе («добавь 2 шт колодок» → 2).
 
-    Зачем: модель регулярно теряла количество, и бот добавлял позицию без него —
-    в сделке появлялось «количество 1000000» (своё значение панели). Число берём
-    только рядом с единицей измерения, иначе номер сделки («сделка 1312») стал бы
-    количеством.
+    Число берём только рядом с единицей измерения, иначе номер сделки
+    («сделка 1312») стал бы количеством.
     """
     source = (text or "").strip()
     if not source:
@@ -812,7 +811,7 @@ SYSTEM_PROMPT = """Правка цены существующей услуги �
    «поставь фильтр за 5200») — ОБЯЗАТЕЛЬНО передай её в параметр price того же вызова
    `draft_add_offer_part`. Не переспрашивай цену, которая уже названа.
    КОЛИЧЕСТВО передавай сразу в том же вызове: «2 шт» → qty=2, «одну» → qty=1.
-   Если количество не названо — qty=1 (не оставляй поле пустым и не пиши 1000000).
+   Если количество не названо — qty=1 (не оставляй поле пустым).
    Если инструмент ответил, что не указана цена продажи, — НЕ ищи позицию заново и не
    спрашивай бренд повторно: просто назови человеку позицию и спроси цену одной строкой.
    Когда он её назовёт, вызови `draft_add_offer_part` с теми же name/brand/sku и price.
@@ -1136,7 +1135,7 @@ class BotPipeline:
         key = user_id or 0
         self._part_pending.pop(key, None)
         for choice in result.choices:
-            if choice.get("kind") == "part" and (choice.get("candidates") or (choice.get("args") or {}).get("sku") or (choice.get("args") or {}).get("name")):
+            if choice.get("kind") == "part" and (choice.get("_group") or choice.get("candidates") or (choice.get("args") or {}).get("sku") or (choice.get("args") or {}).get("name")):
                 self._part_pending[key] = {"choice": choice, "at": time.time()}
                 break
         if len(self._part_pending) > 200:        # простая защита от роста памяти
@@ -1184,7 +1183,7 @@ class BotPipeline:
         self._price_pending.pop(owner, None)
         args = dict(entry.get("args") or {})
         # «800 за 2 шт» — из ответа с ценой берём ещё и количество: человек назвал его
-        # в той же фразе, а раньше оно терялось (в сделке оказывалось «количество 1000000»).
+        # в той же фразе, чтобы названное количество не потерялось.
         if not args.get("qty"):
             qty = qty_in_text(text)
             if qty:
@@ -1257,6 +1256,8 @@ class BotPipeline:
             return None
         choice = entry.get("choice") or {}
         candidates = list(choice.get("candidates") or [])
+        if choice.get("_group"):
+            return await asyncio.to_thread(self._group_reply, choice, text, key)
 
         low = (text or "").strip().lower()
         if low in {"отмена", "отмени", "стоп", "не надо"}:
@@ -1376,6 +1377,18 @@ class BotPipeline:
     def resume_choice(self, choice: dict[str, Any], user_id: int | None,
                       *, user_key: int | None = None) -> PipelineResult:
         """Новый контекст на ответ: цена/артикулы чужого запроса не наследуются."""
+        if choice.get("_group"):
+            with choice['_group']['_lock']:
+                entry = self._part_pending.get(user_key or 0, {})
+                active = entry.get("choice")
+                if active is not choice or time.time() - float(entry.get("at") or 0) > self.to_pending_ttl:
+                    return PipelineResult(answer="Этот выбор устарел; используйте последний вопрос.")
+                picked = next((c for c in choice.get("candidates", []) if c.get("index") == user_id), None)
+                if not picked:
+                    return PipelineResult(answer="Вариант не найден; запись не начата.")
+                state = choice['_group']['items'][choice['_group_index']]
+                state['selected'] = picked
+                return self._group_next(choice['_group'], user_key)
         old_fallback = self.router._fallback_hints
         token = self.router.begin_request()
         try:
@@ -1491,6 +1504,211 @@ class BotPipeline:
         log.info("«%s» → пункт %s из списка = сделка %s", text, index, offer_id)
         return f"покажи подробности сделки {offer_id}"
 
+    def _start_part_group(self, items: list[dict[str, Any]], offer_id: int,
+                          user_id: int | None) -> PipelineResult:
+        """Сначала только чтение и выборы: до окончания вопросов черновиков нет."""
+        from .. import websearch
+        if len({parts.sku_exact(i['sku']) for i in items}) != len(items):
+            return PipelineResult(answer="Один артикул повторяется в заявке. Уточните состав и количество; запись не начата.")
+        states: list[dict[str, Any]] = []
+        unresolved: list[str] = []
+        for item in items:
+            item = dict(item)
+            sku = item['sku']
+            found: dict[str, Any]
+            if item.get('brand'):
+                found = {'status': 'matched', 'best': {'brand': item['brand'], 'sku': sku,
+                         'name': item.get('name') or f"{item['brand']} {sku}", 'source': 'указано человеком'}}
+            else:
+                try:
+                    found = self.tools.resolve_part(query=sku, sku=sku, offer_id=offer_id, allow_web=False)
+                except Exception as exc:  # noqa: BLE001
+                    found = {'status': 'not_found', 'candidates': [], 'warnings': [str(exc)]}
+                best = found.get('best')
+                if best and parts.sku_exact(best.get('sku')) != parts.sku_exact(sku):
+                    found = {'status': 'not_found', 'candidates': []}
+                elif found.get('status') == 'ambiguous':
+                    exact_candidates = [c for c in found.get('candidates') or []
+                                        if parts.sku_exact(c.get('sku')) == parts.sku_exact(sku)]
+                    found = {**found, 'candidates': exact_candidates,
+                             'status': 'ambiguous' if exact_candidates else 'not_found'}
+                if (found.get('status') == 'not_found' and len(parts.normalize_sku(sku)) >= 4
+                        and any(ch.isdigit() for ch in sku)
+                        and not parts.is_viscosity(sku) and not parts.is_probably_year(sku)):
+                    unresolved.append(sku)
+            states.append({'item': item, 'found': found, 'selected': None, 'skipped': False})
+        web_errors: list[str] = []
+        for start in range(0, len(unresolved), 4):
+            articles = unresolved[start:start + 4]
+            try:
+                hits = websearch.search_batch(articles)
+            except (websearch.WebSearchError, ValueError) as exc:
+                web_errors.append(str(exc))
+                # Не обращаться к другим поисковикам и не добивать оставшиеся группы.
+                break
+            raw_hits = [{'title': h.title, 'snippet': h.snippet, 'url': h.url, 'site': h.site} for h in hits]
+            for state in states:
+                sku = state['item']['sku']
+                if sku not in articles:
+                    continue
+                brands = parts.brands_from_hits(raw_hits, sku)
+                candidates = [{'brand': b['brand'], 'sku': sku,
+                               'name': b.get('name_hint') or f"{b['brand']} {sku}",
+                               'source': 'интернет', 'why': b['why'], 'url': b['url'],
+                               'evidence_score': b['score']} for b in brands]
+                ranked = parts.rank_candidates(sku, candidates, sku=sku)
+                if ranked:
+                    state['found'] = {'status': 'ambiguous', 'candidates': ranked}
+        group = {'offer_id': offer_id, 'items': states, 'web_errors': web_errors, '_lock': threading.RLock()}
+        self._part_batch.pop(user_id or 0, None)
+        result = self._group_next(group, user_id)
+        if result.choices:
+            summary = ["В заявке сохранены позиции:"]
+            for item in items:
+                qty = item.get('qty') or 1
+                price = item.get('price')
+                summary.append(f"• {item['sku']}: {qty} шт" + (f" × {_money_text(price)} ₽" if price is not None else " · цена не названа"))
+            result.answer = "\n".join(summary) + "\n\n" + result.answer
+        return result
+
+    def _group_next(self, group: dict[str, Any], user_id: int | None) -> PipelineResult:
+        for index, state in enumerate(group['items']):
+            item, found = state['item'], state['found']
+            if state.get('skipped'):
+                continue
+            if state.get('selected') is None:
+                if found.get('status') == 'matched' and found.get('best'):
+                    state['selected'] = dict(found['best'])
+                else:
+                    outcome = self.router._part_choice(tool=PART_TOOL,
+                        args={'offer_id': group['offer_id'], 'name': item['sku'], 'sku': item['sku'],
+                              'price': item.get('price'), 'qty': item.get('qty')},
+                        candidates=found.get('candidates') or [], query=item['sku'],
+                        status=found.get('status') or 'not_found', tried=found.get('tried') or [])
+                    assert outcome.choice is not None
+                    choice = outcome.choice
+                    choice['_group'] = group
+                    choice['_group_index'] = index
+                    choice['_group_step'] = 'part'
+                    if group.get('web_errors') and not choice['candidates']:
+                        choice['question'] += " Интернет-поиск не завершился или временно ограничен; это не доказывает отсутствие товара."
+                    result = PipelineResult(answer=choice['question'], choices=[choice])
+                    self._track_part(result, user_id)
+                    return result
+            if item.get('price') is None:
+                choice = {'kind': 'part', 'tool': PART_TOOL, 'args': {'sku': item['sku']},
+                          'candidates': [], '_group': group, '_group_index': index,
+                          '_group_step': 'price',
+                          'question': f"Назовите цену продажи для {item['sku']} (за штуку). Остальные данные сохранены."}
+                result = PipelineResult(answer=choice['question'], choices=[choice])
+                self._track_part(result, user_id)
+                return result
+        selected = [state for state in group['items'] if not state.get('skipped')]
+        if not selected:
+            self._part_pending.pop(user_id or 0, None)
+            return PipelineResult(answer="Все позиции пропущены. В CRM ничего не записано.")
+        from ..drafts import BATCH_PREPARING
+        token = BATCH_PREPARING.set(True)
+        drafts: list[dict[str, Any]] = []
+        try:
+            for state in selected:
+                item, chosen = state['item'], state['selected']
+                draft = self.tools.draft_add_offer_part(offer_id=group['offer_id'],
+                    name=chosen.get('name') or item['sku'], sku=item['sku'],
+                    brand=chosen.get('brand'), qty=item.get('qty') or 1, price=item['price'], source='manual')
+                if chosen.get('source') in ('вручную по данным человека', 'указано человеком'):
+                    warning = "; ".join(x for x in (str(draft.get('warning') or ''), "Данные указаны человеком; каталог и применяемость не подтверждены.") if x)
+                    draft = self.tools.drafts.mark(draft['token'], 'pending', warning=warning)
+                drafts.append(draft)
+            merged = self.tools.merge_part_drafts(drafts)
+            if len(self.tools._checks_of(merged)) != len(selected):
+                raise ValueError("Не удалось объединить все позиции в один черновик")
+            merged = self.tools.drafts.mark(merged['token'], 'pending', batch_preparing=False)
+        except Exception as exc:  # noqa: BLE001 — промежуточные черновики заблокированы
+            for draft in drafts:
+                try:
+                    if self.tools.drafts.get(draft['token']).get('status') == 'pending':
+                        self.tools.drafts.mark(draft['token'], 'discarded', reason='сборка заявки не завершена')
+                except (KeyError, ValueError):
+                    pass
+            self._part_pending.pop(user_id or 0, None)
+            return PipelineResult(answer=f"Не удалось собрать всю заявку: {exc}. Запись в CRM не начата.")
+        finally:
+            BATCH_PREPARING.reset(token)
+        self._part_pending.pop(user_id or 0, None)
+        self._part_batch[user_id or 0] = {'token': merged['token'], 'offer_id': group['offer_id'], 'at': time.time()}
+        if self.router.policy.requires_confirmation(PART_TOOL):
+            return PipelineResult(answer="Все позиции подготовлены в одном черновике. Проверьте и подтвердите.", drafts=[merged])
+        applied = self.router._apply_now(merged, tool=PART_TOOL)
+        if applied.get('ok'):
+            return PipelineResult(answer="Результат записи требует проверки." if applied.get('warning') else "Заявка выполнена и проверена.", applied=[{**merged, **applied, 'mode': 'auto'}])
+        saved = self.tools.drafts.get(merged['token'])
+        return PipelineResult(answer="Запись остановлена: " + str(applied.get('error') or 'требуется проверка') + " Не повторяйте заявку вслепую; проверьте /drafts.", drafts=[saved])
+
+    def _group_reply(self, choice: dict[str, Any], value: str, user_id: int | None) -> PipelineResult:
+        with choice['_group']['_lock']:
+            entry = self._part_pending.get(user_id or 0, {})
+            if entry.get("choice") is not choice or time.time() - float(entry.get("at") or 0) > self.to_pending_ttl:
+                return PipelineResult(answer="Этот выбор устарел; используйте последний вопрос.")
+            return self._group_reply_locked(choice, value, user_id)
+
+    def _group_reply_locked(self, choice: dict[str, Any], value: str, user_id: int | None) -> PipelineResult:
+        group = choice['_group']
+        low = value.strip().lower()
+        if low in {'отмена', 'отмени', 'стоп', 'не надо', 'cancel'}:
+            self._part_pending.pop(user_id or 0, None)
+            return PipelineResult(answer="Заявка отменена. В CRM ничего не записано.")
+        if choice['_group_step'] == 'offer':
+            deal = money_text.deal_in_text(value)
+            if deal is None and re.fullmatch(r"\d{1,9}", low):
+                deal = int(low)
+            if not deal:
+                return PipelineResult(answer=choice['question'], choices=[choice])
+            return self._start_part_group(group['raw_items'], deal, user_id)
+        state = group['items'][choice['_group_index']]
+        item = state['item']
+        if low in {'пропусти', 'пропустить', 'дальше', 'следующий', 'skip'}:
+            state['skipped'] = True
+            return self._group_next(group, user_id)
+        if choice['_group_step'] == 'price':
+            price = parse_price(value)
+            if price is None or price <= 0:
+                return PipelineResult(answer=choice['question'], choices=[choice])
+            item['price'] = price
+            return self._group_next(group, user_id)
+        if low in {'повтори поиск', 'повторить поиск', 'поищи снова', 'retry'} and not choice['candidates']:
+            from .. import websearch
+            try:
+                hits = websearch.search_batch([item['sku']])
+                raw = [{'title': h.title, 'snippet': h.snippet, 'url': h.url, 'site': h.site} for h in hits]
+                brands = parts.brands_from_hits(raw, item['sku'])
+                candidates = [{'brand': b['brand'], 'sku': item['sku'], 'name': b['name_hint'],
+                               'source': 'интернет', 'why': b['why'], 'url': b['url'],
+                               'evidence_score': b['score']} for b in brands]
+                ranked = parts.rank_candidates(item['sku'], candidates, sku=item['sku'])
+                state['found'] = {'status': 'ambiguous' if ranked else 'not_found', 'candidates': ranked}
+                result = self._group_next(group, user_id)
+                if not ranked:
+                    result.answer = 'Точных новых вариантов нет; повторный запрос может использовать недавний кэш. ' + result.answer
+                return result
+            except websearch.WebSearchError:
+                return PipelineResult(answer="Поиск временно недоступен или ограничен. Автоматически не повторяю; можно указать бренд или выбрать ручное добавление.", choices=[choice])
+        if low in {'добавь как указано', 'добавить как указано', 'manual'} and not choice['candidates']:
+            state['selected'] = {'sku': item['sku'], 'brand': item.get('brand'), 'name': item.get('name') or item['sku'], 'source': 'вручную по данным человека'}
+        else:
+            picked = self._pick_candidate(choice['candidates'], value)
+            if picked:
+                state['selected'] = picked
+            else:
+                brand = parts.find_brand_in_text(value)
+                if not brand and re.fullmatch(r'[A-Za-z][A-Za-z&-]{2,40}', value.strip()) and value.strip().lower() not in parts._NOT_BRAND:
+                    brand = value.strip().upper()
+                if brand and not choice['candidates']:
+                    state['selected'] = {'sku': item['sku'], 'brand': brand, 'name': f"{brand} {item['sku']}", 'source': 'указано человеком'}
+                else:
+                    return PipelineResult(answer=choice['question'], choices=[choice])
+        return self._group_next(group, user_id)
+
     def _direct_parts(self, text: str, user_id: int | None) -> PipelineResult | None:
         """Несколько артикулов из одной фразы — черновики без модели.
 
@@ -1547,8 +1765,22 @@ class BotPipeline:
             # (скриншот 30.10: «Добавь артикулы Pc2031…» после карточки сделки 1313).
             seen = self._last_offer.get(user_id or 0)
             if not seen:
-                return None                   # сделка неизвестна — пусть разбирается обычный путь
+                if len(items) < 2:
+                    return None
+                if re.search(r"поставщик|закупк|закупочн", source, re.I):
+                    return PipelineResult(answer="Для заказа у поставщика или с закупочной ценой укажите позиции отдельными запросами с поставщиком и закупочной ценой. Свободную заявку вместо заказа не создаю; в CRM ничего не записано.")
+                group = {'raw_items': items, '_lock': threading.RLock()}
+                choice: dict[str, Any] = {'kind': 'part', 'tool': PART_TOOL, 'args': {}, 'candidates': [],
+                          '_group': group, '_group_step': 'offer',
+                          'question': 'В какую сделку добавить все указанные позиции? Напишите номер сделки.'}
+                result = PipelineResult(answer=choice['question'], choices=[choice])
+                self._track_part(result, user_id)
+                return result
             offer_id = int(seen)
+        if len(items) > 1:
+            if re.search(r"поставщик|закупк|закупочн", source, re.I):
+                return PipelineResult(answer="Для заказа у поставщика или с закупочной ценой укажите позиции отдельными запросами с поставщиком и закупочной ценой. Свободную заявку вместо заказа не создаю; в CRM ничего не записано.")
+            return self._start_part_group(items, offer_id, user_id)
         def explicit(item: dict[str, Any]) -> dict[str, Any] | None:
             if not item.get("brand"):
                 return None
@@ -2224,9 +2456,9 @@ class BotPipeline:
                 del history[: max(0, len(history) - self.s.max_history_messages)]
                 return tag
 
-        # Несколько артикулов в одной просьбе разбираем сами: модели на это нужны
-        # секунды и несколько шагов, а теряла она вторую позицию постоянно.
-        if self.fastpath:
+        # Безопасность общей заявки не зависит от переключателя быстрых ответов.
+        # При TG_FASTPATH=0 одиночные позиции остаются на обычном пути модели.
+        if self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text)):
             direct = await asyncio.to_thread(self._direct_parts, text, user_id)
             if direct is not None:
                 history.append({"role": "user", "content": text})

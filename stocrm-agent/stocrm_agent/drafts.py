@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import contextlib
+import builtins
+from contextvars import ContextVar
 import hashlib
 import logging
 import json
@@ -24,6 +26,8 @@ except ImportError:  # pragma: no cover — Windows
     fcntl = None  # type: ignore[assignment]
 
 log = logging.getLogger("stocrm.drafts")
+
+BATCH_PREPARING: ContextVar[bool] = ContextVar("batch_preparing", default=False)
 
 PENDING = "pending"
 APPLIED = "applied"
@@ -203,6 +207,8 @@ class DraftStore:
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         token = f"draft_{secrets.token_hex(4)}"
+        if BATCH_PREPARING.get():
+            extra = {**(extra or {}), "batch_preparing": True}
         draft = {
             "token": token,
             "tool": tool,
@@ -339,6 +345,9 @@ class DraftStore:
         drop = [
             token for token, draft in self._data.items()
             if draft.get("status") not in (PENDING, PARTIAL)
+            and not draft.get("archived_partial")
+            and not (draft.get("check_warning") and not (draft.get("review") or {}).get("verified"))
+            and not (draft.get("status") == DISCARDED and draft.get("done_steps"))
             and float(draft.get("created_at") or 0) < cutoff
         ]
         for token in drop:
@@ -380,12 +389,47 @@ class DraftStore:
             self._save()
             return draft
 
+    @staticmethod
+    def _part_items(draft: dict[str, Any]) -> builtins.list[dict[str, Any]]:
+        check = draft.get("check") or {}
+        items = check.get("items") if check.get("kind") == "added_lines" else [check]
+        return [item for item in (items or []) if isinstance(item, dict) and item.get("kind", "added_line") == "added_line"]
+
+    def _assert_part_unblocked_unlocked(self, draft: dict[str, Any]) -> None:
+        from . import parts
+        if draft.get("tool") != "add_offer_part":
+            return
+        items = self._part_items(draft)
+        for token, other in self._data.items():
+            if token in {draft.get("token"), draft.get("queue_parent"), draft.get("recovery_parent")} or other.get("queue_parent"):
+                continue
+            status = other.get("status")
+            legacy_warning = bool(other.get("check_warning") and not (other.get("review") or {}).get("verified"))
+            archived_unknown = status == DISCARDED and bool(other.get("archived_partial") or other.get("done_steps") or legacy_warning)
+            if other.get("tool") != "add_offer_part" or not (status in (PARTIAL, APPLYING) or archived_unknown or (status == APPLIED and legacy_warning)):
+                continue
+            for item in items:
+                for blocked in self._part_items(other):
+                    offer, old_offer = str(item.get("offer_id") or ""), str(blocked.get("offer_id") or "")
+                    if offer and old_offer and offer != old_offer:
+                        continue
+                    sku, old_sku = parts.sku_exact(str(item.get("sku") or "")), parts.sku_exact(str(blocked.get("sku") or ""))
+                    # Неопознанный артикул в этой сделке не должен обходить блокировку.
+                    if not sku or not old_sku or sku == old_sku:
+                        raise ValueError("По этой сделке и позиции уже есть незавершённая или непроверенная попытка. Не повторяйте добавление: сначала проверьте CRM и /drafts.")
+
+    def assert_part_unblocked(self, check: dict[str, Any]) -> None:
+        with self._locked():
+            self._assert_part_unblocked_unlocked({"tool": "add_offer_part", "check": check})
+
     def archive(self, token: str) -> dict[str, Any]:
         """Убрать из списка, не отменяя и не удаляя ничего в CRM."""
         with self._locked():
             draft = self._get_unlocked(token)
             if draft["status"] not in (PENDING, PARTIAL, EXPIRED):
                 raise ValueError("Этот черновик уже закрыт или применяется; архивирование запрещено")
+            if draft["status"] == PARTIAL:
+                draft["archived_partial"] = True
             draft["status"] = DISCARDED
             self._save()
             return dict(draft)
@@ -393,9 +437,11 @@ class DraftStore:
     def resolve_partial(self, token: str, review: dict[str, Any]) -> dict[str, Any]:
         with self._locked():
             draft = self._get_unlocked(token)
-            if draft["status"] != PARTIAL or not review.get("verified"):
+            legacy = (draft.get("status") in (APPLIED, DISCARDED) and not (draft.get("review") or {}).get("verified")
+                      and (draft.get("check_warning") or (draft.get("status") == DISCARDED and draft.get("done_steps") and not draft.get("merged_into"))))
+            if (draft["status"] != PARTIAL and not draft.get("archived_partial") and not legacy) or not review.get("verified"):
                 raise ValueError("Черновик не может быть подтверждён без свежей проверки CRM")
-            draft.update(status=APPLIED, applied_at=time.time(), review=review)
+            draft.update(status=APPLIED, applied_at=time.time(), review=review, archived_partial=False)
             self._save()
             return dict(draft)
 
@@ -435,6 +481,9 @@ class DraftStore:
         """
         with self._locked():
             draft = self._verify_unlocked(token)
+            if draft.get("batch_preparing"):
+                raise ValueError("Заявка ещё собирается; применять отдельные позиции нельзя.")
+            self._assert_part_unblocked_unlocked(draft)
             draft["status"] = APPLYING
             draft["claimed_at"] = time.time()
             self._save()

@@ -104,15 +104,33 @@ class DraftRecoveryMixin:
             ]
             verified = False
             actual = None
+            # Совпавшая старая строка не доказывает, что шаг был отправлен или
+            # создал новую строку. Нужен ID именно из ответа соответствующего шага.
+            from .tools import _named_value
+            results = draft.get("result")
+            span = ((positions[number].get("steps") if number < len(positions) else None)
+                    or ([0, len(steps) - 1] if len(checks) == 1 and steps else None))
+            returned_id = None
+            if isinstance(results, list) and isinstance(span, list) and len(span) == 2 and isinstance(span[1], int) and 0 <= span[1] < len(results):
+                returned_id = _named_value(results[span[1]], "ORDER_ID")
+            elif len(steps) == 1 and len(checks) == 1:
+                returned_id = _named_value(results, "ORDER_ID")
             if len(matches) == 1:
                 row = matches[0]
                 try:
                     price = float(str(row["PRICE"]).replace(",", "."))
-                    qty = float(row["QUANTITY"])
-                    verified = abs(
-                        price - float(item["price"])
-                    ) < 0.01 and qty == float(item.get("qty", 1))
-                    actual = f"{price:g} ₽ × {qty:g}"
+                    qty_value = row.get("QUANTITY_CURRENT")
+                    if qty_value is None:
+                        qty_value = row.get("QUANTITY")
+                    qty = float(qty_value) if qty_value is not None and not isinstance(qty_value, bool) else float("nan")
+                    verified = (bool(returned_id) and str(row.get("ORDER_ID")) == str(returned_id)
+                                and execution != "запись этой позиции не запускалась"
+                                and abs(price - float(item["price"])) < 0.01
+                                and qty == float(item.get("qty", 1)))
+                    if qty == float(item.get("qty", 1)):
+                        actual = f"{price:g} ₽ × {qty:g}"
+                    else:
+                        actual = f"{price:g} ₽; количество не подтверждено"
                 except (ValueError, TypeError, KeyError):
                     pass
             details.append(
@@ -133,7 +151,9 @@ class DraftRecoveryMixin:
 
     def confirm_draft_result(self: Any, token: str) -> dict[str, Any]:
         draft = self.drafts.get(token)
-        if draft.get("status") != "partial":
+        legacy = (draft.get("status") in ("applied", "discarded") and not (draft.get("review") or {}).get("verified")
+                  and (draft.get("check_warning") or (draft.get("status") == "discarded" and draft.get("done_steps") and not draft.get("merged_into"))))
+        if draft.get("status") != "partial" and not draft.get("archived_partial") and not legacy:
             raise ValueError(
                 "Подтвердить проверкой можно только черновик, требующий проверки"
             )

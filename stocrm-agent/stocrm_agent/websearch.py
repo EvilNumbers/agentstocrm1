@@ -54,7 +54,7 @@ ENGINE_COOLDOWN = 60.0
 BRAND_COLLECTION_GRACE = 0.25
 
 
-def _polite_engine(engine: str, query: str, *, limit: int, timeout: float, deadline: float) -> list[Hit]:
+def _polite_engine(engine: str, query: str, *, limit: int, timeout: float, deadline: float, single_request: bool = False) -> list[Hit]:
     """Один запрос к провайдеру одновременно, пауза после CAPTCHA/429, без обхода."""
     with _CACHE_LOCK:
         lock = _ENGINE_LOCKS.setdefault(engine, threading.Lock())
@@ -75,12 +75,16 @@ def _polite_engine(engine: str, query: str, *, limit: int, timeout: float, deadl
         with _CACHE_LOCK:
             _ENGINE_NEXT[engine] = time.monotonic() + ENGINE_INTERVAL
         try:
-            return _by_engine(engine, query, limit=limit, timeout=min(timeout, max(0.01, deadline - time.monotonic())), deadline=deadline)
-        except WebSearchError as exc:
+            if engine in {"brave", "serper"}:
+                return search(query, limit=limit, timeout=min(timeout, max(0.01, deadline - time.monotonic())), deadline=deadline)
+            return _by_engine(engine, query, limit=limit, timeout=min(timeout, max(0.01, deadline - time.monotonic())), deadline=deadline, single_request=single_request)
+        except Exception as exc:
             if re.search(r"\b(?:202|403|429)\b|captcha|капч|антибот|закрыл доступ", str(exc), re.I):
                 with _CACHE_LOCK:
                     _ENGINE_PAUSE[engine] = time.monotonic() + ENGINE_COOLDOWN
-            raise
+            if isinstance(exc, WebSearchError):
+                raise
+            raise WebSearchError(str(exc)) from exc
     finally:
         lock.release()
 
@@ -610,8 +614,9 @@ def _by_engine(
     limit: int,
     timeout: float,
     deadline: float | None = None,
+    single_request: bool = False,
 ) -> list[Hit]:
-    """Один конкретный поисковик."""
+    """Один конкретный поисковик; single_request не пробует запасные URL."""
     if engine == "bing":
         xml = _get(
             "https://www.bing.com/search?" + _urlencode({"q": query, "format": "rss"}),
@@ -627,7 +632,8 @@ def _by_engine(
         return parse_mojeek(page)[:limit]
     if engine == "searx":
         last = "нет доступных инстансов"
-        for instance in searx_instances():
+        instances = searx_instances()
+        for instance in (instances[:1] if single_request else instances):
             if deadline is not None:
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -638,21 +644,25 @@ def _by_engine(
                     f"{instance}/search?" + _urlencode({"q": query}), timeout=timeout
                 )
             except WebSearchError as exc:
+                if single_request or re.search(r"\b(?:202|403|429)\b|captcha|капч|антибот|закрыл доступ", str(exc), re.I):
+                    raise
                 last = str(exc)
                 continue
             if looks_blocked(page):
-                last = f"{instance}: заглушка вместо выдачи"
-                continue
+                raise WebSearchError(f"{instance}: антибот или ограничение")
             hits = parse_ddg(page) or parse_mojeek(page)
             if hits:
                 return hits[:limit]
             last = f"{instance}: пусто"
+        if single_request:
+            return []
         raise WebSearchError(last)
     # DDG: без пауз и повторов после антибота; параллельно уже работают другие провайдеры.
-    for url in (
+    urls = (
         "https://html.duckduckgo.com/html/?" + _urlencode({"q": query, "kl": "ru-ru"}),
         "https://lite.duckduckgo.com/lite/?" + _urlencode({"q": query, "kl": "ru-ru"}),
-    ):
+    )
+    for url in (urls[:1] if single_request else urls):
         if deadline is not None and time.monotonic() >= deadline:
             raise WebSearchError("время на поиск в интернете вышло")
         left = deadline - time.monotonic() if deadline is not None else timeout
@@ -662,6 +672,8 @@ def _by_engine(
         hits = parse_ddg(page)
         if hits:
             return hits[:limit]
+    if single_request:
+        return []
     raise WebSearchError("duckduckgo не отдал выдачу")
 
 
@@ -669,3 +681,50 @@ def _urlencode(values: dict[str, Any]) -> str:
     from urllib.parse import urlencode
 
     return urlencode(values)
+
+
+def search_batch(articles: list[str], *, limit: int = 10) -> list[Hit]:
+    """Одна выдача одного провайдера для не более четырёх артикулов.
+
+    Отсутствие в выдаче не доказывает, что товар не существует. На ограничения
+    отвечаем паузой, без переключения движков или обхода защиты.
+    """
+    from . import parts
+    values = list(dict.fromkeys(str(x).strip() for x in articles if parts.sku_exact(str(x))))
+    if not values or len(values) > 4:
+        raise ValueError("В одном поисковом запросе допускается от одного до четырёх артикулов")
+    if not enabled() or not available():
+        raise WebSearchError("Интернет-поиск выключен или временно приостановлен")
+    query = "(" + " OR ".join('"' + re.sub(r'[^A-Za-z0-9./-]', '', x) + '"' for x in values) + ") автозапчасть артикул"
+    kind = provider()
+    # Платные провайдеры обрабатываются штатным API, с теми же паузами.
+    if kind not in {"ddg", "bing", "mojeek", "searx", "brave", "serper"}:
+        raise WebSearchError("Неизвестный провайдер поиска")
+    key = (query, "batch:" + kind, tuple(values))
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+        if cached and time.time() - cached[0] < (CACHE_TTL if cached[1] else 300):
+            return list(cached[1])[:limit]
+        future = _FLIGHTS.get(key)
+        leader = future is None
+        if future is None:
+            future = Future()
+            _FLIGHTS[key] = future
+    deadline = time.monotonic() + budget()
+    if not leader:
+        try:
+            return list(future.result(timeout=budget()))
+        except TimeoutError as exc:
+            raise WebSearchError("Истекло время ожидания общего поиска") from exc
+    try:
+        hits = _polite_engine(kind, query, limit=limit, timeout=DEFAULT_TIMEOUT, deadline=deadline, single_request=True)
+        _remember(key, hits)
+        future.set_result(hits)
+        return list(hits)
+    except Exception as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _CACHE_LOCK:
+            if _FLIGHTS.get(key) is future:
+                _FLIGHTS.pop(key, None)
