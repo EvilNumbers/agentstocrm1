@@ -43,6 +43,29 @@ def read_budget(seconds: float):
 log = logging.getLogger("stocrm.client")
 
 
+def _forbidden_supplier_order(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_forbidden_supplier_order(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    method = str(value.get("method") or "").strip("/").lower()
+    if method == "offer/order/add":
+        return True
+    if method == "offer/order/add_free_order":
+        def unsafe_payload(node: Any) -> bool:
+            if isinstance(node, list):
+                return any(unsafe_payload(item) for item in node)
+            if not isinstance(node, dict):
+                return False
+            forbidden = {"SUPPLIER_ID", "SUPPLIER_NAME", "SUPPLIER_PRICE", "PRICE_SUPP_HUM", "STOCK", "STOCK_ID", "STOCK_IDS", "STOCKS_IDS_SYSTEM", "WAREHOUSE_ID"}
+            return any(str(k).upper() in forbidden or unsafe_payload(v) for k, v in node.items())
+        if unsafe_payload(value.get("payload") or {}):
+            return True
+    return any(_forbidden_supplier_order(v) for v in value.values())
+
+
+
+
 #: Ответы панели «пусто», которые на самом деле НЕ ошибка, а пустая выборка.
 #: STOCRM на часть методов (остатки склада, товары сделки, история заказов) вместо
 #: пустого списка отвечает CODE != 200 с текстом «Не найдено». Раньше бот считал это
@@ -331,6 +354,8 @@ class StocrmClient:
         сделку/строку/задачу. Поэтому запись при сетевой ошибке падает с понятным
         объяснением, а не повторяется молча.
         """
+        if _forbidden_supplier_order({"method": method, "payload": payload or {}}):
+            raise ValueError("Заказ поставщику или небезопасная позиция запрещены; запрос не отправлен")
         url = self._url(method)
         body = {"SID": self._sid, **(payload or {})}
         started = time.monotonic()
@@ -438,6 +463,8 @@ class StocrmClient:
 
     def call_get(self, method: str, params: dict[str, Any] | None = None, *, idempotent: bool = False) -> Any:
         """Документированный GET-вариант; записи не повторяются."""
+        if _forbidden_supplier_order({"method": method, "payload": params or {}}):
+            raise ValueError("Заказ поставщику или небезопасная позиция запрещены; запрос не отправлен")
         started = time.monotonic()
         url = self._url(method)
         query: list[tuple[str, Any]] = [("SID", self._sid)]

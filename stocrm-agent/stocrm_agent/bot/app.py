@@ -320,6 +320,8 @@ def render_part_choice(choice: dict[str, Any]) -> str:
         sources = {str(c.get("source") or "") for c in candidates}
         if any(c.get("source") == "склад" or c.get("stock_records") for c in candidates):
             lines.append("Склад — только справочный поиск; позиция со склада в сделку не привязывается.")
+        if "Росско" in sources:
+            lines.append("Росско — только бренды по артикулу; заказ поставщику не оформляется.")
         if "интернет" in sources:
             lines.append("Варианты из интернета — не подтверждение наличия и применяемости:")
             for number, candidate in enumerate(candidates, 1):

@@ -87,6 +87,18 @@ def run_partcheck(tools: Toolset, query: str) -> list[Check]:
         checks.append(Check(INFO, "Склад: совпадений в проверенной выдаче нет", "Это не доказывает отсутствие позиции на складе."))
     else:
         checks.append(Check(INFO, "Склад: поиск пропущен", "Недостаточно данных для поиска."))
+    rossko = result.get("rossko") or {}
+    state = rossko.get("status")
+    if state == "ok":
+        checks.append(Check(OK, f"Росско: найдено брендов точного артикула: {rossko.get('count', 0)}", "Только поиск, без заказа; цена и остатки не используются."))
+    elif state == "empty":
+        checks.append(Check(INFO, "Росско: точных брендов в ответе нет", "Выдача ограничена и зависит от настроек; это не доказывает отсутствие детали."))
+    elif state == "unavailable":
+        checks.append(Check(WARN, "Росско: поиск не выполнен", "Проверьте локальные настройки, сеть и доступ; отсутствие детали не доказано."))
+    elif state == "disabled":
+        checks.append(Check(INFO, "Росско: поиск отключён", "Для подключения нужны локальные настройки, не отправляйте ключи в чат."))
+    else:
+        checks.append(Check(INFO, "Росско: поиск пропущен", "Нужен корректный артикул."))
     online = result.get("internet")
     if online is not None:
         state = online.get("status")

@@ -29,11 +29,11 @@ from typing import Any
 from contextvars import copy_context
 
 from .client import read_budget
-from . import parts
+from . import parts, rossko
 from .booking import BookingMixin
 from .calendar import CalendarMixin
 from .audit import AuditLog
-from .client import StocrmClient, StocrmError, _as_items
+from .client import StocrmClient, StocrmError, _as_items, _forbidden_supplier_order
 from .contact_search import detail_phones, name_key, phone_key, phone_matches, title_of, unique_phones
 from .draft_recovery import DraftRecoveryMixin, lock_refusal
 from .drafts import DraftStore
@@ -1282,17 +1282,19 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
         Порядок как в документации: сначала `offer/require/add` (создаёт «искомую
         запчасть»), затем `offer/order/add_free_order` для ручного товара.
-        Для source=supplier сохранён offer/order/add. Методы не заменяют друг друга после ошибки.
+        Заказы поставщику и старый метод offer/order/add заблокированы.
         """
         source = (source or "manual").lower()
         if source == "stock":
             raise ValueError(
-                "Со склада запчасти в сделку не подставляем. Выберите source=\"supplier\" "
-                "(заказ у поставщика) или source=\"manual\" (свободная позиция). "
+                "Со склада запчасти в сделку не подставляем. Выберите source=\"manual\" "
+                "(свободная позиция без заказа поставщику). "
                 "Наличие на складе можно показать человеку, но списание не оформляем"
             )
         if stock_ids:
             raise ValueError("Складские позиции нельзя привязывать к сделке. Уберите stock_ids; запись не начата")
+        if source == "supplier" or self.manual_order_method != "offer/order/add_free_order":
+            raise ValueError("Заказы поставщикам через бота запрещены. Доступна только свободная позиция без поставщика; запись не начата.")
         if source not in {"supplier", "manual"}:
             raise ValueError("source должен быть supplier (заказ у поставщика) или manual (свободная позиция)")
         if not (name or "").strip():
@@ -1343,70 +1345,17 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             })
             require_ref = {"$from_step": 0}
 
-        if source == "manual" and self.manual_order_method == "offer/order/add_free_order":
-            # Основной путь, не запасная запись после ошибки другого метода.
-            # Поля количества из рабочего исходника не гарантированы API:
-            # успех возможен только после проверки фактической строки.
-            payload: dict[str, Any] = {
-                "REQUIRE_ID": require_ref, "NAME": name, "BRAND": brand, "SKU": sku,
-                "PRICE": float(price), "NEED_MARKUP": False,
-                "AMOUNT": qty, "CURRENT_VOLUME": qty, "MIN_VOLUME": 1,
-            }
-            method = "offer/order/add_free_order"
-            where = "свободный ордер (без подбора склада и заказа поставщику)"
-            if supplier_id is not None or supplier_price is not None or warehouse_id is not None or stock_ids:
-                raise ValueError("Для свободного ордера закупка, поставщик и склад не передаются. Если нужен учёт закупки у выбранного поставщика, укажите source=supplier. Запись не начата")
-        else:
-            # Позиция и заказом у поставщика, и «свободной строкой» оформляются ОДНИМ
-            # документированным методом offer/order/add (STOCK_TYPE=FREE_ORDER).
-            # Поле AMOUNT задаёт желаемое количество; остаток виртуального склада
-            # не является количеством строки сделки.
-            #
-            # ВАЖНО (разбор 29.10, 15:03): панель принимает offer/order/add ТОЛЬКО когда в
-            # STOCK есть SUPPLIER_ID — иначе отвечает «Поля SUPPLIER_ID нет в исходных
-            # данных!». Для поставочного маршрута поставщика подставляем ВСЕГДА: того, кого выбрал
-            # человек, иначе «Виртуального» из панели (см. default_supplier).
-            supplier: dict[str, Any] | None = None
-            if supplier_id:
-                supplier = {"supplier_id": int(supplier_id), "name": supplier_name}
-            else:
-                # Не наследуем произвольного поставщика из старых строк сделки.
-                supplier = self.default_supplier()
-                if supplier:
-                    supplier_name = supplier.get("name")
-
-            technical_warehouse = self.free_order_warehouse(warehouse_id)
-            stock: dict[str, Any] = {
-                "STOCK_TYPE": "FREE_ORDER",
-                "WAREHOUSE_ID": technical_warehouse,
-                "AMOUNT": qty,
-                "CURRENT_VOLUME": qty,
-                "MIN_VOLUME": 1,
-                "SOLID": "Y",
-                "SKU": sku,
-                "BRAND": brand,
-                "NAME": name,
-                # PRICE — цена продажи. FIX_USER_PRICE оставлен для совместимости:
-                # в публичной документации он показан в ответе, не подтверждён как вход.
-                # Ни он, ни мок не заменяют проверку фактической цены после записи.
-                "PRICE": float(price or 0),
-                "FIX_USER_PRICE": True,
-                # Формат из предоставленного рабочего исходника, не числовой пример wiki.
-                "UID": secrets.token_hex(16),
-            }
-            if supplier:
-                stock["SUPPLIER_ID"] = int(str(supplier["supplier_id"]))
-            if supplier_price is not None:
-                stock["PRICE_SUPP_HUM"] = float(supplier_price)
-            payload = {"REQUIRE_ID": require_ref, "DATA": {"STOCK": stock}}
-            method = "offer/order/add"
-
-            if source == "supplier":
-                where = f"у поставщика {supplier_name or supplier_id or 'не указан'}"
-            else:
-                where = "свободной позицией (без склада)"
-            if supplier and not supplier_id:
-                where += f", поставщик «{supplier.get('name') or supplier['supplier_id']}»"
+        # Единственный доступный вариант — свободная строка без полей поставщика.
+        # Количество/цену после применения проверяем чтением, повторов записи нет.
+        if supplier_id is not None or supplier_price is not None or warehouse_id is not None or stock_ids:
+            raise ValueError("Для свободного ордера закупка, поставщик и склад не передаются. Заказы поставщикам через бота запрещены. Запись не начата")
+        payload: dict[str, Any] = {
+            "REQUIRE_ID": require_ref, "NAME": name, "BRAND": brand, "SKU": sku,
+            "PRICE": float(price), "NEED_MARKUP": False,
+            "AMOUNT": qty, "CURRENT_VOLUME": qty, "MIN_VOLUME": 1,
+        }
+        method = "offer/order/add_free_order"
+        where = "свободный ордер (без подбора склада и заказа поставщику)"
 
         step: dict[str, Any] = {"method": method, "payload": payload}
         steps.append(step)
@@ -2330,7 +2279,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         cache_key = f"resolve|{query}|{brand}|{raw_sku}|{offer_id}|{limit}|{allow_web}"
         with self._cache_lock:
             hit = self._cache.get(cache_key)
-            if hit and hit[1].get("status") == "not_found" and time.monotonic() - hit[0] >= 5:
+            if hit and (hit[1].get("status") == "not_found" or (hit[1].get("rossko") or {}).get("status") == "unavailable") and time.monotonic() - hit[0] >= 5:
                 self._cache.pop(cache_key, None)
         def bounded() -> dict[str, Any]:
             with read_budget(8.0):
@@ -2484,6 +2433,22 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 self._run_parallel(fallback)
                 tried.append(f"ограниченный поиск по страницам: собрано {len(collected)} позиций")
 
+        # Независимый источник брендов: даже если CRM уже нашла один бренд,
+        # проверяем Росско, чтобы не скрыть другие варианты точного артикула.
+        rossko_result: dict[str, Any] = {"status": "skipped", "brands": []}
+        if raw_sku and not parts.is_viscosity(raw_sku) and not parts.is_probably_year(raw_sku):
+            rossko_result = rossko.search_brands(raw_sku)
+            for row in rossko_result.get("brands") or []:
+                add(row, "Росско")
+            rstatus = rossko_result.get("status")
+            if rstatus == "ok":
+                tried.append(f"Росско (только поиск): {len(rossko_result['brands'])} брендов")
+            elif rstatus == "empty":
+                tried.append("Росско: точных брендов в полученном ответе нет; поиск ограничен")
+            elif rstatus == "unavailable":
+                tried.append("Росско: поиск недоступен; отсутствие бренда не доказано")
+                errors.append("Росско: " + str(rossko_result.get("error") or "недоступно"))
+
         # 5b) интернет: артикула нет в панели — узнаём бренды по реальным сайтам.
         #     Бренд не выдумываем: только упоминания в выдаче, со ссылкой.
         # Только осмысленный артикул: «5/30», «2020», «масло» — не повод перебирать
@@ -2551,7 +2516,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         ranked.sort(key=lambda item: (item.get("source") == "интернет", -item.get("score", 0)))
         status = parts.decide(ranked)
         if ranked and (all(i.get("source") == "склад" for i in ranked) or
-                       (not brand and all(i.get("source") == "интернет" for i in ranked))):
+                       (not brand and all(i.get("source") in {"интернет", "Росско"} for i in ranked))):
             status = "ambiguous"  # найденный бренд — выбор человека, не доказательство уникальности
         result: dict[str, Any] = {
             "status": status,
@@ -2560,6 +2525,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "brand": brand,
             "internet": online,
             "stock_lookup": stock_lookup,
+            "rossko": {"status": rossko_result.get("status"), "count": len(rossko_result.get("brands") or [])},
             "candidates": ranked,
             "best": ranked[0] if status == "matched" and ranked else None,
         }
@@ -4193,6 +4159,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             current = self.drafts.get(token)
         except KeyError:
             current = None
+        if current and _forbidden_supplier_order(current.get("steps") or [{"method": current.get("method"), "payload": current.get("payload")} ]):
+            raise ValueError("Черновик привязан к складской позиции или потенциальному заказу поставщику; применение запрещено. Запись не начата; старые partial не повторяйте.")
         if current and (current.get("tool") == "add_offer_note" or current.get("check", {}).get("kind") == "added_note"):
             raise ValueError("Старый черновик заметки заблокирован: её отображение в сделке не подтверждено. Проверьте карточку CRM и не создавайте повтор вслепую.")
         if current and current.get("tool") == "create_contact" and (current.get("payload") or {}).get("PROPERTIES"):
@@ -4475,15 +4443,14 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         Для старых операций редактирования сохраняются совместимые альтернативы;
         потеря ответа никогда не является основанием для альтернативной записи.
         """
+        if _forbidden_supplier_order({**step, "payload": payload}):
+            raise ValueError("Заказ поставщику или небезопасная позиция запрещены; запись не выполнялась")
         if step["method"] == "contact/create":
             self._last_step_method = step["method"]
             return self.client.call(step["method"], payload)
         if step["method"] == "offer/order/add_free_order":
             self._last_step_method = step["method"]
             return self.client.call(step["method"], payload)
-        if step["method"] == "offer/order/add":
-            self._last_step_method = step["method"]
-            return self._call_with_known_fields(step["method"], payload)
         if step["method"] in ("calendar/card/new", "calendar/card/edit"):
             self._last_step_method = step["method"]
             return self.client.call(step["method"], payload)
