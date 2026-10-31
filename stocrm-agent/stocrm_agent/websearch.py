@@ -325,14 +325,13 @@ def _get(url: str, *, timeout: float) -> str:
     """GET с маршрутом «напрямую → через прокси» и понятной ошибкой."""
     import httpx
 
-    if not netproxy.known(url):
-        # Маршрут до поисковика ещё не проверяли, а проверка занимает секунды. Поиск
-        # в интернете — вспомогательный источник, поэтому не держим человека: запускаем
-        # проверку в фоне и отвечаем сразу. Следующий запрос пойдёт уже по готовому пути.
-        netproxy.prewarm(url, explicit=_env("HTTPS_PROXY"), timeout=2.0)
-        raise WebSearchError(ROUTE_PENDING)
+    # Первый поиск должен реально выполняться, а не лишь прогревать маршрут.
+    # Проверяем главную страницу, не повторяя сам поисковый запрос.
+    from urllib.parse import urlsplit
+    host = urlsplit(url)
+    origin = f"{host.scheme}://{host.netloc}/"
     route = netproxy.cached_route(
-        url, explicit=_env("HTTPS_PROXY"), timeout=min(2.0, timeout)
+        origin, explicit=_env("HTTPS_PROXY"), timeout=min(1.5, max(0.1, timeout / 2))
     )
     if not route.ok:
         raise WebSearchError(
@@ -380,9 +379,14 @@ def relevant(hits: list[Hit], required: list[str]) -> list[Hit]:
     needles = [n.strip().lower() for n in required if n and n.strip()]
     if not needles:
         return hits
-    return [
-        hit for hit in hits if any(needle in hit.text.lower() for needle in needles)
-    ]
+    from . import parts
+    def matches(hit: Hit, needle: str) -> bool:
+        if needle in hit.text.lower():
+            return True
+        # Для артикула допускаем только различие разделителей, не похожие цифры.
+        target = parts.sku_exact(needle)
+        return bool(target and any(ch.isdigit() for ch in target) and target in parts.sku_in_text(hit.text))
+    return [hit for hit in hits if any(matches(hit, needle) for needle in needles)]
 
 
 def _remember(key: tuple[str, str, tuple[str, ...]], hits: list[Hit]) -> None:
@@ -695,7 +699,8 @@ def search_batch(articles: list[str], *, limit: int = 10) -> list[Hit]:
         raise ValueError("В одном поисковом запросе допускается от одного до четырёх артикулов")
     if not enabled() or not available():
         raise WebSearchError("Интернет-поиск выключен или временно приостановлен")
-    query = "(" + " OR ".join('"' + re.sub(r'[^A-Za-z0-9./-]', '', x) + '"' for x in values) + ") автозапчасть артикул"
+    query = (('"' + values[0] + '" автозапчасть производитель') if len(values) == 1 else
+             "(" + " OR ".join('"' + re.sub(r'[^A-Za-z0-9./-]', '', x) + '"' for x in values) + ") автозапчасть артикул")
     kind = provider()
     # Платные провайдеры обрабатываются штатным API, с теми же паузами.
     if kind not in {"ddg", "bing", "mojeek", "searx", "brave", "serper"}:

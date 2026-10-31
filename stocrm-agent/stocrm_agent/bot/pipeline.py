@@ -634,8 +634,23 @@ def tag_in_request(text: str) -> dict[str, Any] | None:
 
 def _normalize_deal_slip(text: str) -> str:
     # Только начало голосовой команды: «вилку 1313, добавь…», не название детали.
-    return re.sub(r"^\s*(?:вилку|в\s+делку)\s+(\d{3,6})\s*[,;:]?\s*(?=добав)",
+    text = re.sub(r"^\s*(?:вилку|делку|в\s+делку)\s+(\d{1,6}(?:\.\d{1,3})?)\s*[,;:]?\s*(?=добав)",
                   r"в сделку \1, ", text, flags=re.I)
+    # Точка внутри номера распознана как разделитель групп цифр, но только
+    # непосредственно рядом со словом «сделка», никогда в ценах/артикулах.
+    pattern = re.compile(r"(сделк[аиуеой]*\s+(?:подробно\s+)?(?:№|#)?\s*)(\d{1,4})\.(\d{1,3})(?![\d.])", re.I)
+    def join(match: re.Match[str]) -> str:
+        digits = match.group(2) + match.group(3)
+        return match.group(1) + digits if 3 <= len(digits) <= 6 else match.group(0)
+    text = pattern.sub(join, text)
+    if re.search(r"\b(?:товар\w*|запчаст\w*|артикул\w*)\b", text, re.I):
+        # Голосовое «FC 21.39» — буквенный префикс и группы артикула,
+        # не цена: число без букв отдельно никогда не меняем.
+        def join_article(match: re.Match[str]) -> str:
+            value = match.group(2) + match.group(3)
+            return f"{match.group(1)} {value}" if len(value) >= 4 else match.group(0)
+        text = re.sub(r"\b([A-Za-z]{1,4})\s+(\d{1,4})\.(\d{1,4})(?![\d.])", join_article, text)
+    return text
 
 
 def _unit_price_for_request(price: float, text: str, qty: int | None) -> float:
@@ -1317,6 +1332,12 @@ class BotPipeline:
                 self._track_part(result, key)
                 return result
             args = dict(choice["args"])
+            explicit_sku = re.search(r"артикул(?:ом|а)?\s*[:№#]?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9./ -]{2,24})", text, re.I)
+            if explicit_sku:
+                found = parts.sku_spans(explicit_sku.group(1))
+                if len(found) == 1:
+                    args["sku"] = found[0][0]
+                    args["name"] = found[0][0]
             brand = parts.find_brand_in_text(text)
             retry = low in {"повтори поиск", "повторить поиск", "поищи снова"}
             if brand and parts.brand_match(brand, args.get("brand")) == 100:
@@ -1722,6 +1743,9 @@ class BotPipeline:
             return None
         if _TAG_WORD.search(source) or _NOTE_WORD.search(source):
             return None                  # «поставь тег …» / «добавь заметку …» — не запчасть
+        if _WORK_WORD.search(source):
+            # Услуги не становятся артикулами, даже если распознавание написало ДВС 300.
+            return None
         items = parts_in_request(source)
         if not items:
             single = _single_part_in_request(source)
@@ -1899,7 +1923,30 @@ class BotPipeline:
         info = work_in_request(text)
         if not info:
             return None
+        if re.search(r"\b(?:товар\w*|запчаст\w*|детал\w*)\b", text, re.I):
+            return PipelineResult(answer="В одной просьбе названы и услуги, и товары. Чтобы не перепутать позиции, отправьте услуги и товары отдельными сообщениями; ничего не записано.")
         key = user_id or 0
+        word = _WORK_WORD.search(text)
+        tail = text[word.end():] if word else ""
+        # Делим только после названной цены: «диагностика и замена» остаётся одной работой.
+        chunks = [x.strip() for x in re.split(r"(?<=\d)\s*[,;\n]\s*|(?<=рублей)\s*[,;\n]\s*|(?<=рубля)\s*[,;\n]\s*|(?<=\d)\s+и\s+|(?<=рублей)\s+и\s+", tail, flags=re.I) if x.strip()]
+        if len(chunks) > 1:
+            offer_id = info.get("offer_id") or self._last_offer.get(key)
+            if not offer_id:
+                return PipelineResult(answer="Для услуг укажите номер сделки. Ничего не записано.")
+            parsed = [work_in_request("добавь услугу " + chunk) for chunk in chunks]
+            if any(not item or item.get("price") is None for item in parsed):
+                return PipelineResult(answer="Не удалось однозначно разделить услуги и цены. Укажите каждую услугу с ценой отдельно; ничего не записано.")
+            drafts = []
+            try:
+                for item in parsed:
+                    assert item is not None
+                    drafts.append(self.tools.draft_add_offer_work(offer_id=int(offer_id), title=str(item['title']), sum_value=float(item['price'])))
+            except Exception:
+                for draft in drafts:
+                    self.tools.drafts.mark(draft['token'], 'discarded', reason='подготовка остальных услуг не удалась')
+                return PipelineResult(answer="Не удалось подготовить все услуги. Ничего не записано; проверьте формулировку и повторите.")
+            return PipelineResult(answer="Подготовлены отдельные услуги. Проверьте названия, цены и номер сделки; каждую подтвердите отдельно.", drafts=drafts)
         offer_id = info.get("offer_id") or self._last_offer.get(key)
         title = str(info["title"])
         price = info.get("price")
@@ -2369,6 +2416,8 @@ class BotPipeline:
     async def _handle_text(self, text: str, history: list[dict[str, Any]],
                            user_id: int | None = None) -> PipelineResult:
         text = _normalize_deal_slip(text)
+        if _ADD_VERB.search(text) and not money_text.deal_in_text(text) and re.match(r"^\s*(?:и\s+)?лк\s+\d{3,6}\b", text, re.I):
+            return PipelineResult(answer="Номер сделки прозвучал неразборчиво. Повторите команду со словами «в сделку» и номером: не использую предыдущую сделку и ничего не записываю.")
         edit_reply = self._direct_price_edit(text, history, user_id)
         if edit_reply is not None:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": edit_reply.answer}])
@@ -2395,7 +2444,7 @@ class BotPipeline:
         self.router.qty_hint = qty_in_text(text)
         # Несколько артикулов в одной фразе — каждому своя цена («fk-2010 за 6000, cr9ek за 3000»).
         try:
-            self.router.set_request_parts(parts_in_request(text))
+            self.router.set_request_parts([] if _WORK_WORD.search(text) else parts_in_request(text))
         except ValueError as exc:
             return PipelineResult(answer=str(exc) + ". Ничего не записано.")
         # О какой сделке речь: названа в тексте — берём её; иначе — та, которую
@@ -2460,7 +2509,7 @@ class BotPipeline:
 
         # Безопасность общей заявки не зависит от переключателя быстрых ответов.
         # При TG_FASTPATH=0 одиночные позиции остаются на обычном пути модели.
-        if self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text)):
+        if (self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text))) and not _WORK_WORD.search(text):
             direct = await asyncio.to_thread(self._direct_parts, text, user_id)
             if direct is not None:
                 history.append({"role": "user", "content": text})
@@ -2469,7 +2518,7 @@ class BotPipeline:
                 return direct
 
         # Услуга (работа) по фразе — тоже без модели: «добавь услугу X за 1000».
-        if self.fastpath:
+        if self.fastpath or (_WORK_WORD.search(text) and _ADD_VERB.search(text)):
             work = await asyncio.to_thread(self._direct_work, text, user_id)
             if work is not None:
                 history.append({"role": "user", "content": text})

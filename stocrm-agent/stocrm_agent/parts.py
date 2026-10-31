@@ -617,6 +617,8 @@ def brands_from_hits(hits: list[dict[str, Any]], sku: str | None, *, brand: str 
     if not want:
         return []
     scored: dict[str, dict[str, Any]] = {}
+    # Сравнение по цифрам и буквам одинаковое, разделители в выдаче различаются.
+    article_pattern = r"[\s./-]*".join(re.escape(ch) for ch in want)
     known_brands = set(BRAND_ALIASES.values())
     for hit in hits:
         url = str(hit.get("url") or "")
@@ -645,14 +647,14 @@ def brands_from_hits(hits: list[dict[str, Any]], sku: str | None, *, brand: str 
                 # Неизвестное латинское название допускаем лишь непосредственно рядом
                 # с точным артикулом или в явно подписанном поле производителя.
                 adjacent = (bool(re.fullmatch(r"[A-Za-z][A-Za-z&-]{2,}", word)) and (
-                    bool(re.match(r"\s+" + re.escape(sku or "") + r"(?![A-Za-z0-9])", head[match.end():], re.I))
-                    or bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(sku or "") + r"\s+$", head[:match.start()], re.I))))
+                    bool(re.match(r"\s+" + article_pattern + r"(?![A-Za-z0-9])", head[match.end():], re.I))
+                    or bool(re.search(r"(?<![A-Za-z0-9])" + article_pattern + r"\s+$", head[:match.start()], re.I))))
                 if display not in known_brands and display != requested and not (labeled or adjacent):
                     continue
                 if word.lower() in _HIT_STOPWORDS or display in seen:
                     continue
-                glued = bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"[\s./-]*" + re.escape(sku or "") + r"(?![A-Za-z0-9])", head, re.I))
-                reverse = bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(sku or "") + r"[\s,./-]+" + re.escape(word) + r"(?![A-Za-z0-9])", head, re.I))
+                glued = bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"[\s./-]*" + article_pattern + r"(?![A-Za-z0-9])", head, re.I))
+                reverse = bool(re.search(r"(?<![A-Za-z0-9])" + article_pattern + r"[\s,./-]+" + re.escape(word) + r"(?![A-Za-z0-9])", head, re.I))
                 if not (glued or reverse or (article_present and labeled)):
                     continue
                 seen.add(display)
