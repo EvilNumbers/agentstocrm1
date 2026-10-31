@@ -57,7 +57,7 @@ def _num(value: Any) -> str:
 #: Поля ответа, в которых панель держит описание позиции.
 _NAME_KEYS = ("TITLE", "NAME", "FORMATTED_STOCK")
 _PRICE_KEYS = ("PRICE", "PRICE_POSITION_FINAL", "ORDER_SUM")
-_QTY_KEYS = ("QUANTITY_CURRENT", "QUANTITY", "AMOUNT")
+_QTY_KEYS = ("QUANTITY_CURRENT",)
 
 
 def _flat_items(payload: Any, depth: int = 0) -> list[dict[str, Any]]:
@@ -133,7 +133,9 @@ def format_apply_result(method: str, result: Any, *, summary: str = "", warning:
         sku = sku or _first(source, ("SKU", "CUSTOM_SKU"))
         supplier = supplier or _first(source, ("SUPPLIER_NAME",))
         price = price if price is not None else _money(_first(source, _PRICE_KEYS))
-        qty = qty if qty is not None else _first(source, _QTY_KEYS)
+        # Только поле строки товара, не FORMATTED_STOCK и не вложенный склад.
+        if item.get("ORDER_ID") and qty is None:
+            qty = _first(item, _QTY_KEYS)
         order_id = order_id or item.get("ORDER_ID")
         require_id = require_id or item.get("REQUIRE_ID")
         offer_id = offer_id or item.get("OFFER_ID")
@@ -227,14 +229,6 @@ def format_apply_result(method: str, result: Any, *, summary: str = "", warning:
             ] if isinstance(result, dict) else []
             lines.append("; ".join(pairs) if pairs else "STOCRM подтвердил выполнение.")
 
-    qty_number = _as_number(qty) if qty else None
-    if qty_number is not None and qty_number >= 1000:
-        # Панель умеет записать «своё» количество (в разборе 29.10 так появилось
-        # 1000000). Писать при этом «✅ всё хорошо» нельзя.
-        lines.append(
-            f"\n⚠️ Панель записала количество {_grouped(qty)} — это больше, чем нужно. "
-            "Проверьте строку в сделке: «Реализация» → «Товары»."
-        )
     if price is not None and price <= 0:
         lines.append(
             "\n⚠️ Цена продажи 0 ₽ — похоже, она не проставлена. "

@@ -629,20 +629,31 @@ def brands_from_hits(hits: list[dict[str, Any]], sku: str | None, *, brand: str 
             text = re.sub(r"MEAT\s*(?:&amp;|amp;|&)\s*DORIA", "MEAT&DORIA", text, flags=re.I)
             # ABS в «без ABS», AUDI/GOLF/MK2 в применяемости не являются изготовителем.
             head = re.split(r"\b(?:без|для|подходит|применяемость|совместимость|for|fits|without|with)\b", text, maxsplit=1, flags=re.I)[0]
-            article_present = any(sku_exact(raw) == want for raw in raw_sku_in_text(head))
+            found_articles = {sku_exact(raw) for raw in raw_sku_in_text(head)}
+            # Нельзя приписать бренд из одного товара другому в общей выдаче.
+            # Неоднозначный заголовок/сниппет с несколькими артикулами пропускаем.
+            if any(article != want for article in found_articles):
+                continue
+            article_present = want in found_articles
             for match in re.finditer(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё&-]{2,}", head):
                 word = match[0].strip("-&")
                 display = _brand_index().get(brand_key(word), word.upper())
                 if requested and display != requested:
                     continue
                 # Неизвестный производитель допустим только при явной подписи поля.
-                if (display not in known_brands and display != requested
-                        and not re.search(r"(?:производитель|бренд|manufacturer|brand)\s*[:—-]\s*$", head[:match.start()], re.I)):
+                labeled = re.search(r"(?:производитель|бренд|manufacturer|brand)\s*[:—-]\s*$", head[:match.start()], re.I)
+                # Неизвестное латинское название допускаем лишь непосредственно рядом
+                # с точным артикулом или в явно подписанном поле производителя.
+                adjacent = (bool(re.fullmatch(r"[A-Za-z][A-Za-z&-]{2,}", word)) and (
+                    bool(re.match(r"\s+" + re.escape(sku or "") + r"(?![A-Za-z0-9])", head[match.end():], re.I))
+                    or bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(sku or "") + r"\s+$", head[:match.start()], re.I))))
+                if display not in known_brands and display != requested and not (labeled or adjacent):
                     continue
                 if word.lower() in _HIT_STOPWORDS or display in seen:
                     continue
-                present = article_present or bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"[\s./-]*" + re.escape(sku or "") + r"(?![A-Za-z0-9])", head, re.I))
-                if not present:
+                glued = bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"[\s./-]*" + re.escape(sku or "") + r"(?![A-Za-z0-9])", head, re.I))
+                reverse = bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(sku or "") + r"[\s,./-]+" + re.escape(word) + r"(?![A-Za-z0-9])", head, re.I))
+                if not (glued or reverse or (article_present and labeled)):
                     continue
                 seen.add(display)
                 item = scored.setdefault(display, {"brand": display, "score": 0, "sites": [], "url": url, "title": head})
@@ -753,16 +764,14 @@ def rank_candidates(
         score, reasons, exact_sku = score_candidate(query, sku=sku, brand=brand, candidate=item)
         if score <= 0:
             continue
+        explanation = ", ".join(reasons) or "похожее название"
+        if item.get("source") == "интернет" and item.get("why"):
+            explanation += "; " + str(item["why"])
         enriched = {**item, "score": score, "exact_sku": exact_sku,
-                    "why": ", ".join(reasons) or "похожее название"}
+                    "why": explanation}
         scored.append(enriched)
     def sort_key(item: dict[str, Any]) -> tuple[float, float, str]:
-        qty = item.get("qty")
-        try:
-            qty_value = float(qty) if qty not in (None, "") else 0.0
-        except (TypeError, ValueError):
-            qty_value = 0.0
-        return (-item["score"], -qty_value, str(item.get("name") or ""))
+        return (-item["score"], -float(item.get("evidence_score") or 0), str(item.get("name") or ""))
 
     scored.sort(key=sort_key)
     return scored[:limit]

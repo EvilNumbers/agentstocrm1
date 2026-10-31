@@ -134,6 +134,9 @@ def drafts_keyboard(drafts: list[dict[str, Any]]) -> InlineKeyboardMarkup | None
         token = draft.get("token")
         if not token:
             continue
+        if draft.get("batch_preparing"):
+            rows.append([InlineKeyboardButton(text="❌ Отменить незавершённую сборку", callback_data=f"dr:{token}")])
+            continue
         if draft.get("status") == "partial":
             rows.extend([
                 [InlineKeyboardButton(text=f"🔎 {number}. Проверить CRM", callback_data=f"rv:{token}"),
@@ -278,7 +281,7 @@ def _part_line(number: int, item: dict[str, Any]) -> str:
     return f"{number}. {title}" + (f" · {item['stock_note']}" if item.get("stock_note") else "")
 
 
-def part_keyboard(token: str, candidates: list[dict[str, Any]], *, page: int = 0) -> InlineKeyboardMarkup:
+def part_keyboard(token: str, candidates: list[dict[str, Any]], *, page: int = 0, text_only: bool = False) -> InlineKeyboardMarkup:
     pages = max(1, (len(candidates) + 5) // 6)
     page = max(0, min(page, pages - 1))
     rows = [[InlineKeyboardButton(text=_part_button(c, page * 6 + n + 1),
@@ -291,7 +294,7 @@ def part_keyboard(token: str, candidates: list[dict[str, Any]], *, page: int = 0
         nav.append(InlineKeyboardButton(text="Далее →", callback_data=f"prt:{token}:p:{page+1}"))
     if nav:
         rows.append(nav)
-    if not candidates:
+    if not candidates and not text_only:
         rows.extend([
             [InlineKeyboardButton(text="➕ Добавить как указано", callback_data=f"prt:{token}:manual")],
             [InlineKeyboardButton(text="🔎 Повторить поиск", callback_data=f"prt:{token}:retry"),
@@ -316,7 +319,12 @@ def render_part_choice(choice: dict[str, Any]) -> str:
             lines.append(str(first["why"]))
         sources = {str(c.get("source") or "") for c in candidates}
         if "интернет" in sources:
-            lines.append("Есть варианты из интернета; это не подтверждение наличия в панели.")
+            lines.append("Варианты из интернета — не подтверждение наличия и применяемости:")
+            for number, candidate in enumerate(candidates, 1):
+                url = str(candidate.get("url") or "")
+                if candidate.get("source") == "интернет" and url.startswith(("https://", "http://")):
+                    label = " ".join(str(candidate.get(k) or "") for k in ("brand", "sku")).strip()
+                    lines.append(f"{number}. {label}: {url}")
         known = choice.get("args") or {}
         lines.append("Выберите подходящую позицию кнопкой." if known.get("sku") else
                      "Выберите вариант кнопкой или уточните бренд и артикул.")
@@ -392,6 +400,8 @@ def drafts_block(drafts: list[dict[str, Any]], answer: str = "") -> str:
     if not drafts:
         return ""
     body = render_drafts(drafts)
+    if any(d.get("status") == "partial" for d in drafts):
+        return "⚠️ Требуется проверка CRM; часть действий могла выполниться. Не повторяйте заявку:\n" + body
     if "подтвердите" in str(answer or "").lower():
         return body
     return "Подготовлено к записи (пока ничего не изменено):\n" + body
@@ -630,7 +640,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 token = remember_choice(choice)
                 if choice.get("kind") == "part":
                     await message.answer(render_part_choice(choice),
-                                         reply_markup=part_keyboard(token, choice["candidates"]))
+                                         reply_markup=part_keyboard(token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}))
                     continue
                 if choice.get("kind") == "to":
                     await message.answer(render_to_choice(choice),
@@ -863,7 +873,11 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
     async def cmd_drafts(message: Message) -> None:
         pending = tools.drafts.list("pending")
         partial = tools.drafts.list("partial")
-        if not pending and not partial:
+        archived = [d for d in tools.drafts.list("all") if d.get("archived_partial") or (
+            d.get("tool") == "add_offer_part" and d.get("status") in {"applied", "discarded"}
+            and not (d.get("review") or {}).get("verified") and not d.get("merged_into")
+            and (d.get("check_warning") or (d.get("status") == "discarded" and d.get("done_steps"))))]
+        if not pending and not partial and not archived:
             await message.answer("Черновиков нет.")
             return
         if pending:
@@ -874,6 +888,10 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         if partial:
             lines = [f"{number}. ⚠️ {d['summary']} — требует проверки; целиком повторять нельзя" for number, d in enumerate(partial, 1)]
             await message.answer("Требуют проверки в STOCRM:\n" + "\n".join(lines), reply_markup=drafts_keyboard(partial))
+        if archived:
+            visible = [{**d, "status": "partial"} for d in archived]
+            lines = [f"{number}. ⚠️ {d['summary']}" for number, d in enumerate(visible, 1)]
+            await message.answer("Убранные или старые непроверенные попытки блокируют повтор до проверки CRM:\n" + "\n".join(lines), reply_markup=drafts_keyboard(visible))
 
     # ---------------------------------------------------------- голос/аудио
     async def handle_audio(message: Message, file_id: str, suffix: str,
@@ -1174,6 +1192,11 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         if value == "noop":
             await callback.answer()
             return
+        if entry is not None and entry["choice"].get("_group"):
+            key = callback.from_user.id if callback.from_user else 0
+            if pipeline._part_pending.get(key, {}).get("choice") is not entry["choice"]:
+                await callback.answer("Этот вопрос устарел; используйте последние кнопки.", show_alert=True)
+                return
         if value == "cancel":
             pending_choices.pop(token, None)
             await safe_edit(_cb_msg(callback), "❌ Отменено, по ТО ничего не добавлено.")
@@ -1206,7 +1229,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                                         reply_markup=to_keyboard(new_token, choice.get("candidates") or []))
                 elif choice.get("kind") == "part":
                     await target.answer(render_part_choice(choice),
-                                        reply_markup=part_keyboard(new_token, choice["candidates"]))
+                                        reply_markup=part_keyboard(new_token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}))
         # Черновики показываем ВСЕГДА: иначе после «Стандартное ТО» человек видел только
         # вопрос про масло, а подобранные фильтры висели в черновиках без кнопок.
         text_out = result.answer or "Готово."
@@ -1280,12 +1303,15 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             if target is not None:
                 for choice in result.choices:
                     new_token = remember_choice(choice)
-                    await target.answer(render_part_choice(choice), reply_markup=part_keyboard(new_token, choice.get("candidates") or []))
+                    await target.answer(render_part_choice(choice), reply_markup=part_keyboard(new_token, choice.get("candidates") or [], text_only=choice.get("_group_step") in {"price", "offer"}))
                 text_out = result.answer or "Продолжаем."
+                if result.applied:
+                    text_out += "\n\n⚡ Внесено без подтверждения:\n" + render_applied(result.applied)
                 if result.drafts:
                     text_out += "\n\n" + drafts_block(result.drafts, text_out)
-                for piece in chunk(text_out):
-                    await target.answer(piece, reply_markup=drafts_keyboard(result.drafts))
+                if not result.choices:
+                    for piece in chunk(text_out):
+                        await target.answer(piece, reply_markup=drafts_keyboard(result.drafts))
             return
         pending_choices.pop(token, None)
         chosen = next(
@@ -1320,7 +1346,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 if choice.get("kind") == "part":
                     await target.answer(
                         render_part_choice(choice),
-                        reply_markup=part_keyboard(new_token, choice["candidates"]),
+                        reply_markup=part_keyboard(new_token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}),
                     )
                     continue
                 if choice.get("kind") == "to":
@@ -1333,9 +1359,9 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                     render_choice(choice),
                     reply_markup=employee_keyboard(new_token, choice["candidates"], allow_skip=True),
                 )
-        if callback.message is not None:
+        if callback.message is not None and not (result.choices and entry["choice"].get("_group")):
             await callback.message.answer(text_out, reply_markup=drafts_keyboard(result.drafts))
-        await callback.answer("Готово")
+        await callback.answer("Продолжаем" if result.choices else "Готово")
 
     # ---------------------------------------------------------- подтверждение
     @router.callback_query(F.data.startswith(("ap:", "dr:", "dp:", "rv:", "rc:", "rp:", "ra:", "rx:")))
@@ -1357,7 +1383,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 for item in review["details"]:
                     lines.append(f"Сделка №{item['offer_id']} · {item['sku']}: {item.get('execution', 'этап неизвестен')}; строк найдено {item['matches']}; " + (f"фактически {item['actual']}" if item['actual'] else "цена/количество не подтверждены"))
                 lines.append("Цена и количество совпадают — можно подтвердить результат." if review["verified"] else "Выполнение не подтверждено. Не повторяйте всё добавление; используйте продолжение только после явного отказа из-за блокировки.")
-                await safe_edit(_cb_msg(callback), "\n".join(lines), reply_markup=drafts_keyboard([tools.drafts.get(token)]))
+                await safe_edit(_cb_msg(callback), "\n".join(lines), reply_markup=drafts_keyboard([{**tools.drafts.get(token), "status": "partial"}]))
             elif action == "rc":
                 await asyncio.to_thread(tools.confirm_draft_result, token)
                 await safe_edit(_cb_msg(callback), "✅ Цена и количество проверены в CRM. Черновик закрыт как выполненный. Повторных изменений не отправлял.")
@@ -1393,10 +1419,13 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                     "bot.apply", token=token, user_id=actor.id if actor else None,
                     method=result["method"], result=result["result"],
                 )
-                text = format_apply_result(result["method"], result["result"],
-                                           warning=str(result.get("warning") or (
-                                               "API принял запрос, но результат в карточке не перечитан. Проверьте его в STOCRM."
-                                               if result.get("verified") is False else "")))
+                if result.get("queue_completed") and result.get("verified") and not result.get("warning"):
+                    text = f"✅ Заявка выполнена: проверено позиций в CRM — {result['queue_completed']}."
+                else:
+                    text = format_apply_result(result["method"], result["result"],
+                                               warning=str(result.get("warning") or (
+                                                   "API принял запрос, но результат в карточке не перечитан. Проверьте его в STOCRM."
+                                                   if result.get("verified") is False else "")))
                 await safe_edit(_cb_msg(callback), text)
         except (StocrmError, ValueError, KeyError) as exc:
             await notify_problem(callback, humanize_error(exc, context="Не удалось выполнить действие с черновиком"))

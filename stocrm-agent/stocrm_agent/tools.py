@@ -1060,7 +1060,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "brand": r.get("BRAND"),
                 "sku": r.get("SKU"),
                 "name": r.get("NAME"),
-                "qty": r.get("QUANTITY"),
+                "qty": r.get("QUANTITY_CURRENT") if r.get("QUANTITY_CURRENT") is not None else r.get("QUANTITY"),
+                "qty_source": "QUANTITY_CURRENT" if r.get("QUANTITY_CURRENT") is not None else "QUANTITY",
                 "price": _money(r.get("PRICE")),
                 "order_sum": _money(r.get("ORDER_SUM")),
                 "supplier_price": _money(r.get("SUPPLIER_PRICE")),
@@ -1202,7 +1203,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         Зачем: `offer/order/add` (единственный документированный метод с количеством,
         AMOUNT) панель принимает ТОЛЬКО с полем SUPPLIER_ID. Без него ответ был
         «Поля SUPPLIER_ID нет в исходных данных!», и всё откатывалось на старый
-        `add_free_order` — который не умеет количество (в сделке появлялось 1000000).
+        `add_free_order`. Поведение его полей количества на реальной CRM требует проверки.
 
         Порядок: настройка STOCRM_DEFAULT_SUPPLIER_ID → «Виртуальный» из списка
         поставщиков панели → единственный поставщик, если он один.
@@ -1344,14 +1345,13 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 raise ValueError("Для свободного ордера закупка, поставщик и склад не передаются. Если нужен учёт закупки у выбранного поставщика, укажите source=supplier. Запись не начата")
         else:
             # Позиция и заказом у поставщика, и «свободной строкой» оформляются ОДНИМ
-            # документированным методом offer/order/add (STOCK_TYPE=FREE_ORDER): только у
-            # него есть AMOUNT, то есть количество. У add_free_order количества нет вовсе —
-            # панель подставляла своё (в сделке появилось «количество 1000000»).
+            # документированным методом offer/order/add (STOCK_TYPE=FREE_ORDER).
+            # Поле AMOUNT задаёт желаемое количество; остаток виртуального склада
+            # не является количеством строки сделки.
             #
             # ВАЖНО (разбор 29.10, 15:03): панель принимает offer/order/add ТОЛЬКО когда в
             # STOCK есть SUPPLIER_ID — иначе отвечает «Поля SUPPLIER_ID нет в исходных
-            # данных!», и раньше всё молча откатывалось на add_free_order (без количества и
-            # с наценкой). Поэтому поставщика подставляем ВСЕГДА: того, кого выбрал
+            # данных!». Для поставочного маршрута поставщика подставляем ВСЕГДА: того, кого выбрал
             # человек, иначе «Виртуального» из панели (см. default_supplier).
             supplier: dict[str, Any] | None = None
             if supplier_id:
@@ -1419,6 +1419,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if duplicate_warning:
             summary += f" (внимание: {duplicate_warning})"
 
+        # Блокировка переживает /drafts, перезапуск и изменение бренда в новой просьбе.
+        self.drafts.assert_part_unblocked(check)
         extra: dict[str, Any] = {"check": check}
         messages = [duplicate_warning] if duplicate_warning else []
         if unknown_brand:
@@ -1910,17 +1912,20 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if abs(actual - wanted) > 0.01:
             problems.append(f"цена в сделке {actual:.2f} ₽ вместо {wanted:.2f} ₽")
         wanted_qty = int(check.get("qty") or 0)
-        actual_qty = int(_money(row.get("qty")) or 0)
-        if wanted_qty and actual_qty and actual_qty != wanted_qty:
-            problems.append(f"количество {actual_qty} вместо {wanted_qty}")
+        actual_qty = _known_work_sum(row.get("qty"))
+        if wanted_qty and actual_qty != wanted_qty:
+            if row.get("qty_source") == "QUANTITY_CURRENT" and actual_qty is not None:
+                problems.append(f"количество в строке {_num(actual_qty)} вместо {wanted_qty}")
+            else:
+                problems.append("не удалось надёжно проверить количество в строке сделки")
         if not problems:
             return None
         return (
-            "STOCRM не применил изменение к уже добавленной позиции: "
+            "Не удалось подтвердить изменение уже добавленной позиции: "
             + ", ".join(problems) + ".\n"
             "Что сделать: откройте сделку в STOCRM → блок «Реализация» → «Товары» → "
             "в строке позиции поставьте нужную цену продажи и количество "
-            "(метода правки позиции в API STOCRM нет)."
+            "(публичный метод правки позиции не подтверждён)."
         )
 
     def draft_remove_offer_part(
@@ -2297,6 +2302,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         sku: str | None = None,
         offer_id: int | None = None,
         limit: int = 8,
+        allow_web: bool = True,
     ) -> dict[str, Any]:
         """Ищет запчасть по названию/бренду/артикулу и ранжирует варианты.
 
@@ -2311,14 +2317,14 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         raw_sku = (sku or "").strip() or None
         # один и тот же подбор в одном разговоре не повторяем (человек уточняет фразу,
         # но ищет ту же деталь) — это уже готовый ответ, без запросов к панели
-        cache_key = f"resolve|{query}|{brand}|{raw_sku}|{offer_id}|{limit}"
+        cache_key = f"resolve|{query}|{brand}|{raw_sku}|{offer_id}|{limit}|{allow_web}"
         with self._cache_lock:
             hit = self._cache.get(cache_key)
             if hit and hit[1].get("status") == "not_found" and time.monotonic() - hit[0] >= 5:
                 self._cache.pop(cache_key, None)
         def bounded() -> dict[str, Any]:
             with read_budget(8.0):
-                return self._resolve_part(query=query, brand=brand, raw_sku=raw_sku, offer_id=offer_id, limit=limit)
+                return self._resolve_part(query=query, brand=brand, raw_sku=raw_sku, offer_id=offer_id, limit=limit, allow_web=allow_web)
         return self._cached(cache_key, bounded)
 
     def _resolve_part(
@@ -2329,6 +2335,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         raw_sku: str | None = None,
         offer_id: int | None = None,
         limit: int = 8,
+        allow_web: bool = True,
     ) -> dict[str, Any]:
 
         # артикул могли назвать внутри фразы: «фильтр w 914/2».
@@ -2454,7 +2461,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
              and len(parts.normalize_sku(article)) >= 4)
             or (article.isdigit() and len(article) >= 4)
         ) and not parts.is_viscosity(article) and not parts.is_probably_year(article)
-        if sku_worth_searching and not any(
+        if allow_web and sku_worth_searching and not any(
             parts.sku_exact(item.get("sku")) == parts.sku_exact(raw_sku) for item in collected
         ):
             before = len(collected)
@@ -2762,7 +2769,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "source": "интернет",
                 "why": item["why"],
                 "url": item["url"],
-                "score": item["score"],
+                "evidence_score": item["score"],
                 "sites": item["sites"],
             }
             for item in brands
@@ -4138,6 +4145,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             current = self.drafts.get(token)
         except KeyError:
             current = None
+        if current and current.get("batch_preparing"):
+            raise ValueError("Заявка ещё собирается или сборка прервана; применять отдельные позиции нельзя. Отмените незавершённый черновик через /drafts.")
         if current and current.get("queue_parent"):
             parent_job = self.drafts.get(str(current["queue_parent"]))
             if parent_job.get("status") != "applying" or parent_job.get("queue_current") != token:
@@ -4320,6 +4329,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         for index, job in enumerate(jobs):
             steps = job["steps"]
             child: dict[str, Any] | None = None
+            recorded = False
             self.audit.write("write.queue.position.start", token=token, position_index=index, sku=job["check"].get("sku"))
             try:
                 child = self.drafts.create(tool="add_offer_part", method=steps[0]["method"],
@@ -4335,6 +4345,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 results.extend(child_results)
                 got_methods = list(outcome.get("methods") or [step["method"] for step in steps])
                 methods.extend(got_methods)
+                recorded = True
                 done.extend({"index": job["offset"] + i, "method": method, "ok": True}
                             for i, method in enumerate(got_methods))
                 if outcome.get("warning") or not outcome.get("verified"):
@@ -4346,11 +4357,11 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             except BaseException as exc:
                 saved = self.drafts.get(child["token"]) if child else {}
                 failure = saved.get("done_steps") or {}
-                if saved.get("status") != "applied":
+                if saved.get("status") != "applied" and not recorded:
                     raw = saved.get("result")
                     results.extend(raw if isinstance(raw, list) else ([raw] if raw is not None else []))
                     methods.extend(failure.get("methods") or [])
-                default_failed_index = len(steps) - 1 if saved.get("status") == "applied" else min(len(failure.get("methods") or []), len(steps) - 1)
+                default_failed_index = len(steps) - 1 if recorded or saved.get("status") == "applied" else min(len(failure.get("methods") or []), len(steps) - 1)
                 failed_index = job["offset"] + int(failure.get("failed_index", default_failed_index))
                 failed = failure.get("failed") or steps[-1]["method"]
                 self.drafts.mark(token, "partial", failed_at=time.time(), result=list(results),
@@ -4542,6 +4553,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         matches = [
             row for row in rows
             if (str(row.get("active") or "Y").upper() not in {"N", "FALSE", "0"})
+            and str(row.get("offer_id")) == str(offer_id)
             and (str(row.get("order_id")) == str(order_id) if order_id is not None else True)
             and (parts.sku_exact(str(row.get("sku") or "")) == sku_key if sku_key
                  else bool(name_key) and parts.normalize_text(str(row.get("name") or "")) == name_key)
@@ -4554,15 +4566,24 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             return {"error": "Найдено несколько одинаковых позиций; однозначно подтвердить записанную строку нельзя"}
         line = matches[0]
         actual_price = _money(line.get("price"))
-        quantity = _money(line.get("qty"))
-        if quantity != int(quantity):
-            return {"error": "CRM вернула дробное количество штучной позиции; результат не подтверждён"}
-        actual_qty = int(quantity)
+        # QUANTITY из списка товаров документирован как «количество», но в
+        # неоднозначное значение может относиться к складским данным.
+        # При расхождении без явного QUANTITY_CURRENT не выдаём догадку за факт.
+        raw_qty = line.get("qty")
+        try:
+            quantity = float(raw_qty) if raw_qty is not None and not isinstance(raw_qty, bool) else float("nan")
+        except (TypeError, ValueError):
+            quantity = float("nan")
+        valid_qty = math.isfinite(quantity) and quantity > 0 and quantity.is_integer()
+        actual_qty = int(quantity) if valid_qty else None
         problems: list[str] = []
         if wanted_price and abs(actual_price - wanted_price) > 0.01:
             problems.append(f"цена в сделке {actual_price:.0f} ₽ вместо {wanted_price:.0f} ₽")
         if actual_qty != wanted_qty:
-            problems.append(f"количество {actual_qty} вместо {wanted_qty}")
+            if line.get("qty_source") == "QUANTITY_CURRENT" and actual_qty is not None:
+                problems.append(f"количество в строке {actual_qty} вместо {wanted_qty}")
+            else:
+                problems.append("не удалось надёжно проверить количество в строке сделки")
         return {
             "order_id": line.get("order_id"),
             "price": actual_price,
@@ -4578,8 +4599,6 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         details: list[dict[str, Any]] = []
         for check in items or []:
             info = self._check_added_line(check)
-            if info.get("problems") and self._fix_added_line(info):
-                info = self._check_added_line(check)
             details.append({"sku": check.get("sku"), "name": check.get("name"), **info})
             if info.get("error"):
                 problems.append(f"«{check.get('sku') or check.get('name')}»: {info['error']}")
@@ -4589,59 +4608,22 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if not problems:
             return None, details
         return (
-            "STOCRM записал часть позиций по-своему — " + "; ".join(problems) +
-            ". Скорее всего в панели включено правило наценки или своё количество: "
-            "поправьте эти строки в карточке сделки или напишите «поменяй цену»"
+            "Результат записи требует проверки — " + "; ".join(problems) +
+            ". Проверьте эти строки в карточке сделки; не повторяйте заявку вслепую."
         ), details
 
     def _verify_added_line(self, check: dict[str, Any]) -> str | None:
         """Проверяет по панели, что позиция легла в сделку с нашей ценой и количеством.
 
-        Зачем: панель может применить своё правило наценки или своё количество.
-        В разборе 29.10 человек назвал цену 6000 ₽, а в сделке оказалось 7800 ₽
-        (панель применила наценку 30%) и «количество 1000000». Молчать об этом нельзя.
+        Не делаем вывод об остатке склада по неоднозначному полю количества.
         """
         info = self._check_added_line(check)
         if info.get("error"):
             return str(info["error"])
         if not info.get("problems"):
             return None
-        return ("STOCRM записал позицию по-своему: " + ", ".join(info["problems"]) +
-                ". Скорее всего в панели включено правило наценки или своё количество — "
-                "поправьте строку в карточке сделки или напишите «поменяй цену»")
-
-    def _fix_added_line(self, info: dict[str, Any]) -> bool:
-        """Пытается поправить цену/количество строки сразу после добавления.
-
-        Панель иногда записывает позицию со своим количеством (1000000) или с наценкой.
-        Раньше бот только жаловался. Теперь сначала пробует дотянуть строку до того, что
-        просил человек, и лишь если не вышло — говорит об этом.
-        """
-        order_id = info.get("order_id")
-        if not order_id:
-            return False
-        payload = {
-            "ORDER_ID": int(order_id),
-            "PRICE": float(info.get("wanted_price") or info.get("price") or 0),
-            "QUANTITY": int(info.get("wanted_qty") or info.get("qty") or 1),
-            "CURRENT_VOLUME": int(info.get("wanted_qty") or info.get("qty") or 1),
-        }
-        for method in self.price_methods:
-            if self._is_missing_method(method):
-                continue
-            try:
-                self.client.call(method, dict(payload))
-            except StocrmError as exc:
-                if _no_such_method(exc):
-                    self._remember_price_method(method, ok=False)
-                elif exc.code is None or exc.code in (401, 403, 429) or exc.code >= 500:
-                    return False
-                continue
-            self._remember_price_method(method, ok=True)
-            self._invalidate_cache()
-            log.info("позиция %s дотянута до нужных цены/количества методом %s", order_id, method)
-            return True
-        return False
+        return ("Результат записи требует проверки: " + ", ".join(info["problems"]) +
+                ". Проверьте строку в карточке сделки; не повторяйте добавление вслепую")
 
     def _draft_already_done(self, draft: dict[str, Any]) -> bool:
         """Проверка «дело уже сделано» для необязательных шагов черновика."""
@@ -4941,10 +4923,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if problem:
                 self.audit.write("write.unexpected", tool=draft["tool"], method=methods[0],
                                  payload=draft["payload"], error=problem, token=token)
-                self.drafts.mark(token, "partial" if "offer/order/add_free_order" in methods else "applied", applied_at=time.time(), result=result,
+                self.drafts.mark(token, "partial", applied_at=time.time(), result=result,
                                  check_warning=problem)
                 return {
-                    "status": "partial" if "offer/order/add_free_order" in methods else "applied",
+                    "status": "partial",
                     "verified": False,
                     "token": token,
                     "method": methods[0],
@@ -4953,24 +4935,21 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     "warning": problem,
                 }
         if check.get("kind") == "added_line":
-            info = self._check_added_line(check)
-            if info.get("problems") and self._fix_added_line(info):
-                # панель записала по-своему — попробовали поправить и перечитали заново
-                info = self._check_added_line(check)
+            info = (self._check_added_line(check) if check.get("order_id") else
+                    {"error": "CRM не вернула номер созданной строки: нельзя отличить её от старых позиций. Проверьте сделку, не повторяйте заявку."})
             problem = None
             if info.get("error"):
                 problem = str(info["error"])
             elif info.get("problems"):
-                problem = ("STOCRM записал позицию по-своему: " + ", ".join(info["problems"]) +
-                           ". Скорее всего в панели включено правило наценки или своё количество — "
-                           "поправьте строку в карточке сделки или напишите «поменяй цену»")
+                problem = ("Результат записи требует проверки: " + ", ".join(info["problems"]) +
+                           ". Проверьте строку в карточке сделки; не повторяйте заявку вслепую.")
             if problem:
                 self.audit.write("write.unexpected", tool=draft["tool"], method=methods[0],
                                  payload=draft["payload"], error=problem, token=token)
-                self.drafts.mark(token, "partial" if "offer/order/add_free_order" in methods else "applied", applied_at=time.time(), result=result,
+                self.drafts.mark(token, "partial", applied_at=time.time(), result=result,
                                  check_warning=problem)
                 return {
-                    "status": "partial" if "offer/order/add_free_order" in methods else "applied",
+                    "status": "partial",
                     "verified": False,
                     "token": token,
                     "method": methods[0],
