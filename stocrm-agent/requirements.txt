@@ -1,0 +1,13 @@
+# ядро (MCP-сервер + инструменты)
+mcp>=1.2.0
+requests>=2.31.0
+
+# Telegram-бот
+aiogram>=3.13
+httpx[socks]>=0.27
+
+# опционально: локальное распознавание речи без внешних API
+#   pip install faster-whisper
+
+# SOCKS5-прокси для Telegram (нужен, если api.telegram.org недоступен напрямую)
+aiohttp-socks>=0.8

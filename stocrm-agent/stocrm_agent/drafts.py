@@ -1,0 +1,489 @@
+"""Черновики изменений (write-with-confirmation).
+
+Идея: агент НИКОГДА не вызывает изменяющий метод API напрямую. Он создаёт
+черновик — описание операции + человекочитаемое резюме. Запись в STOCRM
+происходит только после явного подтверждения человеком (`apply`), при этом
+проверяется целостность черновика (payload не подменили) и срок его жизни.
+"""
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import logging
+import json
+import secrets
+import threading
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+try:  # POSIX: защита от одновременной записи ботом и CLI
+    import fcntl
+except ImportError:  # pragma: no cover — Windows
+    fcntl = None  # type: ignore[assignment]
+
+log = logging.getLogger("stocrm.drafts")
+
+PENDING = "pending"
+APPLIED = "applied"
+PARTIAL = "partial"      # часть шагов выполнена, продолжать нельзя — нужен человек
+DISCARDED = "discarded"
+EXPIRED = "expired"
+APPLYING = "applying"   # черновик захвачен на применение другим процессом
+PURGE_AFTER_DAYS = 7       # сколько дней хранить закрытые черновики
+
+
+def _fingerprint(method: str, payload: dict[str, Any], steps: list[dict[str, Any]] | None = None) -> str:
+    blob = json.dumps(
+        {"method": method, "payload": payload, "steps": steps or []},
+        sort_keys=True, ensure_ascii=False, default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _shift_step_refs(steps: list[dict[str, Any]], shift: int,
+                     mapping: dict[int, int] | None = None) -> list[dict[str, Any]]:
+    """Сдвигает ссылки `{"$from_step": N}`: шаги дописываются в конец или удаляются.
+
+    shift — при дописывании шагов в конец; mapping — при удалении части шагов
+    (старый номер → новый). Если ссылка указывает на удалённый шаг, он тоже
+    считается ненужным и уходит из черновика.
+    """
+    if not shift and mapping is None:
+        return steps
+    dropped = object()
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, dict):
+            if "$from_step" in value and len(value) == 1:
+                index = int(value["$from_step"])
+                if mapping is not None:
+                    if index not in mapping:
+                        return dropped
+                    return {"$from_step": mapping[index]}
+                return {"$from_step": index + shift}
+            out = {}
+            for key, item in value.items():
+                walked = walk(item)
+                if walked is dropped:
+                    return dropped
+                out[key] = walked
+            return out
+        if isinstance(value, list):
+            out_list = []
+            for item in value:
+                walked = walk(item)
+                if walked is dropped:
+                    return dropped
+                out_list.append(walked)
+            return out_list
+        return value
+
+    result = []
+    for step in steps:
+        new_step = dict(step)
+        new_step["payload"] = walk(step.get("payload"))
+        fallbacks = step.get("fallbacks")
+        if isinstance(fallbacks, list):
+            new_step["fallbacks"] = [fb for fb in (walk(item) for item in fallbacks)
+                                     if fb is not dropped]
+        result.append(new_step)
+    return result
+
+
+def _step_refs(payload: Any) -> set[int]:
+    """Номера шагов, на которые ссылается payload."""
+    found: set[int] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            if "$from_step" in value and len(value) == 1:
+                found.add(int(value["$from_step"]))
+                return
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(payload)
+    return found
+
+
+class DraftStore:
+    """Простое файловое хранилище черновиков (без БД — зависит от масштаба)."""
+
+    def __init__(self, path: Path, ttl_seconds: int = 3600) -> None:
+        self.path = Path(path)
+        self.ttl = ttl_seconds
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._data: dict[str, dict[str, Any]] = {}
+        self._data = self._load()
+
+    @contextlib.contextmanager
+    def _locked(self, *, reload: bool = True) -> Iterator[None]:
+        """Потокобезопасность + межпроцессная блокировка (бот и CLI в разных процессах)."""
+        with self._lock:
+            lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+            handle = None
+            try:
+                if fcntl is not None:
+                    handle = open(lock_path, "a+")  # noqa: SIM115
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                if reload:  # подхватываем изменения, сделанные другим процессом
+                    self._data = self._load()
+                yield
+            finally:
+                if handle is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    handle.close()
+
+    # ------------------------------------------------------------------ io
+    def _load(self) -> dict[str, dict[str, Any]]:
+        """Читает файл черновиков. Битый файл НЕ обнуляет то, что уже в памяти.
+
+        Раньше повреждённый JSON возвращал пустой словарь, и следующая же запись
+        затирала файл — все ожидающие подтверждения черновики исчезали.
+        """
+        if not self.path.exists():
+            return dict(self._data) if getattr(self, "_data", None) else {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("файл черновиков не читается (%s) — работаю с тем, что в памяти", exc)
+            # Битый файл откладываем в сторону: иначе первая же запись затрёт его,
+            # и восстановить ожидающие подтверждения будет невозможно.
+            with contextlib.suppress(OSError):
+                broken = self.path.with_suffix(f".broken-{int(time.time())}.json")
+                self.path.replace(broken)
+                log.warning("битый файл черновиков сохранён как %s", broken.name)
+            return dict(getattr(self, "_data", {}) or {})
+        if not isinstance(data, dict):
+            log.warning("файл черновиков неожиданного вида — работаю с тем, что в памяти")
+            return dict(getattr(self, "_data", {}) or {})
+        return data
+
+    def _save(self) -> None:
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+
+    # --------------------------------------------------------------- public
+    def create(
+        self,
+        *,
+        tool: str,
+        method: str,
+        payload: dict[str, Any],
+        summary: str,
+        risk: str = "medium",
+        steps: list[dict[str, Any]] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Черновик операции. `steps` — для составных действий (создать задачу →
+        назначить ответственного): список {"method","payload"}, где в payload можно
+        ссылаться на результат предыдущего шага через {"$from_step": 0}."""
+        with self._locked():
+            return self._create_unlocked(
+                tool=tool, method=method, payload=payload, summary=summary, risk=risk,
+                steps=steps, extra=extra,
+            )
+
+    def _create_unlocked(
+        self,
+        *,
+        tool: str,
+        method: str,
+        payload: dict[str, Any],
+        summary: str,
+        risk: str,
+        steps: list[dict[str, Any]] | None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        token = f"draft_{secrets.token_hex(4)}"
+        draft = {
+            "token": token,
+            "tool": tool,
+            "method": method,
+            "payload": payload,
+            "steps": steps or [],
+            "summary": summary,
+            "risk": risk,
+            "status": PENDING,
+            "created_at": time.time(),
+            "expires_at": time.time() + self.ttl,
+            "fingerprint": _fingerprint(method, payload, steps),
+        }
+        # extra — служебные поля конкретного действия (например, что проверить
+        # в панели после записи). В отпечаток не входят: он про method/payload/steps.
+        if extra:
+            draft.update(extra)
+        from .diagnostics import TRACE_ID
+        if TRACE_ID.get():
+            draft["trace_id"] = TRACE_ID.get()
+        self._data[token] = draft
+        self._save()
+        return draft
+
+    def extend(
+        self,
+        token: str,
+        *,
+        steps: list[dict[str, Any]],
+        summary: str | None = None,
+        extra: dict[str, Any] | None = None,
+        shift: int = 0,
+    ) -> dict[str, Any]:
+        """Дописывает шаги в уже подготовленный черновик — одно «Применить» на всё.
+
+        Зачем: просьба «добавь пять артикулов» превращалась в пять карточек с пятью
+        кнопками «Применить». Человеку приходилось нажимать пять раз, а если он
+        закрывал чат — часть позиций терялась. Теперь позиции складываются в ОДИН
+        черновик: шаги дописываются в конец, ссылки `{"$from_step": N}` внутри
+        новых шагов сдвигаются на `shift` (номер первого добавленного шага).
+        """
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft["status"] != PENDING:
+                raise ValueError(
+                    f"Черновик {token} в статусе «{draft['status']}» — дописать в него нельзя"
+                )
+            extra_steps = _shift_step_refs(list(steps or []), int(shift))
+            draft["steps"] = list(draft.get("steps") or []) + extra_steps
+            if not draft.get("method") and draft["steps"]:
+                # черновик-«заготовка»: метод берём у первого шага
+                draft["method"] = draft["steps"][0].get("method") or ""
+                draft["payload"] = draft["steps"][0].get("payload") or {}
+            if summary:
+                draft["summary"] = summary
+            if extra:
+                draft.update(extra)
+            draft["expires_at"] = time.time() + self.ttl
+            draft["fingerprint"] = _fingerprint(draft["method"], draft["payload"], draft["steps"])
+            self._save()
+            return dict(draft)
+
+    def remove_steps(
+        self,
+        token: str,
+        indices: list[int],
+        *,
+        summary: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Убирает из черновика часть шагов — «отменить одну позицию из просьбы».
+
+        Ссылки `{"$from_step": N}` на оставшиеся шаги перенумеровываются; если шаг
+        ссылался на удаляемый (то есть без него бессмысленен), он тоже удаляется.
+        Так из общего черновика можно выкинуть одну запчасть, не трогая остальные.
+        """
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft["status"] != PENDING:
+                raise ValueError(
+                    f"Черновик {token} в статусе «{draft['status']}» — менять его нельзя"
+                )
+            current = list(draft.get("steps") or [])
+            drop = {int(i) for i in indices if 0 <= int(i) < len(current)}
+            # шаги, которые ссылаются на удаляемые, уходят вместе с ними
+            changed = True
+            while changed:
+                changed = False
+                for index, step in enumerate(current):
+                    if index in drop:
+                        continue
+                    for ref in _step_refs(step.get("payload")):
+                        if ref in drop:
+                            drop.add(index)
+                            changed = True
+                            break
+            keep = [index for index in range(len(current)) if index not in drop]
+            mapping = {old: new for new, old in enumerate(keep)}
+            steps = [_shift_step_refs([current[index]], 0, mapping)[0] for index in keep]
+            draft["steps"] = steps
+            if not steps:
+                raise ValueError("в черновике не осталось действий")
+            if not draft.get("method"):
+                draft["method"] = steps[0].get("method") or ""
+                draft["payload"] = steps[0].get("payload") or {}
+            if summary:
+                draft["summary"] = summary
+            if extra:
+                draft.update(extra)
+            draft["fingerprint"] = _fingerprint(draft["method"], draft["payload"], draft["steps"])
+            self._save()
+            return dict(draft)
+
+    def get(self, token: str) -> dict[str, Any]:
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft["status"] == EXPIRED and time.time() > draft["expires_at"] and self._data.get(token):
+                self._save()
+            return draft
+
+    def _expire_unlocked(self) -> bool:
+        """Помечает просроченные черновики. Возвращает True, если что-то изменилось."""
+        now = time.time()
+        changed = False
+        for draft in self._data.values():
+            if draft.get("status") == PENDING and now > draft.get("expires_at", 0):
+                draft["status"] = EXPIRED
+                changed = True
+        return changed
+
+    def _purge_unlocked(self, keep_days: int = PURGE_AFTER_DAYS) -> int:
+        """Убирает старые закрытые черновики, чтобы файл не рос бесконечно."""
+        cutoff = time.time() - keep_days * 86400
+        drop = [
+            token for token, draft in self._data.items()
+            if draft.get("status") not in (PENDING, PARTIAL)
+            and float(draft.get("created_at") or 0) < cutoff
+        ]
+        for token in drop:
+            del self._data[token]
+        return len(drop)
+
+    def purge(self, keep_days: int = PURGE_AFTER_DAYS) -> int:
+        with self._locked():
+            removed = self._purge_unlocked(keep_days)
+            if removed:
+                self._save()
+            return removed
+
+    def _get_unlocked(self, token: str) -> dict[str, Any]:
+        draft = self._data.get(token)
+        if draft is None:
+            raise KeyError(f"Черновик {token} не найден")
+        if draft["status"] == PENDING and time.time() > draft["expires_at"]:
+            draft["status"] = EXPIRED     # сохранит тот, кто вызвал (без записи на каждый черновик)
+        return draft
+
+    def list(self, status: str = PENDING) -> list[dict[str, Any]]:
+        with self._locked():
+            changed = self._expire_unlocked()
+            removed = self._purge_unlocked()
+            if changed or removed:
+                self._save()        # одна запись на весь список, а не на каждый черновик
+            out = [
+                draft for token, draft in self._data.items()
+                if not draft.get("queue_parent") and (status == "all" or draft["status"] == status)
+            ]
+            return sorted(out, key=lambda d: d.get("created_at", 0), reverse=True)
+
+    def mark(self, token: str, status: str, **extra: Any) -> dict[str, Any]:
+        with self._locked():
+            draft = self._get_unlocked(token)
+            draft["status"] = status
+            draft.update(extra)
+            self._save()
+            return draft
+
+    def archive(self, token: str) -> dict[str, Any]:
+        """Убрать из списка, не отменяя и не удаляя ничего в CRM."""
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft["status"] not in (PENDING, PARTIAL, EXPIRED):
+                raise ValueError("Этот черновик уже закрыт или применяется; архивирование запрещено")
+            draft["status"] = DISCARDED
+            self._save()
+            return dict(draft)
+
+    def resolve_partial(self, token: str, review: dict[str, Any]) -> dict[str, Any]:
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft["status"] != PARTIAL or not review.get("verified"):
+                raise ValueError("Черновик не может быть подтверждён без свежей проверки CRM")
+            draft.update(status=APPLIED, applied_at=time.time(), review=review)
+            self._save()
+            return dict(draft)
+
+    def create_recovery(self, token: str, step: dict[str, Any], check: dict[str, Any]) -> dict[str, Any]:
+        with self._locked():
+            parent = self._get_unlocked(token)
+            if parent["status"] != PARTIAL:
+                raise ValueError("Черновик больше не требует восстановления")
+            if _fingerprint(parent["method"], parent["payload"], parent.get("steps")) != parent["fingerprint"]:
+                raise ValueError("Целостность черновика нарушена; продолжение запрещено")
+            if parent.get("recovery_token"):
+                raise ValueError("Продолжение уже подготовлено. Откройте /drafts; второй черновик не создаю")
+            from .parts import canonical_brand, sku_exact
+            item = check["items"][0] if check.get("kind") == "added_lines" else check
+            for candidate in self._data.values():
+                if candidate.get("status") != PENDING or not candidate.get("recovery_parent"):
+                    continue
+                other = candidate.get("check") or {}
+                other = other["items"][0] if other.get("kind") == "added_lines" else other
+                if (str(other.get("offer_id")) == str(item.get("offer_id"))
+                        and sku_exact(other.get("sku")) == sku_exact(item.get("sku"))
+                        and canonical_brand(other.get("brand")) == canonical_brand(item.get("brand"))):
+                    raise ValueError("Продолжение для этой позиции уже есть в /drafts. Второй черновик создаст риск дубля")
+            child = self._create_unlocked(tool="add_offer_part", method=step["method"],
+                payload=step["payload"], steps=[step], summary="Доделать без повторного создания искомой запчасти: " + parent["summary"],
+                risk="medium", extra={"check": check, "recovery_parent": token})
+            parent["recovery_token"] = child["token"]
+            self._save()
+            return dict(child)
+
+    def claim(self, token: str) -> dict[str, Any]:
+        """Атомарно: проверить черновик И захватить его на применение.
+
+        Раньше проверка и пометка были двумя разными блокировками, поэтому два
+        одновременных «Применить» (бот и CLI) оба проходили проверку и писали в CRM
+        дважды. Теперь между проверкой и захватом нельзя вклиниться.
+        """
+        with self._locked():
+            draft = self._verify_unlocked(token)
+            draft["status"] = APPLYING
+            draft["claimed_at"] = time.time()
+            self._save()
+            return dict(draft)
+
+    def release(self, token: str, reason: str = "") -> dict[str, Any]:
+        """Возвращает захваченный черновик в «ожидает подтверждения».
+
+        Нужно только для случая, когда в CRM не выполнился **ни один** шаг:
+        изменений нет, значит и дубликатов быть не может — человек должен иметь
+        возможность нажать «Применить» ещё раз (например, когда сделку закроют).
+        """
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft["status"] == APPLYING:
+                draft["status"] = PENDING
+                draft.pop("claimed_at", None)
+                if reason:
+                    draft["last_error"] = reason
+                    draft["last_error_at"] = time.time()
+                self._save()
+            return dict(draft)
+
+    def verify(self, token: str) -> dict[str, Any]:
+        """Проверяет, что черновик ещё можно применять и его не подменили."""
+        with self._locked():
+            return self._verify_unlocked(token)
+
+    def _verify_unlocked(self, token: str) -> dict[str, Any]:
+        draft = self._get_unlocked(token)
+        if draft["status"] == EXPIRED:
+            raise ValueError(f"Черновик {token} истёк — создайте новый")
+        if draft["status"] == PARTIAL:
+            done = ", ".join((draft.get("done_steps") or {}).get("methods", []))
+            raise ValueError(
+                f"Черновик {token} выполнен частично ({done}). Повторное применение создаст "
+                "дубликаты — проверьте сделку в STOCRM и создайте новый черновик при необходимости"
+            )
+        if draft["status"] == APPLYING:
+            raise ValueError(
+                f"Черновик {token} уже применяется (возможно, в другом окне бота или в CLI). "
+                "Если действие не появилось в STOCRM — проверьте сделку и создайте черновик заново"
+            )
+        if draft["status"] != PENDING:
+            raise ValueError(f"Черновик {token} в статусе «{draft['status']}», применять нельзя")
+        if time.time() > draft["expires_at"]:
+            draft["status"] = EXPIRED
+            self._save()
+            raise ValueError(f"Черновик {token} истёк — создайте новый")
+        if _fingerprint(draft["method"], draft["payload"], draft.get("steps")) != draft["fingerprint"]:
+            raise ValueError("Целостность черновика нарушена, применение заблокировано")
+        return draft
