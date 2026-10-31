@@ -52,19 +52,37 @@ def _label(value: str, secrets: tuple[str, str]) -> str:
     return clean[:120] or "Без названия"
 
 
-def _rejection_code(message: str, secrets: tuple[str, str]) -> str:
-    """Только фиксированные категории; ни сообщение сервера, ни секреты не выводятся."""
+def _classification_text(message: str, secrets: tuple[str, str]) -> str:
+    # Не даём содержимому ключей влиять на классификацию сообщения.
     text = message.casefold()
     for secret in sorted(secrets, key=len, reverse=True):
         if secret:
             text = text.replace(secret.casefold(), " ")
+    return text
+
+
+def _rejection_code(message: str, secrets: tuple[str, str]) -> str:
+    """Только фиксированные категории; ни сообщение сервера, ни секреты не выводятся."""
+    text = _classification_text(message, secrets)
     if any(word in text for word in ("лимит", "превыш", "rate limit", "too many", "limit exceeded")):
         return "R02"
     if re.search(r"(?<![a-zа-яё])ip(?![a-zа-яё])", text) or "ip-адрес" in text or "ip адрес" in text:
         return "R03"
-    if any(word in text for word in ("авторизац", "аутентификац", "авториз", "ключ", "парол", "логин", "credential", "unauthor", "authentication", "invalid key", "invalid api key", "key1", "key2")):
+    if any(word in text for word in ("авторизац", "аутентификац", "авториз", "ключ", "парол", "логин", "credential", "unauthor", "authentication", "authorization", "auth failed", "api key", "api-key", "invalid key", "key1", "key2")):
         return "R01"
     return "R04"
+
+
+def _auth_detail(message: str, secrets: tuple[str, str]) -> str:
+    """Приблизительная классификация слов, не доказательство причины сбоя."""
+    text = _classification_text(message, secrets)
+    groups = (
+        ("A1", ("не указан", "не передан", "не введ", "не ввел", "не заполн", "не задан", "не найден", "отсутств", "missing", "not provided", "not supplied", "not specified", "not found")),
+        ("A2", ("неверн", "неправильн", "некорректн", "не действител", "недействител", "ошибочн", "invalid", "incorrect", "wrong")),
+        ("A3", ("нет доступа", "доступ запрещ", "доступ огранич", "отключ", "заблок", "запрещ", "permission denied", "forbidden", "disabled", "blocked", "access denied")),
+    )
+    matches = [code for code, words in groups if any(word in text for word in words)]
+    return matches[0] if len(matches) == 1 else "A4"
 
 
 def _rejection_message(message: str, secrets: tuple[str, str]) -> str:
@@ -75,6 +93,16 @@ def _rejection_message(message: str, secrets: tuple[str, str]) -> str:
         "R03": "В ответе упоминается IP-адрес. Проверьте локальные настройки доступа API в кабинете Росско.",
         "R04": "Категорию отказа определить не удалось.",
     }
+    if code == "R01":
+        detail = _auth_detail(message, secrets)
+        notes = {
+            "A1": "В ответе есть слова об отсутствующих или непереданных данных.",
+            "A2": "В ответе есть слова о неверных или некорректных данных.",
+            "A3": "В ответе есть слова об ограничении доступа или блокировке.",
+            "A4": "Уточнить категорию по ответу не удалось или в нём несколько признаков.",
+        }
+        return (f"Росско не подтвердил запрос. Код R01, уточнение {detail}. {notes[detail]} "
+                "Это подсказка по словам, а не подтверждённая причина. Настройки не изменены.")
     return f"Росско не подтвердил запрос. Код {code}. {hints[code]} Настройки не изменены."
 
 
