@@ -84,15 +84,27 @@ def search_brands(sku: str) -> dict[str, Any]:
     key2 = os.getenv("ROSSKO_KEY2", "").strip()
     delivery = os.getenv("ROSSKO_DELIVERY_ID", "").strip()
     address = os.getenv("ROSSKO_ADDRESS_ID", "").strip()
-    if not key1 or not key2 or not delivery or not delivery.isdigit() or (address and not address.isdigit()):
-        return {"status": "unavailable", "brands": [], "error": "не заданы ключи или корректные ID доставки"}
+    if not key1 or not key2:
+        return {"status": "unavailable", "brands": [], "error": "локально не заданы оба ключа Росско"}
+    if (delivery and not delivery.isdigit()) or (address and (not address.isdigit() or not delivery)):
+        return {"status": "unavailable", "brands": [], "error": "некорректные настройки ID доставки"}
+
+    def unavailable(reason: str) -> dict[str, Any]:
+        suffix = (" Запрос был без ID доставки; документация Росско указывает его обязательным, "
+                  "но причина отказа не установлена." if not delivery else "")
+        return {"status": "unavailable", "brands": [], "error": reason + suffix}
     if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 ./_-]{3,64}", sku) or not parts.sku_exact(sku):
         return {"status": "skipped", "brands": []}
     envelope = ET.Element(f"{{{_SOAP}}}Envelope")
     body = ET.SubElement(envelope, f"{{{_SOAP}}}Body")
     request = ET.SubElement(body, f"{{{_SERVICE}}}GetSearch")
-    for field, value in (("KEY1", key1), ("KEY2", key2), ("text", sku), ("delivery_id", delivery)):
+    for field, value in (("KEY1", key1), ("KEY2", key2), ("text", sku)):
         ET.SubElement(request, f"{{{_SERVICE}}}{field}").text = value
+    # Пробный запрос без ID не подставляет выдуманные значения и не пытается
+    # получить настройки другими методами. Документация требует delivery_id,
+    # поэтому сервер может его отклонить.
+    if delivery:
+        ET.SubElement(request, f"{{{_SERVICE}}}delivery_id").text = delivery
     if address:
         ET.SubElement(request, f"{{{_SERVICE}}}address_id").text = address
     payload = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
@@ -111,15 +123,15 @@ def search_brands(sku: str) -> dict[str, Any]:
                               headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": _SEARCH_URL},
                               timeout=(2, 3), allow_redirects=False, stream=True, verify=True) as response:
                 if response.status_code != 200:
-                    return {"status": "unavailable", "brands": [], "error": f"HTTP {response.status_code}"}
+                    return unavailable(f"Сервер вернул HTTP {response.status_code}.")
                 content = bytearray()
                 for chunk in response.iter_content(16384):
                     content.extend(chunk)
                     if time.monotonic() > deadline:
-                        return {"status": "unavailable", "brands": [], "error": "тайм-аут ответа"}
+                        return unavailable("Истёк тайм-аут ответа.")
                     if len(content) > _MAX_RESPONSE:
-                        return {"status": "unavailable", "brands": [], "error": "ответ слишком большой"}
+                        return unavailable("Ответ слишком большой.")
         rows = _parse(bytes(content), sku)
     except (requests.RequestException, ValueError, ET.ParseError, OSError):
-        return {"status": "unavailable", "brands": [], "error": "сеть, настройки или ответ Росско не подтверждены"}
+        return unavailable("Сеть, настройки или ответ Росско не подтверждены.")
     return {"status": "ok" if rows else "empty", "brands": rows}

@@ -2525,7 +2525,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "brand": brand,
             "internet": online,
             "stock_lookup": stock_lookup,
-            "rossko": {"status": rossko_result.get("status"), "count": len(rossko_result.get("brands") or [])},
+            "rossko": {"status": rossko_result.get("status"), "count": len(rossko_result.get("brands") or []),
+                       **({"error": rossko_result["error"]} if rossko_result.get("error") else {})},
             "candidates": ranked,
             "best": ranked[0] if status == "matched" and ranked else None,
         }

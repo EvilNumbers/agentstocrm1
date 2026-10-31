@@ -94,7 +94,7 @@ def run_partcheck(tools: Toolset, query: str) -> list[Check]:
     elif state == "empty":
         checks.append(Check(INFO, "Росско: точных брендов в ответе нет", "Выдача ограничена и зависит от настроек; это не доказывает отсутствие детали."))
     elif state == "unavailable":
-        checks.append(Check(WARN, "Росско: поиск не выполнен", "Проверьте локальные настройки, сеть и доступ; отсутствие детали не доказано."))
+        checks.append(Check(WARN, "Росско: поиск не выполнен", str(rossko.get("error") or "Проверьте локальные настройки, сеть и доступ; отсутствие детали не доказано.")))
     elif state == "disabled":
         checks.append(Check(INFO, "Росско: поиск отключён", "Для подключения нужны локальные настройки, не отправляйте ключи в чат."))
     else:
