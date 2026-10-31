@@ -971,8 +971,9 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         await message.answer(
             f"🔧 Режим: БОЕВОЙ (STOCRM_MOCK=0).\n"
             f"Панель: {cfg.domain}.stocrm.ru\n"
-            "Сделки и остатки читаются из настоящей панели. Записи — только после "
-            "подтверждения кнопкой. Проверить связь: /crm_test." + version
+            "Сделки и остатки читаются из настоящей панели. Подтверждение записи "
+            "зависит от текущих настроек в /settings; отдельные действия могут выполняться сразу. "
+            "Проверить связь: /crm_test." + version
         )
 
     @router.message(F.text.startswith("/crm_test"))

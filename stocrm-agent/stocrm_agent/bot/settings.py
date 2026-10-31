@@ -109,7 +109,7 @@ class BotSettings:
             stt_model=_env("STT_MODEL", stt_model or "whisper-1"),
             stt_language=os.getenv("STT_LANGUAGE", "ru"),
             stt_local_model=os.getenv("STT_LOCAL_MODEL", "small"),
-            stt_prompt=os.getenv("STT_PROMPT", "автосервис, заказ-наряд, замена масла, колодки, диагностика, VIN, артикул"),
+            stt_prompt=os.getenv("STT_PROMPT", "автосервис, сделка, номер сделки, заказ-наряд, услуга, работа, товар, артикул, бренд, замена масла, диагностика, катушка зажигания, VIN"),
             llm_provider=llm_provider or ("custom" if _env("LLM_BASE_URL") else "openai"),
             llm_base_url=_env("LLM_BASE_URL", preset_url or "https://api.openai.com/v1").rstrip("/"),
             llm_api_key=(

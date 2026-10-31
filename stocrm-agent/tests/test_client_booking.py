@@ -48,7 +48,7 @@ def test_reproduces_screenshot_without_stale_offer(env):
     assert send(pipe, 'Запиши сделку 1654 на сегодня', history).pending_booking['field'] == 'change_status'
     assert 'отменена' in send(pipe, 'Отмена', history).answer
     result = send(pipe, request('89001112233'), history)
-    assert result.pending_booking['field'] == 'client_name'
+    assert result.pending_booking['field'] == 'offer_choice'
     assert '1654' not in result.answer
     args = result.pending_booking['args']
     assert args['phone'] == '89001112233' and args['master'] == 'Андрею'
@@ -59,7 +59,8 @@ def test_reproduces_screenshot_without_stale_offer(env):
 def test_new_client_dialog_and_confirmed_readback(env):
     session, tools, pipe = env
     history = []
-    assert send(pipe, request('89001112233'), history).pending_booking['field'] == 'client_name'
+    assert send(pipe, request('89001112233'), history).pending_booking['field'] == 'offer_choice'
+    assert send(pipe, '1', history).pending_booking['field'] == 'client_name'
     after_name = send(pipe, 'Новый Клиент', history)
     assert after_name.pending_booking['field'] == 'duration_minutes', after_name.answer
     ready = send(pipe, 'час', history)
@@ -121,7 +122,8 @@ def test_only_specified_closed_statuses_are_excluded(env, closed):
     session, _, pipe = env
     session.data['offers/get_from_filter'][0]['STATUS_NAME'] = closed
     result=send(pipe, request(), [])
-    assert result.pending_booking['field'] == 'duration_minutes', result.answer
+    assert result.pending_booking['field'] == 'offer_choice', result.answer
+    assert [o['value'] for o in result.pending_booking['options']] == ['new']
     assert not writes(session)
 
 
@@ -193,7 +195,7 @@ def test_explicit_wrong_offer_with_phone_rejected(env):
 def test_direct_new_offer_cannot_bypass_active_choice(env):
     _, tools, _=env
     with pytest.raises(ValueError, match='активные сделки'):
-        tools.draft_book_new_offer(client_name='Иван', phone='89990001122', start='2026-11-20T12:00:00', duration_minutes=60, post_id=11, customer_id=1)
+        tools.draft_book_new_offer(client_name='Иван', phone='89990001122', start='2026-11-20T12:00:00', duration_minutes=60, duration_confirmed=True, post_id=11, customer_id=1)
 
 
 def test_partial_blocks_new_command_for_same_contact(env):
@@ -214,7 +216,7 @@ def test_client_change_during_pending_does_not_reuse_data(env):
     history=[]
     send(pipe, request(), history)
     r=send(pipe, 'Запиши клиента 89001112233 на послезавтра в 15 к Андрею', history)
-    assert r.pending_booking['field']=='client_name'
+    assert r.pending_booking['field']=='offer_choice'
     args=r.pending_booking['args']
     assert args['phone']=='89001112233' and 'contact_id' not in args and 'offer_choice' not in args
     assert args['start'].endswith('T15:00:00')
@@ -286,7 +288,7 @@ def test_existing_booking_automatic_only_if_disabled_in_settings(env):
 
 def test_legacy_new_booking_draft_blocked_before_write(env):
     session, tools, _=env
-    draft=tools.draft_book_new_offer(client_name='Новый', phone='89001112233', start='2026-11-20T12:00:00', duration_minutes=60, post_id=11, customer_id=1)
+    draft=tools.draft_book_new_offer(client_name='Новый', phone='89001112233', start='2026-11-20T12:00:00', duration_minutes=60, duration_confirmed=True, post_id=11, customer_id=1)
     check=dict(draft['check'])
     check.pop('approved_active_ids')
     tools.drafts.mark(draft['token'], 'pending', check=check)
@@ -476,8 +478,10 @@ def test_disappearing_contact_does_not_supply_old_crm_name(env):
     session.data['offers/get_from_filter'][0]['STATUS_NAME']='Мусор'
     history=[]
     first=send(pipe, request(), history)
-    assert first.pending_booking['field']=='duration_minutes'
+    assert first.pending_booking['field']=='offer_choice'
     session.data['contacts/get_from_filter'][0]['MAIN_PHONE']='79991112233'
-    result=send(pipe, 'час', history)
+    result=send(pipe, '1', history)
+    assert result.pending_booking['field']=='offer_choice'
+    result=send(pipe, '1', history)
     assert result.pending_booking['field']=='client_name'
     assert not writes(session)

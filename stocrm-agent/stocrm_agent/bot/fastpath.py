@@ -120,9 +120,7 @@ def format_offer_items(card: dict[str, Any]) -> str:
 
     payments = card.get("payments") or {}
     paid = card.get("paid")
-    if paid is None:
-        paid = payments.get("total") or 0
-    money = f"💰 Оплачено: {_money(paid)} ₽"
+    money = f"💰 Оплачено: {_money(paid)} ₽" if paid is not None else "💰 Оплачено: не удалось проверить"
     by_kind = payments.get("by_kind") or {}
     if by_kind:
         money += " (" + ", ".join(f"{kind} {_money(value)} ₽"
@@ -130,8 +128,10 @@ def format_offer_items(card: dict[str, Any]) -> str:
     lines.append(money)
     if card.get("overpaid"):
         lines.append(f"↩️ Переплата: {_money(card['overpaid'])} ₽")
+    elif card.get("debt") is not None:
+        lines.append(f"📉 Долг (осталось оплатить): {_money(card['debt'])} ₽")
     else:
-        lines.append(f"📉 Долг (осталось оплатить): {_money(card.get('debt'))} ₽")
+        lines.append("⚠️ Долг: не удалось проверить баланс")
     if card.get("items_error"):
         lines.append(f"⚠️ Часть данных не прочиталась: {card['items_error']}")
     return "\n".join(lines)
@@ -165,6 +165,13 @@ def format_offer_card(card: dict[str, Any], *, detailed: bool = False) -> str:
         # в подробном виде ниже будут реальные суммы оплат — «Нет оплаты» из карточки
         # рядом с «Оплачено: 5 000 ₽» только путает
         lines.append(f"Оплата: {card['payment_status']}")
+    if not detailed:
+        if card.get("debt") is not None:
+            lines.append(f"🔴 ДОЛГ: {_money(card['debt'])} ₽" if card['debt'] else "✅ Долг: 0 ₽")
+            if card.get("overpaid"):
+                lines.append(f"↩️ Переплата: {_money(card['overpaid'])} ₽")
+        else:
+            lines.append("⚠️ Долг: не удалось проверить баланс")
     if card.get("responsible"):
         lines.append(f"Ответственный: {card['responsible']}")
     if detailed:
@@ -200,28 +207,48 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _estimate_offers(tools: Any) -> tuple[str, list[int]]:
+def _estimate_offers(tools: Any, *, parts_only: bool = False) -> tuple[str, list[int]]:
+    """Не доверяем серверному фильтру: отбираем только подтверждённые строки."""
     from ..client import read_budget
     try:
         with read_budget(8.0):
             matches = []
             for board in tools.boards():
                 for status in tools.statuses(int(board["board_id"])):
-                    title = str(status.get("title") or "")
-                    if title.lower().replace("ё", "е").startswith("просчет"):
+                    title = str(status.get("title") or "").lower().replace("ё", "е")
+                    if (str(status.get("board_id")) == str(board.get("board_id"))
+                            and title.startswith("просчет") and (not parts_only or "запчаст" in title)):
                         matches.append((board, status))
             if not matches:
-                return "Статус «Просчёт» в полученном справочнике не найден. Уточните название статуса; все сделки вместо фильтра не показываю.", []
+                return "Подходящий статус просчёта в справочнике не найден. Уточните название статуса.", []
             if len(matches) > 1:
                 return "Уточните воронку и статус:\n" + "\n".join(f"• {b['name']} · {s['title']}" for b, s in matches), []
             board, status = matches[0]
-            rows = tools.find_offers(board_id=int(board["board_id"]), status_id=int(status["status_id"]), limit=25)
-            valid = [r for r in rows if str(r.get("status_id")) == str(status["status_id"]) and str(r.get("board_id")) == str(board["board_id"])]
-            if len(valid) != len(rows):
-                return "CRM вернула сделки, не соответствующие выбранному статусу. Фильтр не подтверждён; посторонние сделки не показываю.", []
+            valid: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            complete = False
+            page_size = 100
+            for page in range(1, 6):
+                rows = tools.find_offers(board_id=int(board["board_id"]), status_id=int(status["status_id"]), limit=page_size, page=page)
+                if rows and all(str(r.get("offer_id")) in seen for r in rows):
+                    break  # CRM повторяет страницу, полноту подтвердить нельзя
+                for r in rows:
+                    ident = str(r.get("offer_id") or "")
+                    if not ident or ident in seen:
+                        continue
+                    seen.add(ident)
+                    if str(r.get("status_id")) == str(status["status_id"]) and str(r.get("board_id")) == str(board["board_id"]):
+                        valid.append(r)
+                if len(rows) < page_size:
+                    complete = True
+                    break
+                if len(valid) >= 25:
+                    break
+            valid = valid[:25]
+            qualifier = "" if complete else " Проверка ограничена просмотренными страницами, список может быть неполным."
             if not valid:
-                return f"В полученной выборке нет сделок в статусе «{status['title']}» ({board['name']}).", []
-            return format_offers_list(with_status_colors(tools, valid)) + "\nПоказано до 25 сделок выбранного статуса.", [int(r["offer_id"]) for r in valid]
+                return f"В просмотренных сделках статус «{status['title']}» ({board['name']}) не найден." + qualifier, []
+            return format_offers_list(with_status_colors(tools, valid)) + f"\nСтатус: {status['title']} ({board['name']})." + qualifier, [int(r["offer_id"]) for r in valid]
     except Exception as exc:
         return f"Не удалось закончить чтение сделок в просчёте: {exc}", []
 
@@ -235,8 +262,8 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
     message = (text or "").strip()
     if not message or message.startswith("/"):
         return None
-    if re.fullmatch(r"(?:покажи|покажите|найди|список)\s+сделк[иа]\s+(?:в|на)\s+просч[её]т[еа]?[.!?]?", message, re.I):
-        return _estimate_offers(tools)
+    if re.fullmatch(r"(?:покажи|покажите|найди|список)\s+сделк(?:и|ок)\s+(?:в|на)\s+просч[её]т[еа]?(?:\s+запчаст(?:ей|и|ями))?[.!?]?", message, re.I):
+        return _estimate_offers(tools, parts_only=bool(re.search(r"запчаст", message, re.I)))
     if _is_action(message):
         return None
 
