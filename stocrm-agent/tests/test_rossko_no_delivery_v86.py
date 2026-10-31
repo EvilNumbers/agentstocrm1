@@ -121,40 +121,52 @@ def test_local_config_preserves_other_env_and_clears_ids(tmp_path):
     assert not list(tmp_path.glob('.rossko-env-*'))
 
 
-def test_local_config_does_not_change_on_duplicate_or_bad_key(tmp_path):
+def test_local_config_repairs_duplicate_keys_but_rejects_bad_key(tmp_path):
+    from stocrm_agent.envfile import _parse
     from stocrm_agent.rossko_config import configure_file
     path = tmp_path / '.env'
     text = 'ROSSKO_KEY1=old1\nROSSKO_KEY1=old2\nSTOCRM_SID=keep\n'
     path.write_text(text, encoding='utf-8')
-    with pytest.raises(ValueError):
-        configure_file(path, 'goodkey1', 'goodkey2')
-    assert path.read_text(encoding='utf-8') == text
+    configure_file(path, 'goodkey1', 'goodkey2')
+    updated = path.read_text(encoding='utf-8')
+    assert updated.count('ROSSKO_KEY1=') == 1 and _parse(updated)['ROSSKO_KEY1'] == 'goodkey1'
+    assert 'STOCRM_SID=keep' in updated
     with pytest.raises(ValueError):
         configure_file(path, 'bad\nkey', 'goodkey2')
-    assert path.read_text(encoding='utf-8') == text
+    assert path.read_text(encoding='utf-8') == updated
     assert not list(tmp_path.glob('.rossko-env-*'))
 
 
-def test_config_cancel_never_writes_or_displays_keys(tmp_path, capsys):
+def test_config_visible_input_saves_without_confirmation(tmp_path, capsys):
     from stocrm_agent.rossko_config import run
+    from stocrm_agent.envfile import _parse
     path = tmp_path / '.env'
-    original = 'STOCRM_SID=keep\n'
-    path.write_text(original, encoding='utf-8')
+    path.write_text('STOCRM_SID=keep\n', encoding='utf-8')
     keys = iter(['secret-key1', 'secret-key2'])
-    assert run(path=path, ask=lambda _: 'нет', secret=lambda _: next(keys)) == 0
-    assert path.read_text(encoding='utf-8') == original
+    prompts = []
+    def ask(prompt):
+        prompts.append(prompt)
+        return next(keys)
+    assert run(path=path, ask=ask) == 0
+    assert prompts == ['KEY1: ', 'KEY2: ']
+    assert _parse(path.read_text(encoding='utf-8'))['ROSSKO_KEY1'] == 'secret-key1'
     printed = capsys.readouterr().out
-    assert 'secret-key1' not in printed and 'secret-key2' not in printed
+    assert 'ВИДНЫ на экране' in printed and 'secret-key1' not in printed and 'secret-key2' not in printed
 
 
-def test_config_uses_existing_keys_without_showing_them(tmp_path, capsys):
+def test_config_enter_reuses_existing_keys_without_confirmation(tmp_path, capsys):
     from stocrm_agent.rossko_config import run
+    from stocrm_agent.envfile import _parse
     path = tmp_path / '.env'
     path.write_text('ROSSKO_KEY1=secretkey1\nROSSKO_KEY2=secretkey2\n', encoding='utf-8')
-    def no_prompt(_):
-        raise AssertionError('existing keys must not be requested again')
-    assert run(path=path, ask=lambda _: 'ДА', secret=no_prompt) == 0
+    prompts = []
+    def ask(prompt):
+        prompts.append(prompt)
+        return ''
+    assert run(path=path, ask=ask) == 0
     text = path.read_text(encoding='utf-8')
+    assert len(prompts) == 2 and all('Enter' in p for p in prompts)
+    assert _parse(text)['ROSSKO_KEY1'] == 'secretkey1'
     assert 'ROSSKO_ENABLED=1' in text and 'ROSSKO_DELIVERY_ID=\n' in text
     printed = capsys.readouterr().out
     assert 'secretkey1' not in printed and 'secretkey2' not in printed
