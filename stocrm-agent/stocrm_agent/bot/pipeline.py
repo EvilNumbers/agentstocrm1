@@ -928,6 +928,7 @@ class BotPipeline:
         self._lists: dict[int, list[int]] = {}
         self._bookings: dict[int, dict[str, Any]] = {}
         self._contact_lookups: dict[int, dict[str, Any]] = {}
+        self._contact_create_pending: dict[int, dict[str, Any]] = {}
         self._last_work_request: dict[int, dict[str, Any]] = {}
         self._turn_locks: dict[tuple[Any, int], list[Any]] = {}
         #: Сделка, которую бот только что показал. Нужна, когда человек говорит
@@ -973,6 +974,7 @@ class BotPipeline:
         self._lists.pop(key, None)
         self._bookings.pop(key, None)
         self._contact_lookups.pop(key, None)
+        self._contact_create_pending.pop(key, None)
         self._last_work_request.pop(key, None)
 
     # ------------------------------------------------------- один черновик на всё
@@ -2214,6 +2216,75 @@ class BotPipeline:
         except RuntimeError:              # нет работающего цикла — просто пропускаем
             pass
 
+    def _direct_create_contact(self, text: str, user_id: int | None) -> PipelineResult | None:
+        """Явное создание клиента до разбора товаров; телефон никогда не артикул."""
+        key = user_id or 0
+        source = text.strip()
+        create = re.match(r"^(?:добавь(?:те)?|создай(?:те)?|создать|добавить)\s+(?:нового\s+)?(?:клиента|клиентa|контакт(?:а)?)\b", source, re.I)
+        pending = self._contact_create_pending.get(key)
+        if pending and time.time() - float(pending.get("at") or 0) > self.to_pending_ttl:
+            self._contact_create_pending.pop(key, None)
+            pending = None
+        if create:
+            self._contact_create_pending.pop(key, None)
+            self._part_pending.pop(key, None)
+            self._price_pending.pop(key, None)
+            if re.search(r"\bсделк\w*|\bзапиш\w*", source, re.I):
+                return PipelineResult(answer="Уточните: нужно создать клиента или записать его в сделку? Ничего не создано.")
+            tail = source[create.end():].strip()
+            pending = {"at": time.time()}
+        elif pending:
+            low = source.lower().strip(" .!?")
+            if low in {"отмена", "отмени", "стоп", "не надо"}:
+                self._contact_create_pending.pop(key, None)
+                return PipelineResult(answer="Создание клиента отменено. В CRM ничего не записано.")
+            if _looks_like_new_request(low):
+                self._contact_create_pending.pop(key, None)
+                return None
+            tail = source
+        else:
+            return None
+
+        phones = list(re.finditer(r"(?<!\d)\+?\d[\d ()-]{8,}\d(?!\d)", tail))
+        if len(phones) > 1:
+            self._contact_create_pending[key] = pending
+            return PipelineResult(answer="Укажите один полный номер телефона клиента. Ничего не создано.")
+        if phones:
+            value = phones[0].group().strip()
+            from ..contact_search import phone_key
+            if not 10 <= len(phone_key(value)) <= 15:
+                self._contact_create_pending[key] = pending
+                return PipelineResult(answer="Укажите полный номер телефона клиента. Ничего не создано.")
+            pending["phone"] = value
+            tail = tail[:phones[0].start()] + " " + tail[phones[0].end():]
+        tail = re.sub(r"\b(?:по|с|телефону|телефон|номер|номеру|имя|зовут)\b", " ", tail, flags=re.I)
+        tail = re.sub(r"[,:;—–]+", " ", tail).strip(" .!?")
+        if tail:
+            words = tail.split()
+            if len(words) > 3 or any(not re.fullmatch(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё'-]{0,49}", w) for w in words):
+                self._contact_create_pending[key] = pending
+                return PipelineResult(answer="Напишите имя клиента, затем фамилию и отчество, если известны. Ничего не создано.")
+            pending["firstname"] = words[0]
+            pending["surname"] = words[1] if len(words) > 1 else ""
+            pending["middlename"] = words[2] if len(words) > 2 else ""
+        pending["at"] = time.time()
+        if not pending.get("phone"):
+            self._contact_create_pending[key] = pending
+            return PipelineResult(answer="Укажите полный телефон нового клиента.")
+        if not pending.get("firstname"):
+            self._contact_create_pending[key] = pending
+            return PipelineResult(answer="Как зовут клиента? Напишите имя, затем фамилию и отчество, если известны. Телефон сохранён.")
+        self._contact_create_pending.pop(key, None)
+        outcome = self.router.execute("draft_create_contact", {k: pending[k] for k in ("phone", "firstname", "surname", "middlename") if k in pending})
+        if not outcome.draft and not outcome.applied:
+            error = self._outcome_error(outcome, "Не удалось подготовить клиента") or "Не удалось подготовить клиента."
+            return PipelineResult(answer=error + " Новая запись не начата.")
+        if outcome.draft:
+            saved = self.tools.drafts.get(outcome.draft["token"])
+            if saved.get("status") in ("partial", "applying"):
+                return PipelineResult(answer="Результат создания клиента неизвестен. Проверьте CRM и /drafts; повтор заблокирован.", drafts=[saved])
+        return self._from_outcome(outcome, default="Проверьте данные нового клиента.", user_key=key)
+
     def _direct_client_offers(self, text: str, user_id: int | None) -> PipelineResult | None:
         """Поиск сделки по клиенту и короткое уточнение телефоном, без угадывания модели."""
         ident = user_id or 0
@@ -2418,6 +2489,11 @@ class BotPipeline:
         text = _normalize_deal_slip(text)
         if _ADD_VERB.search(text) and not money_text.deal_in_text(text) and re.match(r"^\s*(?:и\s+)?лк\s+\d{3,6}\b", text, re.I):
             return PipelineResult(answer="Номер сделки прозвучал неразборчиво. Повторите команду со словами «в сделку» и номером: не использую предыдущую сделку и ничего не записываю.")
+        contact_create = await asyncio.to_thread(self._direct_create_contact, text, user_id)
+        if contact_create is not None:
+            history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": contact_create.answer}])
+            del history[:max(0, len(history) - self.s.max_history_messages)]
+            return contact_create
         edit_reply = self._direct_price_edit(text, history, user_id)
         if edit_reply is not None:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": edit_reply.answer}])

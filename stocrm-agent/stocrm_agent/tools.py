@@ -3096,17 +3096,44 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             summary=summary,
         )
 
-    def draft_create_contact(self, *, surname: str, firstname: str, middlename: str | None = None, phone: str | None = None) -> dict[str, Any]:
+    def draft_create_contact(self, *, surname: str = "", firstname: str, middlename: str | None = None, phone: str | None = None) -> dict[str, Any]:
+        if not str(firstname or "").strip():
+            raise ValueError("Укажите имя клиента")
         data = {"SURNAME": surname, "FIRSTNAME": firstname}
         if middlename:
             data["MIDDLENAME"] = middlename
         payload: dict[str, Any] = {"DATA": data}
         if phone:
             payload["PROPERTIES"] = {"1": [{"VALUE": str(phone), "MAIN": "Y"}]}
+        check: dict[str, Any] = {}
+        if phone:
+            if not 10 <= len(phone_key(phone)) <= 15:
+                raise ValueError("Укажите полный номер телефона клиента")
+            self._invalidate_cache()
+            matches = self._booking_contacts(phone)
+            if matches:
+                names = ", ".join(f"{c.get('title') or 'Без имени'} (контакт №{c['contact_id']})" for c in matches[:10])
+                raise ValueError("Этот телефон уже найден у клиента: " + names + ". Новый контакт не создаю.")
+            for previous in self.drafts.list("all"):
+                old = previous.get("check") or {}
+                if previous.get("tool") != "create_contact":
+                    continue
+                old_props = ((previous.get("payload") or {}).get("PROPERTIES") or {}).get("1") or []
+                old_phone = old.get("phone") or (old_props[0].get("VALUE") if isinstance(old_props, list) and old_props and isinstance(old_props[0], dict) else None)
+                if phone_key(old_phone) != phone_key(phone):
+                    continue
+                uncertain_old = previous.get("status") == "applied" and old.get("kind") != "added_contact"
+                if previous.get("status") in ("partial", "applying") or previous.get("archived_partial") or uncertain_old:
+                    raise ValueError("Предыдущая попытка создания клиента с этим номером не подтверждена. Проверьте CRM и /drafts; повтор заблокирован.")
+                if previous.get("status") == "pending":
+                    if previous.get("payload") == payload:
+                        return previous
+                    raise ValueError("Для этого номера уже подготовлен другой черновик. Проверьте /drafts; второй не создаю.")
+            check = {"kind": "added_contact", "phone": str(phone)}
         return self.drafts.create(
             tool="create_contact", method="contact/create", payload=payload,
             summary=f"Создать контакт {surname} {firstname} {middlename or ''}".strip()
-                    + (f", телефон {phone}" if phone else ""),
+                    + (f", телефон {phone}" if phone else ""), extra={"check": check} if check else None,
         )
 
     # ------------------------------------------------- правка карточки клиента
@@ -4149,6 +4176,17 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             current = None
         if current and (current.get("tool") == "add_offer_note" or current.get("check", {}).get("kind") == "added_note"):
             raise ValueError("Старый черновик заметки заблокирован: её отображение в сделке не подтверждено. Проверьте карточку CRM и не создавайте повтор вслепую.")
+        if current and current.get("tool") == "create_contact" and (current.get("payload") or {}).get("PROPERTIES"):
+            check = current.get("check") or {}
+            if check.get("kind") != "added_contact":
+                raise ValueError("Старый черновик контакта не содержит проверки телефона. Отмените его, только если он не отправлялся, и подготовьте заново.")
+            payload_phone = (((current.get("payload") or {}).get("PROPERTIES") or {}).get("1") or [{}])[0].get("VALUE")
+            if phone_key(payload_phone) != phone_key(check.get("phone")):
+                raise ValueError("Телефон черновика не совпадает с проверкой; запись остановлена")
+            if current.get("status") == "pending":
+                self._invalidate_cache()
+                if self._booking_contacts(str(check.get("phone") or "")):
+                    raise ValueError("Контакт с этим телефоном появился в CRM после подготовки. Создание остановлено.")
         if current and current.get("batch_preparing"):
             raise ValueError("Заявка ещё собирается или сборка прервана; применять отдельные позиции нельзя. Отмените незавершённый черновик через /drafts.")
         if current and current.get("queue_parent"):
@@ -4400,6 +4438,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         Для старых операций редактирования сохраняются совместимые альтернативы;
         потеря ответа никогда не является основанием для альтернативной записи.
         """
+        if step["method"] == "contact/create":
+            self._last_step_method = step["method"]
+            return self.client.call(step["method"], payload)
         if step["method"] == "offer/order/add_free_order":
             self._last_step_method = step["method"]
             return self.client.call(step["method"], payload)
@@ -4756,6 +4797,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 # Повторить можно только если панель ЯВНО отказала (ответила с кодом):
                 # при таймауте неизвестно, записалось ли действие, и повтор дал бы дубликат.
                 refused = isinstance(exc, StocrmError) and (bool(exc.code) or lock_refusal(exc))
+                if nothing_done and step["method"] == "contact/create" and (not isinstance(exc, StocrmError) or exc.code is None or exc.code in (429,) or exc.code >= 500):
+                    self.drafts.mark(token, "partial", failed_at=time.time(), done_steps={"failed": "contact/create", "error": str(exc)})
+                    raise StocrmError("Результат создания контакта неизвестен. Проверьте CRM и /drafts; повтор заблокирован.") from exc
                 if nothing_done and not refused and _is_transport_error(exc):
                     # Ответа нет: панель могла успеть записать. Спрашиваем её, а не гадаем.
                     if draft.get("tool") == "add_offer_part":
@@ -4846,6 +4890,21 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # перечитываем сделку. Панель может ответить «ok», но ничего не применить:
         # тогда человек должен узнать правду, а не думать, что цена уже поменялась.
         check = dict(draft.get("check") or {})
+        if check.get("kind") == "added_contact":
+            try:
+                ident = int(result) if isinstance(result, (str, int)) and not isinstance(result, bool) else int(_named_value(result, "CONTACT_ID"))
+                matches = self._booking_contacts(str(check["phone"]), ident) if ident > 0 else []
+                data = (draft.get("payload") or {}).get("DATA") or {}
+                expected_names = {name_key(" ".join(str(data.get(k) or "") for k in order)) for order in
+                                  (("SURNAME", "FIRSTNAME", "MIDDLENAME"), ("FIRSTNAME", "SURNAME", "MIDDLENAME"))}
+                if not any(str(c["contact_id"]) == str(ident) and name_key(c.get("title")) in expected_names and name_key(c.get("title")) for c in matches):
+                    raise ValueError("контакт, имя и телефон не подтверждены")
+            except Exception:  # noqa: BLE001 — даже успешный ответ без проверки не означает успех
+                contact_problem = "Контакт, имя или телефон не удалось подтвердить в CRM. Проверьте вручную; повторное создание заблокировано."
+                self.drafts.mark(token, "partial", failed_at=time.time(), result=result, check_warning=contact_problem)
+                return {"status": "partial", "token": token, "method": methods[0], "methods": methods,
+                        "result": result, "warning": contact_problem, "verified": False}
+            result = {"CONTACT_ID": ident}
         if check.get("kind") == "added_line":
             returned_order = _named_value(result, "ORDER_ID")
             if returned_order is not None and not isinstance(returned_order, bool) and str(returned_order).isdigit():
