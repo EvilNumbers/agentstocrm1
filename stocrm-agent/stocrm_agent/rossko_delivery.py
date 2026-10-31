@@ -1,12 +1,15 @@
 """Явно запускаемая локальная настройка ID из GetCheckoutDetails; заказов нет."""
 from __future__ import annotations
 
+import html
 import os
 import re
+import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -36,6 +39,19 @@ class Address:
 
 class LookupErrorSafe(Exception):
     """Сообщение создаётся только из фиксированного безопасного текста."""
+
+
+@dataclass
+class LookupTrace:
+    """Временные данные одного запроса; никуда автоматически не отправляются."""
+    attempted: bool = False
+    status: int | None = None
+    content_type: str = ""
+    body: bytes = b""
+    truncated: bool = False
+    body_complete: bool = False
+    exception_type: str = ""
+    exception_text: str = ""
 
 
 def _id_identity(value: str) -> str:
@@ -124,7 +140,8 @@ def _parse_details(content: bytes, secrets: tuple[str, str]) -> tuple[list[Deliv
     success = (success_node.text or "").strip().lower()
     if success in ("false", "0"):
         # Поставщик может включить в message ключи или личные данные.
-        # Исходное сообщение никогда не отображается и не сохраняется.
+        # Краткое сообщение не содержит исходного текста; подробный ответ
+        # записывается только в отдельный локальный файл при ошибке запроса.
         raise LookupErrorSafe(_rejection_message(_text(result, "message"), secrets))
     if success not in ("true", "1"):
         raise LookupErrorSafe("Неожидательное значение success в ответе Росско. Код R06. Настройки не изменены.")
@@ -166,41 +183,155 @@ def _parse_details(content: bytes, secrets: tuple[str, str]) -> tuple[list[Deliv
     return deliveries, addresses
 
 
-def _lookup(key1: str, key2: str) -> tuple[list[Delivery], list[Address]]:
+def _lookup(key1: str, key2: str, *, trace: LookupTrace | None = None) -> tuple[list[Delivery], list[Address]]:
     envelope = ET.Element(f"{{{_SOAP}}}Envelope")
     body = ET.SubElement(envelope, f"{{{_SOAP}}}Body")
     request = ET.SubElement(body, f"{{{_SERVICE}}}GetCheckoutDetails")
     ET.SubElement(request, f"{{{_SERVICE}}}KEY1").text = key1
     ET.SubElement(request, f"{{{_SERVICE}}}KEY2").text = key2
     payload = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
+    content = bytearray()
     try:
         deadline = time.monotonic() + 12
+        if trace is not None:
+            trace.attempted = True
         with requests.Session() as session:
             session.trust_env = False
-            with session.post(_URL, data=payload, headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": _URL},
+            with session.post(_URL, data=payload, headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": f'"{_URL}"'},
                               timeout=(4, 5), allow_redirects=False, stream=True, verify=True) as response:
+                if trace is not None:
+                    trace.status = response.status_code
+                    trace.content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
+                for chunk in response.iter_content(16384):
+                    remaining = _MAX_RESPONSE - len(content)
+                    content.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        if trace is not None:
+                            trace.truncated = True
+                        raise LookupErrorSafe("Ответ Росско слишком большой. Настройки не изменены.")
+                    if time.monotonic() > deadline:
+                        if trace is not None:
+                            trace.truncated = True
+                        raise LookupErrorSafe("Истёк тайм-аут ответа Росско. Настройки не изменены.")
+                if trace is not None:
+                    trace.body_complete = True
                 if response.status_code != 200:
                     raise LookupErrorSafe(f"Росско вернул HTTP {response.status_code}. Настройки не изменены.")
-                content = bytearray()
-                for chunk in response.iter_content(16384):
-                    content.extend(chunk)
-                    if time.monotonic() > deadline:
-                        raise LookupErrorSafe("Истёк тайм-аут ответа Росско. Настройки не изменены.")
-                    if len(content) > _MAX_RESPONSE:
-                        raise LookupErrorSafe("Ответ Росско слишком большой. Настройки не изменены.")
         return _parse_details(bytes(content), (key1, key2))
-    except requests.exceptions.SSLError:
+    except requests.exceptions.SSLError as exc:
+        _record_exception(trace, exc)
         raise LookupErrorSafe("Ошибка защищённого соединения TLS с Росско. Настройки не изменены.") from None
-    except requests.exceptions.Timeout:
+    except requests.exceptions.Timeout as exc:
+        _record_exception(trace, exc)
         raise LookupErrorSafe("Истёк тайм-аут запроса к Росско. Настройки не изменены.") from None
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.ConnectionError as exc:
+        _record_exception(trace, exc)
         raise LookupErrorSafe("Ошибка соединения с Росско. Настройки не изменены.") from None
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        _record_exception(trace, exc)
         raise LookupErrorSafe("Сетевая ошибка при запросе к Росско. Настройки не изменены.") from None
-    except (UnicodeError, ET.ParseError, ValueError):
+    except (UnicodeError, ET.ParseError, ValueError) as exc:
+        _record_exception(trace, exc)
         raise LookupErrorSafe("Не удалось прочитать ответ Росско. Настройки не изменены.") from None
-    except OSError:
+    except OSError as exc:
+        _record_exception(trace, exc)
         raise LookupErrorSafe("Системная ошибка при запросе к Росско. Настройки не изменены.") from None
+    finally:
+        if trace is not None:
+            trace.body = bytes(content)
+            if trace.exception_type and not trace.body_complete and content:
+                trace.truncated = True
+
+
+def _record_exception(trace: LookupTrace | None, exc: BaseException) -> None:
+    if trace is not None:
+        trace.exception_type = type(exc).__name__
+        trace.exception_text = str(exc)
+
+
+def _mask_known_keys(text: str, secrets: tuple[str, str]) -> str:
+    # Только точные совпадения и распространённая XML-запись. Прочие личные
+    # данные, части и иные представления ключей могут остаться в отчёте.
+    values: set[str] = set()
+    for secret in secrets:
+        if secret:
+            values.add(secret)
+            values.add(html.escape(secret, quote=True))
+            values.add(html.escape(secret, quote=False))
+    for value in sorted(values, key=len, reverse=True):
+        text = re.sub(re.escape(value), lambda _: "[СКРЫТ КЛЮЧ]", text, flags=re.IGNORECASE)
+    return text
+
+
+def _response_fields(body: bytes) -> str:
+    """Показывает message/success/Fault отдельно, полный текст тела ниже в файле."""
+    if not body:
+        return "Ответ от сервера не получен или тело пустое."
+    try:
+        text = body.decode("utf-8-sig")
+        if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
+            return "XML содержит запрещённую конструкцию; поля не извлекались."
+        root = ET.fromstring(text)
+        soap_body = _child(root, "Body")
+        fault = _child(soap_body, "Fault") if soap_body is not None else None
+        response = _child(soap_body, "GetCheckoutDetailsResponse") if soap_body is not None else None
+        result = _child(response, "CheckoutDetailsResult") if response is not None else None
+        if fault is not None:
+            return "SOAP Fault code: " + _text(fault, "faultcode") + "\nSOAP Fault text: " + _text(fault, "faultstring")
+        if result is None:
+            return "Поля GetCheckoutDetails не обнаружены."
+        message = _child(result, "message")
+        success = _child(result, "success")
+        return ("success: " + ((success.text or "") if success is not None else "[нет]") +
+                "\nmessage:\n" + ("".join(message.itertext()) if message is not None else "[нет]"))
+    except (UnicodeError, ET.ParseError, ValueError):
+        return "Не удалось извлечь поля из XML."
+
+
+def _write_local_report(directory: Path, trace: LookupTrace, error: str, secrets: tuple[str, str]) -> Path:
+    """Только для локального просмотра; этот файл не является безопасным для отправки."""
+    folder = directory / "rossko_local_reports"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Дополнительная защита от случайного git add, если .env вне проекта.
+    # Существующий файл не меняем; это не защита от резервных копий.
+    try:
+        with (folder / ".gitignore").open("x", encoding="ascii") as ignore:
+            ignore.write("*\n")
+    except OSError:
+        pass
+    body = trace.body.decode("utf-8-sig", errors="backslashreplace")
+    report = ("ЛОКАЛЬНЫЙ ОТЧЁТ РОССКО — НЕ ОТПРАВЛЯТЬ БЕЗ ПРОВЕРКИ\n"
+              "Может содержать личные данные и секреты, в том числе фрагменты ключей.\n"
+              "Точные совпадения KEY1 и KEY2 по возможности скрыты; это не гарантирует безопасности.\n"
+              "Программа не добавляет в отчёт запрос или .env, но сервер может вернуть их в ответе.\n\n"
+              f"Время ПК: {datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+              "Метод: GetCheckoutDetails (чтение, не заказ)\n"
+              f"HTTPS endpoint: {_URL}\n"
+              f"SOAPAction: \"{_URL}\"\n"
+              f"Результат программы: {error}\n"
+              f"HTTP статус: {trace.status if trace.status is not None else '[нет ответа]'}\n"
+              f"Content-Type: {trace.content_type or '[не указан]'}\n"
+              f"Ошибка: {trace.exception_type or '[нет]'}\n"
+              f"Подробности ошибки: {trace.exception_text or '[нет]'}\n"
+              f"Тело ограничено/прервано: {'да' if trace.truncated else 'нет'}\n\n"
+              "=== Поля ответа ===\n" + _response_fields(trace.body) +
+              "\n\n=== Тело ответа сервера (декодировано как UTF-8; может содержать личные данные) ===\n" +
+              (body if body else "[тело не получено]") + "\n")
+    report = _mask_known_keys(report, secrets)
+    fd, filename = tempfile.mkstemp(prefix="rossko-error-", suffix=".txt", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="\n") as file:
+            fd = -1
+            file.write(report)
+        return Path(filename)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(filename)
+        except OSError:
+            pass
+        raise
 
 
 def _choice(ask: Callable[[str], str], prompt: str, maximum: int, *, allow_zero: bool = False) -> int | None:
@@ -239,7 +370,20 @@ def run(*, path: Path | None = None, ask: Callable[[str], str] = input) -> int:
             raise LookupErrorSafe("Ключи Росско не найдены в .env. Сначала запустите Настроить_Росско.bat.")
         if values.get("ROSSKO_ENABLED", "").strip() != "1":
             raise LookupErrorSafe("Поиск Росско выключен. Сначала запустите Настроить_Росско.bat; затем повторите получение ID.")
-        deliveries, addresses = _lookup(key1, key2)
+        trace = LookupTrace()
+        try:
+            deliveries, addresses = _lookup(key1, key2, trace=trace)
+        except LookupErrorSafe as exc:
+            print(str(exc))
+            if trace.attempted:
+                try:
+                    report = _write_local_report(target.parent, trace, str(exc), (key1, key2))
+                    print(f"Подробный локальный отчёт: {report}")
+                    print("Откройте файл в Блокноте. Он может содержать личные данные и секреты!")
+                    print("Не отправляйте файл целиком. Для чата проверьте поле message и удалите личные данные и ключи.")
+                except (OSError, UnicodeError, ValueError):
+                    print("Не удалось записать подробный локальный отчёт. Проверьте права записи в папке.")
+            return 1
         print("Доступные способы доставки:")
         for index, option in enumerate(deliveries, 1):
             print(f"  {index}. {_label(option.id, (key1, key2))} — {option.name}")
