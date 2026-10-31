@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .status_colors import with_status_colors
+
 #: Слова, при которых быстрый путь НЕ вмешивается: это уже действие или сценарий.
 _ACTION_WORDS = (
     "собер", "собери", "добав", "измен", "помен", "поставь", "созда", "назнач",
@@ -151,7 +153,8 @@ def format_offer_card(card: dict[str, Any], *, detailed: bool = False) -> str:
         str(x) for x in (card.get("board"), card.get("status")) if x
     )
     if status:
-        lines.append(f"Воронка и статус: {status}")
+        marker = card.get("status_marker")
+        lines.append(f"Воронка и статус: {marker + ' ' if marker else ''}{status}")
     sums = f"Сумма: {_money(card.get('sum'))} ₽"
     parts_sum = card.get("parts_sum")
     works_sum = card.get("works_sum")
@@ -182,7 +185,8 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
         return ""
     lines = [f"📋 Последние сделки ({len(rows)}):"]
     for number, row in enumerate(rows, 1):
-        head = f"{number}. №{row.get('offer_id')}"
+        marker = row.get("status_marker")
+        head = f"{number}. №{row.get('offer_id')}" + (f" {marker}" if marker else "")
         if row.get("contact"):
             head += f" {row['contact']}"
         if row.get("car"):
@@ -217,7 +221,7 @@ def _estimate_offers(tools: Any) -> tuple[str, list[int]]:
                 return "CRM вернула сделки, не соответствующие выбранному статусу. Фильтр не подтверждён; посторонние сделки не показываю.", []
             if not valid:
                 return f"В полученной выборке нет сделок в статусе «{status['title']}» ({board['name']}).", []
-            return format_offers_list(valid) + "\nПоказано до 25 сделок выбранного статуса.", [int(r["offer_id"]) for r in valid]
+            return format_offers_list(with_status_colors(tools, valid)) + "\nПоказано до 25 сделок выбранного статуса.", [int(r["offer_id"]) for r in valid]
     except Exception as exc:
         return f"Не удалось закончить чтение сделок в просчёте: {exc}", []
 
@@ -262,7 +266,7 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
             return None
         offers = rows or []
         ids = [int(row["offer_id"]) for row in offers if row.get("offer_id")]
-        answer = format_offers_list(offers)
+        answer = format_offers_list(with_status_colors(tools, offers))
         return (answer, ids) if answer else None
 
     # 2) карточка конкретной сделки
@@ -283,4 +287,4 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
         return None
     if not isinstance(card, dict) or card.get("error") or not card.get("offer_id"):
         return None            # пусть обычный путь объяснит, почему не нашлась
-    return format_offer_card(card, detailed=detailed), [offer_id]
+    return format_offer_card(with_status_colors(tools, [card])[0], detailed=detailed), [offer_id]

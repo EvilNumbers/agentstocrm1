@@ -769,6 +769,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "status_id": s.get("STATUS_ID"),
                 "board_id": s.get("BOARD_ID"),
                 "title": s.get("TITLE"),
+                "front_color": s.get("FRONT_COLOR"),
                 "is_final": s.get("IS_FINAL"),
                 "is_new": s.get("IS_NEW"),
                 "active": s.get("ACTIVE"),
