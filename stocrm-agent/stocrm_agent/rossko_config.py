@@ -10,7 +10,6 @@ from typing import Callable
 
 from .envfile import _parse, find_env_file
 
-_FIELDS = ("ROSSKO_ENABLED", "ROSSKO_KEY1", "ROSSKO_KEY2", "ROSSKO_DELIVERY_ID", "ROSSKO_ADDRESS_ID")
 _PATTERN = re.compile(r"^\s*(?:export\s+)?(ROSSKO_ENABLED|ROSSKO_KEY1|ROSSKO_KEY2|ROSSKO_DELIVERY_ID|ROSSKO_ADDRESS_ID)\s*=")
 
 
@@ -36,12 +35,29 @@ def _env_key(value: str) -> str:
 
 
 def configure_file(path: Path, key1: str, key2: str) -> None:
-    """Атомарно обновить только эти пять переменных; никогда не трогать .state."""
-    if not path.is_file():
-        raise ConfigurationError("Файл .env не найден. Сначала завершите setup.bat и перенесите свои настройки.")
+    """Атомарно обновить пять переменных; никогда не трогать .state."""
     values = {"ROSSKO_ENABLED": "1", "ROSSKO_KEY1": _env_key(key1), "ROSSKO_KEY2": _env_key(key2),
               "ROSSKO_DELIVERY_ID": "", "ROSSKO_ADDRESS_ID": ""}
+    _update_fields(path, values)
+
+
+def update_delivery_ids(path: Path, delivery: str, address: str, *, expected_raw: bytes) -> None:
+    """Обновить только ID, если настройки не изменились с момента запроса."""
+    if not _valid_id(delivery) or (address and not _valid_id(address)):
+        raise ConfigurationError("Некорректный ID; настройки не изменены.")
+    _update_fields(path, {"ROSSKO_DELIVERY_ID": delivery, "ROSSKO_ADDRESS_ID": address}, expected_raw=expected_raw)
+
+
+def _valid_id(value: str) -> bool:
+    return bool(value) and value.isascii() and value.isdigit() and len(value) <= 32
+
+
+def _update_fields(path: Path, values: dict[str, str], *, expected_raw: bytes | None = None) -> None:
+    if not path.is_file():
+        raise ConfigurationError("Файл .env не найден. Сначала завершите setup.bat и перенесите свои настройки.")
     raw = path.read_bytes()
+    if expected_raw is not None and raw != expected_raw:
+        raise ConfigurationError("Файл .env изменился во время настройки; ничего не перезаписано.")
     original = raw.decode("utf-8-sig")
     lines = original.splitlines(keepends=True)
     newline = "\r\n" if b"\r\n" in raw else "\n"
@@ -49,7 +65,7 @@ def configure_file(path: Path, key1: str, key2: str) -> None:
     out: list[str] = []
     for line in lines:
         match = _PATTERN.match(line)
-        if match:
+        if match and match.group(1) in values:
             key = match.group(1)
             if key not in seen:
                 seen.add(key)
@@ -59,7 +75,7 @@ def configure_file(path: Path, key1: str, key2: str) -> None:
         else:
             out.append(line)
     result = "".join(out)
-    missing = [key for key in _FIELDS if key not in seen]
+    missing = [key for key in values if key not in seen]
     if missing and result and not result.endswith(("\r", "\n")):
         result += newline
     result += "".join(f"{key}={values[key]}{newline}" for key in missing)

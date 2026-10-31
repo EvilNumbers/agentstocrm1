@@ -24,6 +24,22 @@ _lock = threading.Lock()
 _last_request = 0.0
 
 
+class _UnsafeXML(ValueError):
+    pass
+
+
+class _UnexpectedResponse(ValueError):
+    pass
+
+
+class _SearchRejected(ValueError):
+    pass
+
+
+class _SoapFault(ValueError):
+    pass
+
+
 def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
@@ -41,14 +57,21 @@ def _parse(content: bytes, sku: str) -> list[dict[str, str]]:
     # Do not interpret document types or entities from the network.
     decoded = content.decode("utf-8-sig")
     if "<!DOCTYPE" in decoded.upper() or "<!ENTITY" in decoded.upper():
-        raise ValueError("небезопасный XML")
+        raise _UnsafeXML()
     root = ET.fromstring(decoded)
     body = _child(root, "Body")
+    if body is not None and _child(body, "Fault") is not None:
+        # Никогда не выводим содержимое Fault: оно может включать ключи.
+        raise _SoapFault()
     response = _child(body, "GetSearchResponse") if body is not None else None
     result = _child(response, "SearchResult") if response is not None else None
-    if result is None or _text(result, "success").lower() not in ("true", "1"):
-        # Не показываем произвольное message сервера: там могут оказаться данные.
-        raise ValueError("поиск не подтверждён сервером")
+    if result is None:
+        raise _UnexpectedResponse()
+    success = _text(result, "success").lower()
+    if success in ("false", "0"):
+        raise _SearchRejected()
+    if success not in ("true", "1"):
+        raise _UnexpectedResponse()
     collection = _child(result, "PartsList")
     found: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -90,7 +113,7 @@ def search_brands(sku: str) -> dict[str, Any]:
         return {"status": "unavailable", "brands": [], "error": "некорректные настройки ID доставки"}
 
     def unavailable(reason: str) -> dict[str, Any]:
-        suffix = (" Запрос был без ID доставки; документация Росско указывает его обязательным, "
+        suffix = (" Поиск настроен без ID доставки; документация Росско указывает его обязательным, "
                   "но причина отказа не установлена." if not delivery else "")
         return {"status": "unavailable", "brands": [], "error": reason + suffix}
     if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 ./_-]{3,64}", sku) or not parts.sku_exact(sku):
@@ -132,6 +155,24 @@ def search_brands(sku: str) -> dict[str, Any]:
                     if len(content) > _MAX_RESPONSE:
                         return unavailable("Ответ слишком большой.")
         rows = _parse(bytes(content), sku)
-    except (requests.RequestException, ValueError, ET.ParseError, OSError):
-        return unavailable("Сеть, настройки или ответ Росско не подтверждены.")
+    except requests.exceptions.SSLError:
+        return unavailable("Ошибка защищённого соединения TLS с Росско; соединение не подтверждено.")
+    except requests.exceptions.Timeout:
+        return unavailable("Истёк тайм-аут соединения или ответа Росско.")
+    except requests.exceptions.ConnectionError:
+        return unavailable("Не удалось установить или удержать соединение с Росско.")
+    except requests.RequestException:
+        return unavailable("Ошибка сетевого запроса к Росско.")
+    except _SoapFault:
+        return unavailable("Росско вернул SOAP-ошибку; её причина неизвестна.")
+    except _SearchRejected:
+        return unavailable("Ответ Росско сообщает, что поиск не выполнен; причина неизвестна.")
+    except _UnsafeXML:
+        return unavailable("Ответ Росско содержит запрещённые конструкции XML и не обработан.")
+    except (UnicodeError, ET.ParseError):
+        return unavailable("Ответ Росско не удалось прочитать как XML.")
+    except (_UnexpectedResponse, ValueError):
+        return unavailable("Ответ Росско имеет неожиданный формат; поиск не подтверждён.")
+    except OSError:
+        return unavailable("Системная ошибка при запросе к Росско.")
     return {"status": "ok" if rows else "empty", "brands": rows}
