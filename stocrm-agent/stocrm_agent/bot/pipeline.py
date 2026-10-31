@@ -1979,7 +1979,7 @@ class BotPipeline:
             return (f"В сделке {offer_id} заметок нет.\n"
                     "Скажите «добавь заметку в сделку "
                     f"{offer_id}: …» — подготовлю черновик.")
-        lines = [f"Заметки сделки {offer_id}:"]
+        lines = [f"Заметки API для сделки {offer_id} (отображение в карточке не подтверждено):"]
         for row in rows[:10]:
             when = str(row.get("created") or "")[:16]
             text = re.sub(r"\s+", " ", str(row.get("text") or "")).strip()
@@ -2016,6 +2016,8 @@ class BotPipeline:
         """
         info = note_in_request(text)
         if not info:
+            if re.search(r"\b(?:добав\w*|созда\w*|запиш\w*)\b", text, re.I) and re.search(r"заметк", text, re.I):
+                return PipelineResult(answer="Добавление заметки через бота временно остановлено: API не подтверждает её отображение в блоке сделки. Добавьте заметку вручную в карточке; старую попытку не повторяйте вслепую.")
             return None
         key = user_id or 0
         action = str(info.get("action") or "")
@@ -2287,7 +2289,7 @@ class BotPipeline:
             if client_args is not None and outcome.meta.get("needs_booking"):
                 next_pending = outcome.meta["needs_booking"]
                 # Сохраняем данные клиента и выбранную сделку, а не перенимаем offer_id из старого контекста.
-                fields = ("start", "end", "duration_minutes", "master", "customer_id", "post_id", "reason_id", "comment", "change_status", "client_name", "phone", "contact_id", "board_id")
+                fields = ("start", "end", "duration_minutes", "duration_confirmed", "master", "customer_id", "post_id", "reason_id", "comment", "change_status", "client_name", "phone", "contact_id", "board_id")
                 updated = {k: v for k, v in next_pending["args"].items() if k in fields and v is not None}
                 # Имя, автоматически взятое из CRM, нельзя принимать за названное
                 # человеком, если найденный по телефону контакт позже изменится.

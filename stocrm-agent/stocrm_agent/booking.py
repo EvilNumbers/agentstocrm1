@@ -61,6 +61,8 @@ class BookingMixin:
             raise ValueError("Укажите полный номер телефона клиента")
         matches: list[dict[str, Any]] = []
         seen: set[str] = set()
+        incomplete = False
+        details_checked = 0
         for page in range(1, 21):
             raw_contacts = self._read("booking_contacts", "contacts/get_from_filter",
                                       {"FILTER": {"CONTACT_ID": contact_id} if contact_id else {}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": page, "LIMIT": 500})
@@ -75,28 +77,26 @@ class BookingMixin:
                 if contact_id and str(contact_id) != ident:
                     continue  # CRM может игнорировать FILTER
                 phones = {phone_key(row.get("MAIN_PHONE"))}
-                raw = self._read("booking_contact_phones", "contact/get_info", {"CONTACT_ID": int(ident)})
-                structured = raw.get("STRUCTURIZED", {}) if isinstance(raw, dict) else {}
-                if str(structured.get("CONTACT_ID")) != ident or not isinstance(structured.get("FLAT"), dict):
-                    raise ValueError("Не удалось проверить дополнительные телефоны контакта — создание дубля запрещено")
-                props = structured["FLAT"].get("PROP")
-                if not isinstance(props, dict):
-                    raise ValueError("CRM не вернула свойства контакта — поиск телефонов не подтверждён")
-                for prop in props.values():
-                    if not isinstance(prop, dict) or not isinstance(prop.get("INFO"), dict):
-                        raise ValueError("Неизвестный формат телефонов контакта")
-                    if prop["INFO"].get("TYPE") == "phone":
-                        phones.add(phone_key(prop["INFO"].get("MAIN")))
-                        items = prop.get("ITEMS", {})
-                        if not isinstance(items, dict):
-                            raise ValueError("Неизвестный формат дополнительных телефонов")
-                        for item in items.values():
-                            if not isinstance(item, dict):
-                                raise ValueError("Неизвестный формат дополнительного телефона")
-                            phones.add(phone_key(item.get("VALUE")))
+                # MAIN_PHONE достоверен независимо от неполного ответа других карточек.
+                # Не превращаем ошибку чтения чужого контакта в «клиент не найден».
+                if details_checked >= 20:
+                    incomplete = True  # ограничиваем HTTP-нагрузку на большую базу
+                else:
+                    details_checked += 1
+                    try:
+                        from .contact_search import detail_phones
+                        raw = self._read("booking_contact_phones", "contact/get_info", {"CONTACT_ID": int(ident)})
+                        phones.update(phone_key(value) for value in detail_phones(raw, int(ident)))
+                    except Exception:  # noqa: BLE001 — неполный поиск разрешает только подтверждённый выбор
+                        incomplete = True
                 if phone_key(phone) in phones:
                     matches.append({"contact_id": int(ident), "title": row.get("TITLE"), "phone": row.get("MAIN_PHONE")})
             if len(rows) < 500:
+                if incomplete and not matches:
+                    raise ValueError("Не удалось проверить все дополнительные телефоны; создание нового контакта запрещено. Проверьте CRM вручную.")
+                if incomplete:
+                    for match in matches:
+                        match["search_incomplete"] = True
                 return matches
         raise ValueError("Не удалось закончить поиск контакта по телефону; новую запись не создаю")
 
@@ -177,11 +177,13 @@ class BookingMixin:
             args.pop("change_status", None)
             args.pop("reason_id", None)
             contact_id = None
-        if len(contacts) > 1 and (contact_id is None or previous_contacts != contact_ids):
+        incomplete = any(c.get("search_incomplete") for c in contacts)
+        if (len(contacts) > 1 or incomplete) and (contact_id is None or previous_contacts != contact_ids):
             args.pop("contact_id", None)
             args["_contact_snapshot"] = contact_ids
             options = [{"value": c["contact_id"], "label": f"{c['title'] or 'Без имени'} · контакт №{c['contact_id']}"} for c in contacts]
-            raise BookingNeeds("Телефон найден у нескольких клиентов. Выберите нужного:", "contact_id", args, options)
+            question = ("Основной телефон найден, но дополнительные телефоны некоторых контактов проверить не удалось. Выберите подтверждённого клиента; другие совпадения не исключены:" if incomplete else "Телефон найден у нескольких клиентов. Выберите нужного:")
+            raise BookingNeeds(question, "contact_id", args, options)
         args["_contact_snapshot"] = contact_ids
         if contact_id is not None:
             matches = [c for c in contacts if str(c["contact_id"]) == str(contact_id)]
@@ -216,16 +218,22 @@ class BookingMixin:
             options.extend({"value": str(o["offer_id"]), "label": f"Сделка №{o['offer_id']} · {o['status']}" + (f" · {o['car']}" if o['car'] else "") + (f" · {o['board']}" if o['board'] else "")} for o in active)
             question = "У этого клиента есть активные сделки. Создать новую или выбрать существующую?\n" + "\n".join(f"{i}. {o['label']}" for i, o in enumerate(options, 1))
             raise BookingNeeds(question, "offer_choice", args, options)
+        if not active and choice is None:
+            args["_offered_active_ids"] = []
+            question = ("У выбранного клиента активных сделок не найдено. Создать новую сделку?" if contact
+                        else "Контакт не найден. Создать нового клиента и сделку?")
+            raise BookingNeeds(question, "offer_choice", args,
+                               [{"value": "new", "label": "Создать новую сделку"}])
         if choice and choice != "new":
             if not contact_id or str(choice) not in {str(i) for i in ids}:
                 raise ValueError("Выбранная сделка больше не подтверждена как активная сделка клиента")
-            fields = ("start", "end", "duration_minutes", "master", "customer_id", "post_id", "reason_id", "comment", "change_status")
+            fields = ("start", "end", "duration_minutes", "duration_confirmed", "master", "customer_id", "post_id", "reason_id", "comment", "change_status")
             selected = {k: args[k] for k in fields if k in args}
             selected.update(offer_id=int(choice), verified_phone=phone, verified_contact_id=contact_id)
             return "draft_book_existing_offer", selected
         if not contact and not str(args.get("client_name") or "").strip():
             raise BookingNeeds("Как зовут нового клиента? Телефон и время сохранены.", "client_name", args)
-        new_fields = ("client_name", "phone", "start", "end", "duration_minutes", "master", "customer_id", "post_id", "board_id", "contact_id", "reason_id", "comment")
+        new_fields = ("client_name", "phone", "start", "end", "duration_minutes", "duration_confirmed", "master", "customer_id", "post_id", "board_id", "contact_id", "reason_id", "comment")
         selected = {k: args[k] for k in new_fields if k in args}
         selected["client_name"] = str(args.get("client_name") or (contact or {}).get("title") or "")
         if contact and not selected["client_name"]:
@@ -267,8 +275,16 @@ class BookingMixin:
             if "T" not in normalized:
                 raise BookingNeeds(f"На какое время {normalized} записать? Например «в 9 утра».", "start", args)
             start = normalized
+        if not args.get("duration_confirmed"):
+            options: list[dict[str, Any]] = []
+            if end:
+                options.append({"value": "keep_end", "label": "Оставить указанное время окончания"})
+            elif duration_minutes and int(duration_minutes) != 60:
+                options.append({"value": int(duration_minutes), "label": f"Оставить {int(duration_minutes)} мин"})
+            options.extend([{"value": 60, "label": "1 час"}, {"value": "custom", "label": "Своя длительность"}])
+            raise BookingNeeds("Длительность записи: 1 час или своя? Подтвердите выбор.", "duration_minutes", args, options)
         if not end and duration_minutes is None:
-            raise BookingNeeds("На сколько времени записать? Назовите длительность или время окончания.", "duration_minutes", args)
+            raise BookingNeeds("Укажите длительность записи.", "duration_minutes", args)
         if duration_minutes is not None and (isinstance(duration_minutes, bool) or int(duration_minutes) <= 0):
             raise ValueError("Длительность должна быть положительным количеством минут")
         customers = self.calendar_customers()
@@ -320,7 +336,7 @@ class BookingMixin:
     def draft_book_new_offer(self: Any, *, client_name: str | None = None, phone: str | None = None,
                              start: str | None = None, end: str | None = None,
                              duration_minutes: int | None = None, master: str | None = None,
-                             customer_id: int | None = None, post_id: int | None = None,
+                             duration_confirmed: bool = False, customer_id: int | None = None, post_id: int | None = None,
                              board_id: int | None = None, contact_id: int | None = None,
                              reason_id: int | None = None, comment: str = "",
                              _approved_active_ids: list[int] | None = None) -> dict[str, Any]:
@@ -358,6 +374,8 @@ class BookingMixin:
         if reason_id is not None and str(reason_id) not in {str(r["reason_id"]) for r in reasons}:
             raise ValueError("Причина перехода не найдена у статуса «Запись»")
         contacts = self._booking_contacts(phone)
+        if any(c.get("search_incomplete") for c in contacts) and (contact_id is None or _approved_active_ids is None):
+            raise ValueError("Поиск контактов неполный. Сначала явно выберите клиента и сделку в диалоге записи.")
         if contact_id is None and len(contacts) > 1:
             options = [{"value": c["contact_id"], "label": f"{c['title']} · контакт №{c['contact_id']}"} for c in contacts]
             raise BookingNeeds("Этот телефон есть у нескольких контактов — выберите нужный: " +
@@ -416,7 +434,7 @@ class BookingMixin:
                                   end: str | None = None, duration_minutes: int | None = None,
                                   master: str | None = None, customer_id: int | None = None,
                                   post_id: int | None = None, reason_id: int | None = None,
-                                  comment: str = "", change_status: bool | None = None,
+                                  duration_confirmed: bool = False, comment: str = "", change_status: bool | None = None,
                                   verified_phone: str | None = None, verified_contact_id: int | None = None) -> dict[str, Any]:
         args = {k: v for k, v in locals().copy().items() if k != "self" and v is not None}
         ident = _positive(offer_id, "Существующая сделка")
@@ -792,6 +810,25 @@ def answer_pending(pending: dict[str, Any], text: str) -> dict[str, Any]:
         if updated is not None:
             return updated
         raise BookingNeeds("Данные сохранены. Уточните дату/время или нажмите «Повторить подготовку».", field, args, options)
+    if options and field == "change_status" and (duration := duration_in_text(text)):
+        args["duration_minutes"] = duration
+        args.pop("end", None)
+        raise BookingNeeds("Длительность сохранена. Сначала выберите, переводить ли сделку в «Запись»: " + pending["question"], field, args, options)
+    if options and field == "duration_minutes":
+        selected = next((o for i, o in enumerate(options, 1) if text.strip() == str(i) or key(text) == key(o["label"])), None)
+        if selected and selected["value"] == "custom":
+            args.pop("end", None)
+            args.pop("duration_minutes", None)
+            args["duration_confirmed"] = False
+            raise BookingNeeds("Укажите свою длительность, например «45 минут», или время окончания «до 10:30».", field, args)
+        if selected:
+            if selected["value"] != "keep_end":
+                args[field] = selected["value"]
+                args.pop("end", None)
+            args["duration_confirmed"] = True
+            return args
+        # Допускаем привычный ответ текстом, например «час» или «45 минут».
+        options = []
     if options:
         selection = next((o for i, o in enumerate(options, 1) if text.strip() == str(i) or key(text) == key(o["label"]) or (field == "change_status" and key(text) in (("да", "перевести", "менять") if o["value"] else ("нет", "не менять", "оставить", "оставить текущий")))), None)
         if selection is None:
@@ -817,6 +854,7 @@ def answer_pending(pending: dict[str, Any], text: str) -> dict[str, Any]:
             raise BookingNeeds("Укажите единицу длительности: например «1 час» или «45 минут».", field, args)
         updated = repair_booking(args, text)
         if updated is not None:
+            updated["duration_confirmed"] = True
             return updated
         duration = duration_in_text(text)
         if duration is None:
@@ -824,9 +862,11 @@ def answer_pending(pending: dict[str, Any], text: str) -> dict[str, Any]:
             if end_match and args.get("start"):
                 start = dt.datetime.fromisoformat(args["start"])
                 args["end"] = start.replace(hour=int(end_match[1]), minute=int(end_match[2])).isoformat()
+                args["duration_confirmed"] = True
                 return args
             raise BookingNeeds("Укажите длительность, например «на 45 минут», или конец «до 10:30».", field, args)
         args[field] = duration
+        args["duration_confirmed"] = True
     else:
         args[field] = text.strip()
     return args

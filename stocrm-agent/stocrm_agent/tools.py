@@ -961,10 +961,26 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         offer = self._slim_offer(row)
         if balance_error is not None:
             offer["balances_error"] = balance_error
-        elif balance is not None:
+        elif isinstance(balance, dict):
             offer["balances"] = {
-                k: _money(v.get("CURRENCY_VALUE")) for k, v in (balance or {}).items() if isinstance(v, dict)
+                k: _money(v.get("CURRENCY_VALUE")) for k, v in balance.items() if isinstance(v, dict)
             }
+        # Баланс нельзя подменять нулём при ошибке API или повреждённой сумме.
+        total = _known_work_sum(row.get("OFFER_SUM"))
+        rub = {k: v for k, v in (balance or {}).items() if str(k).startswith("RUB_")} if isinstance(balance, dict) else {}
+        amounts = [_known_work_sum(v.get("CURRENCY_VALUE")) if isinstance(v, dict) else None for v in rub.values()]
+        balance_known = bool(rub) and all(v is not None for v in amounts) and all(
+            isinstance(v, dict) and (v.get("ENTITY_ID") in (None, False, "") or str(v.get("ENTITY_ID")) == str(offer_id))
+            and (v.get("ENTITY_TYPE") in (None, False, "", "OFFER"))
+            for v in rub.values()
+        )
+        if total is not None and balance_known:
+            paid = round(sum(v for v in amounts if v is not None), 2)
+            offer["paid"] = paid
+            offer["debt"] = round(max(0.0, total - paid), 2)
+            offer["overpaid"] = round(max(0.0, paid - total), 2)
+        else:
+            offer["paid"] = offer["debt"] = offer["overpaid"] = None
         if not with_items:
             return offer
 
@@ -990,12 +1006,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         offer["works"] = items["works"]
         if errors:
             offer["items_error"] = "; ".join(errors)
-        offer["payments"] = _payments_total(offer.get("balances") or {})
-        offer["paid"] = offer["payments"]["total"]
-        offer["sum"] = _money(offer.get("sum")) or _money(
-            _money(offer.get("works_sum")) + _money(offer.get("parts_sum")))
-        offer["debt"] = round(max(0.0, _money(offer["sum"]) - offer["paid"]), 2)
-        offer["overpaid"] = round(max(0.0, offer["paid"] - _money(offer["sum"])), 2)
+        offer["payments"] = _payments_total({k: _money(v.get("CURRENCY_VALUE")) for k, v in rub.items()}) if balance_known else {}
         return offer
 
     # ------------------------------------------------------------------- работы
@@ -4107,19 +4118,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         )
 
     def draft_add_offer_note(self, *, offer_id: int, text: str) -> dict[str, Any]:
-        text = (text or "").strip()
-        if not text:
-            raise ValueError("Пустой текст заметки — нечего записывать")
-        payload = {
-            "ARGS": {"OVERWRITE": "N", "UNIQUE": "N"},
-            "CODE": int(offer_id),
-            "ENTITY": "OFFER_NOTE",
-            "TEXT": text,
-        }
-        return self.drafts.create(
-            tool="add_offer_note", method="note/create", payload=payload, risk="low",
-            summary=f"Добавить заметку к сделке {offer_id}: «{text[:120]}»",
-            extra={"check": {"kind": "added_note", "offer_id": int(offer_id), "text": text}},
+        raise ValueError(
+            "API умеет создавать заметки, но привязка к видимому блоку сделки не подтверждена. "
+            "Автоматическую запись остановил, чтобы не создавать скрытые заметки. "
+            "Добавьте заметку вручную в карточке сделки; повтор старой попытки через бота не делайте."
         )
 
     def apply_draft(self, token: str) -> dict[str, Any]:
@@ -4145,6 +4147,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             current = self.drafts.get(token)
         except KeyError:
             current = None
+        if current and (current.get("tool") == "add_offer_note" or current.get("check", {}).get("kind") == "added_note"):
+            raise ValueError("Старый черновик заметки заблокирован: её отображение в сделке не подтверждено. Проверьте карточку CRM и не создавайте повтор вслепую.")
         if current and current.get("batch_preparing"):
             raise ValueError("Заявка ещё собирается или сборка прервана; применять отдельные позиции нельзя. Отмените незавершённый черновик через /drafts.")
         if current and current.get("queue_parent"):
