@@ -15,7 +15,7 @@ from typing import Any
 
 from .. import money as money_text
 from .. import parts
-from ..client import StocrmError
+from ..client import StocrmError, read_budget
 from ..human import humanize_error, payload_text, polish
 from ..policy import ConfirmationPolicy
 from ..tools import Toolset
@@ -761,8 +761,8 @@ SYSTEM_PROMPT = """Правка цены существующей услуги �
      и дай человеку выбрать. Если поиск недоступен — честно скажи это и попроси бренд.
    Источник: СО СКЛАДА НЕ ПОДСТАВЛЯЕМ НИКОГДА — source="stock" запрещён (остаток склада
    только справочная сноска для человека). Обычное «добавь товар» → source="manual"
-   (основной add_free_order, без выбора поставщика и закупки). Только явно заказанная
-   закупка у поставщика → source="supplier" (supplier_id, supplier_price). Цены не выдумывай.
+   (основной add_free_order, без выбора поставщика и закупки). Заказы поставщикам
+   запрещены; только source="manual". Цены не выдумывай.
    Если человек назвал только «колодки» или только бренд — это как раз случай ambiguous.
    Если в ОДНОЙ фразе несколько артикулов («fk-2010 за 6000, cr9ek за 3000») — вызывай
    `draft_add_offer_part` для первой позиции: остальные бот добавит сам, с их ценами.
@@ -928,6 +928,7 @@ class BotPipeline:
         self._lists: dict[int, list[int]] = {}
         self._bookings: dict[int, dict[str, Any]] = {}
         self._contact_lookups: dict[int, dict[str, Any]] = {}
+        self._contact_create_pending: dict[int, dict[str, Any]] = {}
         self._last_work_request: dict[int, dict[str, Any]] = {}
         self._turn_locks: dict[tuple[Any, int], list[Any]] = {}
         #: Сделка, которую бот только что показал. Нужна, когда человек говорит
@@ -973,6 +974,7 @@ class BotPipeline:
         self._lists.pop(key, None)
         self._bookings.pop(key, None)
         self._contact_lookups.pop(key, None)
+        self._contact_create_pending.pop(key, None)
         self._last_work_request.pop(key, None)
 
     # ------------------------------------------------------- один черновик на всё
@@ -1525,6 +1527,27 @@ class BotPipeline:
         log.info("«%s» → пункт %s из списка = сделка %s", text, index, offer_id)
         return f"покажи подробности сделки {offer_id}"
 
+    def _human_part_stock(self, item: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """Сохраняем названный человеком бренд; склад здесь только читается."""
+        sku = str(item.get("sku") or "")
+        brand = str(item.get("brand") or "")
+        candidate: dict[str, Any] = {"brand": brand, "sku": sku,
+            "name": item.get("name") or f"{brand} {sku}", "source": "указано человеком", "price": None}
+        errors: list[str] = []
+        try:
+            with read_budget(8.0):
+                rows = self.tools.stock_by_sku_variants(sku, brand=brand, errors=errors) if sku else []
+        except Exception as exc:  # noqa: BLE001 — отказ чтения не меняет данные человека
+            rows, errors = [], [str(exc)]
+        candidate["stock_records"] = [{"warehouse_id": row.get("warehouse_id"), "qty": row.get("qty")} for row in rows]
+        if errors:
+            note = f"Склад {brand} {sku}: проверка не выполнена или неполная; отсутствие не доказано."
+        elif rows:
+            note = f"Склад {brand} {sku}: найдены данные, только справочно {parts.in_stock_note(candidate)}. Со склада не привязываю."
+        else:
+            note = f"Склад {brand} {sku}: в проверенной выдаче не найдено; отсутствие не доказано."
+        return candidate, note
+
     def _start_part_group(self, items: list[dict[str, Any]], offer_id: int,
                           user_id: int | None) -> PipelineResult:
         """Сначала только чтение и выборы: до окончания вопросов черновиков нет."""
@@ -1533,13 +1556,15 @@ class BotPipeline:
             return PipelineResult(answer="Один артикул повторяется в заявке. Уточните состав и количество; запись не начата.")
         states: list[dict[str, Any]] = []
         unresolved: list[str] = []
+        stock_notes: list[str] = []
         for item in items:
             item = dict(item)
             sku = item['sku']
             found: dict[str, Any]
             if item.get('brand'):
-                found = {'status': 'matched', 'best': {'brand': item['brand'], 'sku': sku,
-                         'name': item.get('name') or f"{item['brand']} {sku}", 'source': 'указано человеком'}}
+                candidate, note = self._human_part_stock(item)
+                stock_notes.append(note)
+                found = {'status': 'matched', 'best': candidate}
             else:
                 try:
                     found = self.tools.resolve_part(query=sku, sku=sku, offer_id=offer_id, allow_web=False)
@@ -1590,6 +1615,8 @@ class BotPipeline:
                 price = item.get('price')
                 summary.append(f"• {item['sku']}: {qty} шт" + (f" × {_money_text(price)} ₽" if price is not None else " · цена не названа"))
             result.answer = "\n".join(summary) + "\n\n" + result.answer
+        if stock_notes:
+            result.answer += "\n\n" + "\n".join(stock_notes)
         return result
 
     def _group_next(self, group: dict[str, Any], user_id: int | None) -> PipelineResult:
@@ -1637,6 +1664,9 @@ class BotPipeline:
                 draft = self.tools.draft_add_offer_part(offer_id=group['offer_id'],
                     name=chosen.get('name') or item['sku'], sku=item['sku'],
                     brand=chosen.get('brand'), qty=item.get('qty') or 1, price=item['price'], source='manual')
+                if chosen.get('source') == 'склад':
+                    warning = "; ".join(x for x in (str(draft.get('warning') or ''), "Склад использован только для поиска; свободная позиция не привязана к складскому остатку. Применяемость требует проверки.") if x)
+                    draft = self.tools.drafts.mark(draft['token'], 'pending', warning=warning)
                 if chosen.get('source') in ('вручную по данным человека', 'указано человеком'):
                     warning = "; ".join(x for x in (str(draft.get('warning') or ''), "Данные указаны человеком; каталог и применяемость не подтверждены.") if x)
                     draft = self.tools.drafts.mark(draft['token'], 'pending', warning=warning)
@@ -1765,14 +1795,20 @@ class BotPipeline:
                     items = [{"sku": "", "name": title, "normalized": "", "price": unit, "qty": qty, "brand": parts.find_brand_in_text(title)}]
         if not items:
             return None
+        # После «производитель» человек может назвать бренд не из словаря,
+        # и через запятую он относится к единственному артикулу всей просьбы.
+        if len(items) == 1:
+            spoken_brand = parts.explicit_brand_in_text(source)
+            if spoken_brand:
+                items[0]["brand"] = spoken_brand
         # Явный бренд конкретной строки не теряем при пакетном разборе.
         for segment in re.split(r"[\n;,]", source):
             keys = set(parts.sku_in_text(segment))
             keys.difference_update(parts.sku_exact(m.group(1)) for m in _DEAL_IN_TEXT.finditer(segment))
-            brand = parts.find_brand_in_text(segment)
+            brand = parts.explicit_brand_in_text(segment) or parts.find_brand_in_text(segment)
             if brand and len(keys) == 1:
                 for item in items:
-                    if item["normalized"] in keys:
+                    if item["normalized"] in keys and not item.get("brand"):
                         item["brand"] = brand
         for item in items:
             previous = (self.router.part_context or {}).get(item["normalized"], {})
@@ -1789,27 +1825,26 @@ class BotPipeline:
             # (скриншот 30.10: «Добавь артикулы Pc2031…» после карточки сделки 1313).
             seen = self._last_offer.get(user_id or 0)
             if not seen:
-                if len(items) < 2:
-                    return None
                 if re.search(r"поставщик|закупк|закупочн", source, re.I):
-                    return PipelineResult(answer="Для заказа у поставщика или с закупочной ценой укажите позиции отдельными запросами с поставщиком и закупочной ценой. Свободную заявку вместо заказа не создаю; в CRM ничего не записано.")
+                    return PipelineResult(answer="Заказы поставщикам и учёт закупочной цены через бота запрещены. Свободную позицию вместо заказа автоматически не создаю; в CRM ничего не записано.")
                 group = {'raw_items': items, '_lock': threading.RLock()}
                 choice: dict[str, Any] = {'kind': 'part', 'tool': PART_TOOL, 'args': {}, 'candidates': [],
                           '_group': group, '_group_step': 'offer',
-                          'question': 'В какую сделку добавить все указанные позиции? Напишите номер сделки.'}
+                          'question': 'В какую сделку добавить указанные позиции? Напишите номер сделки.'}
                 result = PipelineResult(answer=choice['question'], choices=[choice])
                 self._track_part(result, user_id)
                 return result
             offer_id = int(seen)
         if len(items) > 1:
             if re.search(r"поставщик|закупк|закупочн", source, re.I):
-                return PipelineResult(answer="Для заказа у поставщика или с закупочной ценой укажите позиции отдельными запросами с поставщиком и закупочной ценой. Свободную заявку вместо заказа не создаю; в CRM ничего не записано.")
+                return PipelineResult(answer="Заказы поставщикам и учёт закупочной цены через бота запрещены. Свободную позицию вместо заказа автоматически не создаю; в CRM ничего не записано.")
             return self._start_part_group(items, offer_id, user_id)
+        stock_notes: list[str] = []
         def explicit(item: dict[str, Any]) -> dict[str, Any] | None:
             if not item.get("brand"):
                 return None
-            title = item.get("name") or f"{item['brand']} {item['sku']}"
-            candidate = {"brand": item["brand"], "sku": item["sku"], "name": title, "source": "указано человеком", "price": None}
+            candidate, note = self._human_part_stock(item)
+            stock_notes.append(note)
             return {"status": "matched", "best": candidate, "candidates": [candidate]}
         self.router.part_resolutions = {parts.sku_exact(i["sku"]): found for i in items if i.get("sku") and (found := explicit(i))}
         first = items[0]
@@ -1836,6 +1871,8 @@ class BotPipeline:
             result.applied.append(outcome.applied)
             result.answer = ("Результат записи требует проверки — смотрите предупреждение ниже."
                              if any(a.get("warning") for a in result.applied) else "Готово, изменения внесены.")
+            if stock_notes:
+                result.answer += "\n\n" + "\n".join(stock_notes)
             return result
         if (not outcome.draft and not outcome.extra_drafts and not outcome.choice
                 and not outcome.meta.get("needs_price") and not outcome.meta.get("pending_part_choices")):
@@ -1884,6 +1921,8 @@ class BotPipeline:
                 money = f" × {_money_text(amount)} ₽ = {_money_text(amount * quantity)} ₽" if amount is not None else " · цена не названа"
                 summary.append(f"• {item['sku']}: {quantity} шт{money}")
             result.answer = "\n".join(summary) + "\n\n" + result.answer
+        if stock_notes:
+            result.answer += "\n\n" + "\n".join(stock_notes)
         log.info("позиции из просьбы разобраны без модели: %s", text[:60])
 
         self._track_to(result, user_id)
@@ -2214,6 +2253,75 @@ class BotPipeline:
         except RuntimeError:              # нет работающего цикла — просто пропускаем
             pass
 
+    def _direct_create_contact(self, text: str, user_id: int | None) -> PipelineResult | None:
+        """Явное создание клиента до разбора товаров; телефон никогда не артикул."""
+        key = user_id or 0
+        source = text.strip()
+        create = re.match(r"^(?:добавь(?:те)?|создай(?:те)?|создать|добавить)\s+(?:нового\s+)?(?:клиента|клиентa|контакт(?:а)?)\b", source, re.I)
+        pending = self._contact_create_pending.get(key)
+        if pending and time.time() - float(pending.get("at") or 0) > self.to_pending_ttl:
+            self._contact_create_pending.pop(key, None)
+            pending = None
+        if create:
+            self._contact_create_pending.pop(key, None)
+            self._part_pending.pop(key, None)
+            self._price_pending.pop(key, None)
+            if re.search(r"\bсделк\w*|\bзапиш\w*", source, re.I):
+                return PipelineResult(answer="Уточните: нужно создать клиента или записать его в сделку? Ничего не создано.")
+            tail = source[create.end():].strip()
+            pending = {"at": time.time()}
+        elif pending:
+            low = source.lower().strip(" .!?")
+            if low in {"отмена", "отмени", "стоп", "не надо"}:
+                self._contact_create_pending.pop(key, None)
+                return PipelineResult(answer="Создание клиента отменено. В CRM ничего не записано.")
+            if _looks_like_new_request(low):
+                self._contact_create_pending.pop(key, None)
+                return None
+            tail = source
+        else:
+            return None
+
+        phones = list(re.finditer(r"(?<!\d)\+?\d[\d ()-]{8,}\d(?!\d)", tail))
+        if len(phones) > 1:
+            self._contact_create_pending[key] = pending
+            return PipelineResult(answer="Укажите один полный номер телефона клиента. Ничего не создано.")
+        if phones:
+            value = phones[0].group().strip()
+            from ..contact_search import phone_key
+            if not 10 <= len(phone_key(value)) <= 15:
+                self._contact_create_pending[key] = pending
+                return PipelineResult(answer="Укажите полный номер телефона клиента. Ничего не создано.")
+            pending["phone"] = value
+            tail = tail[:phones[0].start()] + " " + tail[phones[0].end():]
+        tail = re.sub(r"\b(?:по|с|телефону|телефон|номер|номеру|имя|зовут)\b", " ", tail, flags=re.I)
+        tail = re.sub(r"[,:;—–]+", " ", tail).strip(" .!?")
+        if tail:
+            words = tail.split()
+            if len(words) > 3 or any(not re.fullmatch(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё'-]{0,49}", w) for w in words):
+                self._contact_create_pending[key] = pending
+                return PipelineResult(answer="Напишите имя клиента, затем фамилию и отчество, если известны. Ничего не создано.")
+            pending["firstname"] = words[0]
+            pending["surname"] = words[1] if len(words) > 1 else ""
+            pending["middlename"] = words[2] if len(words) > 2 else ""
+        pending["at"] = time.time()
+        if not pending.get("phone"):
+            self._contact_create_pending[key] = pending
+            return PipelineResult(answer="Укажите полный телефон нового клиента.")
+        if not pending.get("firstname"):
+            self._contact_create_pending[key] = pending
+            return PipelineResult(answer="Как зовут клиента? Напишите имя, затем фамилию и отчество, если известны. Телефон сохранён.")
+        self._contact_create_pending.pop(key, None)
+        outcome = self.router.execute("draft_create_contact", {k: pending[k] for k in ("phone", "firstname", "surname", "middlename") if k in pending})
+        if not outcome.draft and not outcome.applied:
+            error = self._outcome_error(outcome, "Не удалось подготовить клиента") or "Не удалось подготовить клиента."
+            return PipelineResult(answer=error + " Новая запись не начата.")
+        if outcome.draft:
+            saved = self.tools.drafts.get(outcome.draft["token"])
+            if saved.get("status") in ("partial", "applying"):
+                return PipelineResult(answer="Результат создания клиента неизвестен. Проверьте CRM и /drafts; повтор заблокирован.", drafts=[saved])
+        return self._from_outcome(outcome, default="Проверьте данные нового клиента.", user_key=key)
+
     def _direct_client_offers(self, text: str, user_id: int | None) -> PipelineResult | None:
         """Поиск сделки по клиенту и короткое уточнение телефоном, без угадывания модели."""
         ident = user_id or 0
@@ -2416,8 +2524,16 @@ class BotPipeline:
     async def _handle_text(self, text: str, history: list[dict[str, Any]],
                            user_id: int | None = None) -> PipelineResult:
         text = _normalize_deal_slip(text)
+        if (_ADD_VERB.search(text) and re.search(r"(?<!не )\b(?:со|с|из)\s+склад[а-я]*\b", text, re.I)
+                and not re.search(r"\bне\s+(?:со|с|из)\s+склад[а-я]*\b", text, re.I)):
+            return PipelineResult(answer="Со склада в сделку не добавляю и складскую позицию не привязываю. Могу найти её для справки или подготовить свободную позицию по вашему отдельному запросу.")
         if _ADD_VERB.search(text) and not money_text.deal_in_text(text) and re.match(r"^\s*(?:и\s+)?лк\s+\d{3,6}\b", text, re.I):
             return PipelineResult(answer="Номер сделки прозвучал неразборчиво. Повторите команду со словами «в сделку» и номером: не использую предыдущую сделку и ничего не записываю.")
+        contact_create = await asyncio.to_thread(self._direct_create_contact, text, user_id)
+        if contact_create is not None:
+            history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": contact_create.answer}])
+            del history[:max(0, len(history) - self.s.max_history_messages)]
+            return contact_create
         edit_reply = self._direct_price_edit(text, history, user_id)
         if edit_reply is not None:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": edit_reply.answer}])
@@ -2508,8 +2624,9 @@ class BotPipeline:
                 return tag
 
         # Безопасность общей заявки не зависит от переключателя быстрых ответов.
-        # При TG_FASTPATH=0 одиночные позиции остаются на обычном пути модели.
-        if (self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text))) and not _WORK_WORD.search(text):
+        # При TG_FASTPATH=0 одиночная позиция с явно названным производителем
+        # тоже проходит здесь, чтобы произвольный бренд не пропал.
+        if (self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text)) or (parts.explicit_brand_in_text(text) and _ADD_VERB.search(text))) and not _WORK_WORD.search(text):
             direct = await asyncio.to_thread(self._direct_parts, text, user_id)
             if direct is not None:
                 history.append({"role": "user", "content": text})

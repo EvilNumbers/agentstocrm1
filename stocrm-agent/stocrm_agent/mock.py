@@ -482,6 +482,15 @@ class MockSession:
                         "INFO": {"TYPE": "phone", "MAIN": phones[0]},
                         "ITEMS": {str(i): {"VALUE": phone} for i, phone in enumerate(phones)}
                     }}}}}}, 200)
+        if method == "contact/create":
+            contacts = self.data["contacts/get_from_filter"]
+            contact_id = max((c["CONTACT_ID"] for c in contacts), default=0) + 1
+            fields = body.get("DATA") or {}
+            props = (body.get("PROPERTIES") or {}).get("1") or []
+            contacts.append({"CONTACT_ID": contact_id,
+                             "TITLE": " ".join(str(fields.get(k) or "") for k in ("SURNAME", "FIRSTNAME", "MIDDLENAME")).strip(),
+                             "MAIN_PHONE": props[0].get("VALUE") if props else "", "ACTIVE": "Y", "ARCHIVE": "N"})
+            return MockResponse({"CODE": 200, "RESPONSE": contact_id}, 200)
         if method == "offer/new/with_contact":
             contacts = self.data["contacts/get_from_filter"]
             contact_id = body.get("CONTACT_ID")

@@ -314,10 +314,14 @@ def render_part_choice(choice: dict[str, Any]) -> str:
     if candidates:
         first = candidates[0]
         label = " ".join(str(first.get(k) or "") for k in ("brand", "sku")).strip()
-        lines.append("Самый вероятный: " + (label or str(first.get("title") or "первый вариант")))
+        lines.append("Первый вариант (проверьте источник): " + (label or str(first.get("title") or "первый вариант")))
         if first.get("why"):
             lines.append(str(first["why"]))
         sources = {str(c.get("source") or "") for c in candidates}
+        if any(c.get("source") == "склад" or c.get("stock_records") for c in candidates):
+            lines.append("Склад — только справочный поиск; позиция со склада в сделку не привязывается.")
+        if "Росско" in sources:
+            lines.append("Росско — только бренды по артикулу; заказ поставщику не оформляется.")
         if "интернет" in sources:
             lines.append("Варианты из интернета — не подтверждение наличия и применяемости:")
             for number, candidate in enumerate(candidates, 1):

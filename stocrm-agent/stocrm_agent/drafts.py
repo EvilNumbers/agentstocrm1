@@ -484,6 +484,15 @@ class DraftStore:
             if draft.get("batch_preparing"):
                 raise ValueError("Заявка ещё собирается; применять отдельные позиции нельзя.")
             self._assert_part_unblocked_unlocked(draft)
+            check = draft.get("check") or {}
+            if check.get("kind") == "added_contact":
+                from .contact_search import phone_key
+                for other in self._data.values():
+                    other_check = other.get("check") or {}
+                    if (other.get("token") != token and other_check.get("kind") == "added_contact"
+                            and phone_key(other_check.get("phone")) == phone_key(check.get("phone"))
+                            and (other.get("status") in (APPLYING, PARTIAL, APPLIED) or other.get("archived_partial"))):
+                        raise ValueError("Создание контакта с этим телефоном уже выполнялось или требует проверки. Повтор запрещён.")
             draft["status"] = APPLYING
             draft["claimed_at"] = time.time()
             self._save()

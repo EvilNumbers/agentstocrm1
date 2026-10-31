@@ -160,10 +160,10 @@ TOOL_SPEC: list[dict[str, Any]] = [
           {"query": _STR, "phone": _STR, "limit": _INT}),
     _tool("contact_card", "Полная карточка клиента по contact_id (свойства, автомобили, юрлица).",
           {"contact_id": _INT}, ["contact_id"]),
-    _tool("stock", "Остатки склада: только по явной просьбе проверить остатки. Для подбора и добавления запчастей НЕ вызывать: склад из подбора исключён.",
+    _tool("stock", "Поиск по складу только для справки. Не резервировать, не списывать и не привязывать складскую позицию к сделке.",
           {"query": _STR, "brand": _STR, "sku": _STR, "warehouse_id": _INT, "limit": _INT}),
     _tool("resolve_part",
-          "Подбор запчасти БЕЗ склада, с обязательным совпадением названных бренда и артикула. Возвращает проверенные варианты "
+          "Подбор запчасти, включая справочный поиск по складу только на чтение, с обязательным совпадением названных бренда и артикула. Возвращает варианты "
           "(status: matched — можно брать первый; ambiguous — нужно спросить человека). "
           "ВСЕГДА вызывай перед draft_add_offer_part: в карточке нужен точный бренд, артикул и цена.",
           {"query": {"type": "string", "description": "как сказал человек: «фильтр масляный w914/2»"},
@@ -238,17 +238,17 @@ TOOL_SPEC: list[dict[str, Any]] = [
           ["offer_id"]),
     _tool("draft_add_offer_part",
           "ЧЕРНОВИК добавления запчасти в сделку. Позицию ищи через resolve_part; "
-          "поставщика, если он нужен, уточняй у человека через suppliers. "
-          "source: supplier — заказ у подключённого поставщика, "
+          "поставщика не выбирай и закупку не оформляй. "
+          "source: manual — свободная позиция; заказы поставщикам запрещены. "
           "manual — основной add_free_order, свободная позиция без склада/поставщика. "
           "Для обычного «добавь товар» используй manual; поставщика и закупку не запрашивай. "
-          "supplier используй только для явно указанной закупки у поставщика. "
+
           "Со склада НЕ подставляем: source=stock запрещён, наличие склада — только сноска. "
           "Если человек просит ИЗМЕНИТЬ ЦЕНУ уже добавленной позиции — это не добавление: "
           "используй draft_change_part_price. allow_duplicate=true — только если человек "
           "явно подтвердил, что нужна ещё одна такая же строка.",
           {"offer_id": _INT, "name": _STR, "brand": _STR, "sku": _STR, "qty": _INT,
-           "source": {"type": "string", "enum": ["supplier", "manual"]},
+           "source": {"type": "string", "enum": ["manual"]},
            "price": {"type": "number", "description": "цена продажи"},
            "supplier_price": {"type": "number", "description": "цена закупки у поставщика"},
            "supplier_id": _INT,
@@ -1319,6 +1319,8 @@ class ToolRouter:
     @staticmethod
     def _apply_part(args: dict[str, Any], chosen: dict[str, Any]) -> None:
         """Подставляет в аргументы данные выбранной позиции."""
+        if chosen.get("source") == "склад":
+            args["_input_warning"] = "Склад использован только для поиска; будет свободная позиция, не привязанная к складскому остатку. Наличие и применяемость требуют проверки."
         if chosen.get("source") in {"указано человеком", "вручную по данным человека"}:
             args["_input_warning"] = "Свободная позиция по данным сотрудника; каталог и применяемость не подтверждены. Это не заказ у внешнего поставщика."
         args["name"] = chosen.get("name") or args.get("name")
@@ -1326,7 +1328,7 @@ class ToolRouter:
             args["brand"] = chosen["brand"]
         if chosen.get("sku"):
             args["sku"] = chosen["sku"]
-        if chosen.get("price") and not args.get("price"):
+        if chosen.get("source") != "склад" and chosen.get("price") and not args.get("price"):
             args["price"] = chosen["price"]
         if not args.get("price"):
             # Цену не выдумываем и 0 не подставляем: позиция с ценой 0 уже уезжала
@@ -1337,7 +1339,7 @@ class ToolRouter:
         # справочная сноска для человека. Нет поставщика → свободная позиция.
         args.pop("warehouse_id", None)
         args.pop("stock_ids", None)
-        if args.get("source") in (None, "", "stock"):
+        if args.get("source") in (None, ""):
             args["source"] = "manual"
 
     def _part_choice(self, *, tool: str, args: dict[str, Any],
@@ -1364,7 +1366,8 @@ class ToolRouter:
                 "url": c.get("url"),
                 "score": c.get("score"),
                 "why": c.get("why"),
-                "in_stock": c.get("qty") or None,
+                "in_stock": parts.in_stock(c),
+                "stock_records": c.get("stock_records") or [],
                 "stock_note": parts.in_stock_note(c),
                 "title": parts.describe(c),
             }
@@ -1379,21 +1382,27 @@ class ToolRouter:
                                "Артикул и указанные цена/количество сохранены; уточните бренд, если известен, или название детали для поиска."))
             else:
                 question = (f"В панели не нашёл «{query}». Продиктуйте точнее: бренд и артикул — "
-                            "или назовите поставщика, если заказываем подбор.")
+                            "или уточните название детали для поиска.")
         else:
             question = f"Уточните запчасть «{query}» — какой вариант нужен?"
+        if any("склад" in item.lower() and "не полностью" in item.lower() for item in (tried or [])):
+            question += " Проверка склада не завершена полностью; отсутствие позиции не доказано."
         if status == "not_found" and tried and not args.get("sku"):
             question += " Проверено: " + "; ".join(tried[:2])
         if not shortlist:
+            if any("интернет" in item.lower() and any(word in item.lower() for word in ("недоступ", "ошибка", "не заверш")) for item in (tried or [])):
+                question += " Интернет-поиск был недоступен или не завершился; это не означает, что товара нет."
+            elif any("интернет" in item.lower() for item in (tried or [])):
+                question += " В полученной выдаче не удалось подтвердить производителя для этого артикула."
             question += " Можно добавить свободную позицию ровно по вашим данным, без проверки применяемости: напишите «добавь как указано». Неуказанные бренд/артикул останутся неизвестными. Также доступны «повтори поиск», «пропусти», «отмена»."
         payload = json.dumps({
             "status": "нужно уточнить запчасть",
             "question": question,
             "candidates": shortlist,
             "tried": tried or [],
-            "hint": ("Ничего не добавлено. Первый вариант — самый вероятный. "
+            "hint": ("Ничего не добавлено. Проверь варианты и их источники. "
                      "Дождись выбора человека из списка. Со склада не списываем: "
-                     "наличие указано справочно, добавление — заказом или свободной позицией."),
+                     "наличие указано справочно, добавление — только свободной позицией без заказа поставщику."),
         }, ensure_ascii=False)
         return ToolOutcome(payload=payload, choice={
             "kind": "part",
@@ -1558,11 +1567,11 @@ class ToolRouter:
             }, ensure_ascii=False))
         self._apply_part(args, chosen)
         # Со склада в сделку не подставляем: даже если вариант нашли на складе,
-        # позиция уходит заказом у поставщика или свободной строкой (source=manual).
+        # позиция уходит только свободной строкой (source=manual), без заказа поставщику.
         # Остаток склада остаётся только сноской для человека.
         args.pop("warehouse_id", None)
         args.pop("stock_ids", None)
-        if args.get("source") in (None, "", "stock"):
+        if args.get("source") in (None, ""):
             args["source"] = "manual"
         return self.execute(tool, args)
 

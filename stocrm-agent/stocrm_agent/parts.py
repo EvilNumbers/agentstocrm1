@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 from functools import lru_cache
 from typing import Any
@@ -337,6 +338,17 @@ def _canonical_brand_cached(text: str) -> str:
     return str(value or "").strip().upper()
 
 
+def exact_brand_identity(value: Any) -> str:
+    """Только точные алиасы: неизвестный бренд не заменяется похожим префиксом."""
+    key = brand_key(value)
+    return _brand_index().get(key, key) if key else ""
+
+
+def exact_brand_match(left: Any, right: Any) -> bool:
+    a, b = exact_brand_identity(left), exact_brand_identity(right)
+    return bool(a and b and a == b)
+
+
 def brand_match(query_brand: str | None, candidate_brand: str | None) -> int:
     """Сколько даёт совпадение бренда: 100 точное, 70 «тот же по-другому», 0 нет."""
     if not query_brand:
@@ -587,7 +599,7 @@ _HIT_STOPWORDS = {
     "www", "com", "html", "detail", "details", "goods", "item", "items", "sku", "oem",
     "art", "article", "catalog", "search", "result", "page", "ru", "by", "kz", "ua",
     "the", "and", "for", "with", "from", "not", "you", "all", "sale", "delivery", "stock",
-    "element", "elements", "system", "systems", "quality", "cheap", "discount", "opt",
+    "element", "elements", "system", "systems", "quality", "cheap", "discount", "opt", "performance", "returns", "investment",
     "dlya", "filtr", "masla", "vozduha", "toplivnyy", "salonnyy",
 }
 
@@ -610,6 +622,40 @@ def _clean_title(title: str, brand: str, sku: str) -> str:
     return head[:70]
 
 
+# Сам код встречается и вне автозапчастей (например, в индексах фондов).
+# Текст результата должен содержать признаки товарной автомобильной тематики;
+# по одному совпадению букв и цифр производителя не выводим.
+_AUTO_RESULT = re.compile(
+    r"автозапчаст|запчаст|автодетал|подшипник|ступиц|радиатор|тормоз|колодк|"
+    r"амортизатор|свеч[аи]|зажиган|двигател|катушк|фильтр|сальник|привод|"
+    r"automotive|auto[ -]?parts|car parts|wheel bearing|wheel hub|brake pad|"
+    r"radiator|ignition coil|engine part|oil filter|air filter", re.I)
+_NON_PART_RESULT = re.compile(
+    r"ycharts\.com|finance\.yahoo\.com|morningstar\.com|"
+    r"mutual[ _-]*fund|investment fund|stock market|annual returns|"
+    r"инвестиционн.{0,20}фонд|паевой.{0,20}фонд|доходность.{0,20}фонд", re.I)
+
+
+def explicit_brand_in_text(text: str) -> str | None:
+    """Производитель, явно названный человеком, в том числе неизвестный словарю."""
+    stop = r"(?:артикул|арт|код|цен[аыуой]|стоимость|за|по|для|в|на|и|товар|запчасть|деталь|добавь|пожалуйста)\b"
+    word = r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё&'-]{1,39}"
+    match = re.search(rf"\b(?:производител[ьяюем]*|бренд(?:а|ом)?)\s*[:—-]?\s*((?!{stop}){word}(?:\s+(?!{stop}){word}){{0,2}})", text or "", re.I)
+    if not match:
+        return None
+    word = match.group(1)
+    if word.lower().split()[0] in _NOT_BRAND or word.lower().split()[0] in {"не", "нет", "неизвестен", "неизвестно", "артикул", "цена", "указан"}:
+        return None
+    return _brand_index().get(brand_key(word), word.upper())
+
+
+def _other_sku_has_brand(text: str, start: int, end: int) -> bool:
+    """Чужая связка бренд/артикул означает неоднозначную общую выдачу."""
+    before = re.search(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z&-]{2,})[\s,./-]+$", text[:start])
+    after = re.match(r"[\s,./-]+([A-Za-z][A-Za-z&-]{2,})(?![A-Za-z0-9])", text[end:])
+    return any(m and m.group(1).lower() not in _HIT_STOPWORDS for m in (before, after))
+
+
 def brands_from_hits(hits: list[dict[str, Any]], sku: str | None, *, brand: str | None = None) -> list[dict[str, Any]]:
     """Только подтверждённые производители рядом с точным SKU, не слова применяемости."""
     want = sku_exact(sku)
@@ -625,16 +671,22 @@ def brands_from_hits(hits: list[dict[str, Any]], sku: str | None, *, brand: str 
         if not url.startswith(("https://", "http://")):
             continue
         site = str(hit.get("site") or url.split("/")[2])
+        context = " ".join(str(hit.get(k) or "") for k in ("title", "snippet", "url"))
+        if _NON_PART_RESULT.search(context) or not _AUTO_RESULT.search(context):
+            continue
         seen = set()
         for field in ("title", "snippet"):
             text = str(hit.get(field) or "")
             text = re.sub(r"MEAT\s*(?:&amp;|amp;|&)\s*DORIA", "MEAT&DORIA", text, flags=re.I)
             # ABS в «без ABS», AUDI/GOLF/MK2 в применяемости не являются изготовителем.
-            head = re.split(r"\b(?:без|для|подходит|применяемость|совместимость|for|fits|without|with)\b", text, maxsplit=1, flags=re.I)[0]
-            found_articles = {sku_exact(raw) for raw in raw_sku_in_text(head)}
-            # Нельзя приписать бренд из одного товара другому в общей выдаче.
-            # Неоднозначный заголовок/сниппет с несколькими артикулами пропускаем.
-            if any(article != want for article in found_articles):
+            # Указание применимости до запятой — не товарный артикул/бренд.
+            head = re.sub(r"\b(?:для|подходит|применяемость|совместимость|for|fits)\b[^,;|]*[,;|]", " ", text, flags=re.I)
+            spans = sku_spans(head)
+            found_articles = {sku_exact(raw) for raw, _, _, _ in spans}
+            # Другая пара бренд/артикул в том же фрагменте делает атрибуцию
+            # ненадёжной. Коды моделей автомобилей без бренда товара допускаются.
+            if any(sku_exact(raw) != want and _other_sku_has_brand(head, start, end)
+                   for raw, _, start, end in spans):
                 continue
             article_present = want in found_articles
             for match in re.finditer(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё&-]{2,}", head):
@@ -652,6 +704,9 @@ def brands_from_hits(hits: list[dict[str, Any]], sku: str | None, *, brand: str 
                 if display not in known_brands and display != requested and not (labeled or adjacent):
                     continue
                 if word.lower() in _HIT_STOPWORDS or display in seen:
+                    continue
+                # Марка автомобиля после «для/подходит» — применимость, не бренд товара.
+                if re.search(r"\b(?:без|для|подходит|for|fits|without)\s+$", head[max(0, match.start()-24):match.start()], re.I):
                     continue
                 glued = bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"[\s./-]*" + article_pattern + r"(?![A-Za-z0-9])", head, re.I))
                 reverse = bool(re.search(r"(?<![A-Za-z0-9])" + article_pattern + r"[\s,./-]+" + re.escape(word) + r"(?![A-Za-z0-9])", head, re.I))
@@ -853,23 +908,34 @@ def sku_variants(value: str | None, limit: int = 8) -> list[str]:
 
 
 def in_stock(candidate: dict[str, Any]) -> float | None:
-    """Остаток на складе (или None). Нужен только для сноски — не для источника позиции."""
-    qty = candidate.get("qty")
-    if qty is None or str(qty).strip() == "":
+    """Справочный остаток только из складского чтения; не количество сделки."""
+    records = candidate.get("stock_records") or []
+    if not records:
         return None
     try:
-        value = float(qty)
-    except (TypeError, ValueError):
+        value = float(records[0].get("qty"))
+    except (TypeError, ValueError, AttributeError):
         return None
-    return value if value > 0 else None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def in_stock_note(candidate: dict[str, Any]) -> str:
-    """Сноска для человека: «(в наличии на складе: 12)» или пустая строка."""
-    value = in_stock(candidate)
-    if value is None:
-        return ""
-    return f"(в наличии на складе{': ' + format(value, 'g') if value else ''})"
+    """Остатки отдельных складов справочно, без утверждения о доступности."""
+    records = candidate.get("stock_records") or []
+    details = []
+    for record in records[:3]:
+        if not isinstance(record, dict) or record.get("qty") in (None, ""):
+            continue
+        try:
+            value = float(record["qty"])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value < 0:
+            continue
+        warehouse = record.get("warehouse_id")
+        rendered = str(int(value)) if value.is_integer() else format(value, ".10f").rstrip("0").rstrip(".")
+        details.append((f"склад {warehouse}, строка: " if warehouse else "строка: ") + rendered)
+    return "(остаток по данным склада: " + "; ".join(details) + "; справочно)" if details else ""
 
 
 def describe(candidate: dict[str, Any]) -> str:
