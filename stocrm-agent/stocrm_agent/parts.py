@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 from functools import lru_cache
 from typing import Any
@@ -335,6 +336,17 @@ def _canonical_brand_cached(text: str) -> str:
         if alias_key and (key.startswith(alias_key) or alias_key.startswith(key)):
             return canonical
     return str(value or "").strip().upper()
+
+
+def exact_brand_identity(value: Any) -> str:
+    """Только точные алиасы: неизвестный бренд не заменяется похожим префиксом."""
+    key = brand_key(value)
+    return _brand_index().get(key, key) if key else ""
+
+
+def exact_brand_match(left: Any, right: Any) -> bool:
+    a, b = exact_brand_identity(left), exact_brand_identity(right)
+    return bool(a and b and a == b)
 
 
 def brand_match(query_brand: str | None, candidate_brand: str | None) -> int:
@@ -896,23 +908,34 @@ def sku_variants(value: str | None, limit: int = 8) -> list[str]:
 
 
 def in_stock(candidate: dict[str, Any]) -> float | None:
-    """Остаток на складе (или None). Нужен только для сноски — не для источника позиции."""
-    qty = candidate.get("qty")
-    if qty is None or str(qty).strip() == "":
+    """Справочный остаток только из складского чтения; не количество сделки."""
+    records = candidate.get("stock_records") or []
+    if not records:
         return None
     try:
-        value = float(qty)
-    except (TypeError, ValueError):
+        value = float(records[0].get("qty"))
+    except (TypeError, ValueError, AttributeError):
         return None
-    return value if value > 0 else None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def in_stock_note(candidate: dict[str, Any]) -> str:
-    """Сноска для человека: «(в наличии на складе: 12)» или пустая строка."""
-    value = in_stock(candidate)
-    if value is None:
-        return ""
-    return f"(в наличии на складе{': ' + format(value, 'g') if value else ''})"
+    """Остатки отдельных складов справочно, без утверждения о доступности."""
+    records = candidate.get("stock_records") or []
+    details = []
+    for record in records[:3]:
+        if not isinstance(record, dict) or record.get("qty") in (None, ""):
+            continue
+        try:
+            value = float(record["qty"])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value < 0:
+            continue
+        warehouse = record.get("warehouse_id")
+        rendered = str(int(value)) if value.is_integer() else format(value, ".10f").rstrip("0").rstrip(".")
+        details.append((f"склад {warehouse}, строка: " if warehouse else "строка: ") + rendered)
+    return "(остаток по данным склада: " + "; ".join(details) + "; справочно)" if details else ""
 
 
 def describe(candidate: dict[str, Any]) -> str:

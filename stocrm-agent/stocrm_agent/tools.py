@@ -1291,6 +1291,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "(заказ у поставщика) или source=\"manual\" (свободная позиция). "
                 "Наличие на складе можно показать человеку, но списание не оформляем"
             )
+        if stock_ids:
+            raise ValueError("Складские позиции нельзя привязывать к сделке. Уберите stock_ids; запись не начата")
         if source not in {"supplier", "manual"}:
             raise ValueError("source должен быть supplier (заказ у поставщика) или manual (свободная позиция)")
         if not (name or "").strip():
@@ -1396,9 +1398,6 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 stock["SUPPLIER_ID"] = int(str(supplier["supplier_id"]))
             if supplier_price is not None:
                 stock["PRICE_SUPP_HUM"] = float(supplier_price)
-            if stock_ids:
-                stock["STOCKS_IDS_SYSTEM"] = [int(i) for i in stock_ids]
-
             payload = {"REQUIRE_ID": require_ref, "DATA": {"STOCK": stock}}
             method = "offer/order/add"
 
@@ -2367,7 +2366,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         def add(item: dict[str, Any], source: str) -> None:
             if raw_sku and parts.sku_exact(item.get("sku")) != parts.sku_exact(raw_sku):
                 return
-            if raw_sku and brand and parts.brand_match(brand, item.get("brand")) != 100:
+            if raw_sku and brand and not parts.exact_brand_match(brand, item.get("brand")):
                 return
             collected.append({**item, "source": item.get("source") or source})
 
@@ -2420,8 +2419,32 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             # в панели. Она подключается шагом ниже, только если ничего не нашлось.
             self._run_parallel(tasks)
 
+        # Склад — только справочный источник: поиск не резервирует, не списывает и
+        # не передаёт ID складской позиции в будущий черновик. Не смешиваем остаток
+        # с количеством в сделке или закупочную цену с ценой продажи.
+        stock_errors: list[str] = []
+        stock_rows: list[dict[str, Any]] = []
+        stock_checked = bool(raw_sku or term or brand)
+        if stock_checked:
+            if raw_sku:
+                stock_rows = self.stock_by_sku_variants(raw_sku, brand=brand,
+                                                        limit=max(limit * 4, 20), errors=stock_errors)
+            else:
+                try:
+                    stock_rows = self.stock(query=term, brand=brand, limit=max(limit * 4, 20))
+                except (StocrmError, ValueError) as exc:
+                    stock_errors.append(str(exc))
+            for row in stock_rows:
+                add({"brand": row.get("brand"), "sku": row.get("sku"), "name": row.get("name"),
+                     "stock_records": [{"warehouse_id": row.get("warehouse_id"), "qty": row.get("qty")}],
+                     "source": "склад"}, "склад")
+            tried.append(f"склад (только чтение): {len(stock_rows)} строк" + ("; поиск проверен не полностью" if stock_errors else ""))
+            errors.extend(f"склад: {error}" for error in stock_errors)
+        stock_lookup = {"status": ("partial" if stock_rows else "unavailable") if stock_errors else
+                        ("ok" if stock_rows else "empty") if stock_checked else "skipped",
+                        "rows": len(stock_rows), "errors": stock_errors}
+
         # 4) Последняя попытка перед интернетом: страницы номенклатуры.
-        # Склад полностью исключён из подбора по просьбе пользователя.
         if not collected:
             fallback: list[Callable[[], None]] = []
             if raw_sku:
@@ -2504,26 +2527,31 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             except (StocrmError, ValueError) as exc:
                 errors.append(f"сделка: {exc}")
 
-        sku = parts.normalize_sku(raw_sku) or None
+        # Для строгой проверки передаём исходное написание: normalize_sku
+        # использует визуальные двойники и не является обратимым преобразованием.
+        sku = raw_sku or None
 
         # убираем дубли по (артикул или название, бренд)
         unique: dict[tuple[str, str], dict[str, Any]] = {}
         for item in collected:
             key = (parts.normalize_sku(item.get("sku")) or str(item.get("name") or "").lower(),
-                   parts.canonical_brand(item.get("brand")))
+                   parts.exact_brand_identity(item.get("brand")))
             if not any(key):
                 continue
             current = unique.get(key)
             if current is None:
                 unique[key] = item
-            elif current.get("source") != "склад" and item.get("source") == "склад":
-                unique[key] = {**current, **{k: v for k, v in item.items() if v not in (None, "")}}
+            elif item.get("source") == "склад":
+                current["stock_records"] = (current.get("stock_records") or []) + (item.get("stock_records") or [])
+            elif current.get("source") == "склад":
+                unique[key] = {**item, "stock_records": current.get("stock_records") or []}
 
         ranked = parts.rank_candidates(query, list(unique.values()), sku=sku, brand=brand, limit=limit)
         # при равном балле сначала то, что реально есть в CRM, потом интернет
         ranked.sort(key=lambda item: (item.get("source") == "интернет", -item.get("score", 0)))
         status = parts.decide(ranked)
-        if ranked and not brand and all(i.get("source") == "интернет" for i in ranked):
+        if ranked and (all(i.get("source") == "склад" for i in ranked) or
+                       (not brand and all(i.get("source") == "интернет" for i in ranked))):
             status = "ambiguous"  # найденный бренд — выбор человека, не доказательство уникальности
         result: dict[str, Any] = {
             "status": status,
@@ -2531,6 +2559,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "sku": raw_sku,
             "brand": brand,
             "internet": online,
+            "stock_lookup": stock_lookup,
             "candidates": ranked,
             "best": ranked[0] if status == "matched" and ranked else None,
         }
@@ -2573,7 +2602,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         for r in rows:
             if sku and parts.sku_exact(r.get("SKU")) != parts.sku_exact(sku):
                 continue
-            if brand and parts.brand_match(brand, r.get("BRAND")) != 100:
+            if brand and not parts.exact_brand_match(brand, r.get("BRAND")):
                 continue
             name = str(r.get("NAME") or "")
             if needle and not parts.text_matches(query, f"{name} {r.get('SKU') or ''}"):
@@ -2583,7 +2612,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "brand": r.get("BRAND"),
                 "sku": r.get("SKU"),
                 "name": name,
-                "qty": r.get("QUANTITY") or r.get("COUNT") or r.get("STOCK_COUNT"),
+                "qty": next((r[k] for k in ("QUANTITY", "COUNT", "STOCK_COUNT") if r.get(k) not in (None, "")), None),
                 "reserved": r.get("RESERVED"),
                 # В API склада PRICE — это ЗАКУПКА (она же PRICE_W_TAX), а цена продажи
                 # панель считает наценкой: PRICE_W_MARKUP. Раньше бот брал «price» и
@@ -2632,7 +2661,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         } for r in rows[:limit]]
 
     def stock_by_sku_variants(self, sku: str | list[str], *, brand: str | None = None,
-                              limit: int = 40) -> list[dict[str, Any]]:
+                              limit: int = 40, errors: list[str] | None = None) -> list[dict[str, Any]]:
         """Ищет остатки, перебирая написания артикула (FILTER[SKU] сравнивает как в панели)."""
         variants = parts.sku_variants(sku) if isinstance(sku, str) else list(sku)
         # Одинаковые по смыслу написания второй раз не спрашиваем («w914/2» ↔ «W9142»).
@@ -2648,23 +2677,26 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             unique.append(variant)
 
         found: list[dict[str, Any]] = []
-        seen: set[tuple[Any, Any]] = set()
+        seen: set[tuple[Any, Any, str]] = set()
         batch_rows: dict[str, list[dict[str, Any]]] = {}
 
         def fetch(variant: str) -> None:
             try:
                 batch_rows[variant] = self.stock(sku=variant, brand=brand, limit=limit)
-            except (StocrmError, ValueError):
+            except (StocrmError, ValueError) as exc:
+                if errors is not None:
+                    errors.append(str(exc))
                 batch_rows[variant] = []
 
         def collect(variant: str) -> None:
             for row in batch_rows.get(variant) or []:
                 if unique and parts.sku_exact(row.get("sku")) != parts.sku_exact(unique[0]):
                     continue
-                if brand and parts.brand_match(brand, row.get("brand")) != 100:
+                if brand and not parts.exact_brand_match(brand, row.get("brand")):
                     continue
                 row_key = (row.get("warehouse_id"),
-                           parts.sku_exact(row.get("sku")) or row.get("name"))
+                           parts.sku_exact(row.get("sku")) or row.get("name"),
+                           parts.exact_brand_identity(row.get("brand")))
                 if row_key in seen:
                     continue
                 seen.add(row_key)
@@ -4226,6 +4258,24 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if not review["can_resume"]:
                 raise ValueError("Позиция уже появилась в CRM; продолжение остановлено, чтобы не создать дубль. Откройте /drafts и проверьте результат")
         if current and current.get("status") == "pending" and current.get("tool") == "add_offer_part":
+            def has_stock_reference(value: Any) -> bool:
+                if isinstance(value, list):
+                    return any(has_stock_reference(v) for v in value)
+                if not isinstance(value, dict):
+                    return False
+                for key, val in value.items():
+                    name = str(key).upper()
+                    if name in {"STOCK_ID", "STOCK_IDS", "STOCKS_IDS", "STOCKS_IDS_SYSTEM"} and val not in (None, "", [], 0):
+                        return True
+                    if name == "METHOD" and val not in {"offer/require/add", "offer/order/add", "offer/order/add_free_order"}:
+                        return True
+                    if name == "STOCK_TYPE" and str(val).upper() != "FREE_ORDER":
+                        return True
+                    if has_stock_reference(val):
+                        return True
+                return False
+            if has_stock_reference(current.get("steps") or [{"method": current.get("method"), "payload": current.get("payload")} ]):
+                raise ValueError("Этот черновик привязан к складской позиции; применение запрещено. Запись не начата. Старые partial повторять нельзя")
             if (self.manual_order_method == "offer/order/add_free_order"
                     and any(s.get("method") == "offer/order/add" for s in current.get("steps") or [])
                     and ("свободной позицией" in str(current.get("summary") or "")

@@ -160,10 +160,10 @@ TOOL_SPEC: list[dict[str, Any]] = [
           {"query": _STR, "phone": _STR, "limit": _INT}),
     _tool("contact_card", "Полная карточка клиента по contact_id (свойства, автомобили, юрлица).",
           {"contact_id": _INT}, ["contact_id"]),
-    _tool("stock", "Остатки склада: только по явной просьбе проверить остатки. Для подбора и добавления запчастей НЕ вызывать: склад из подбора исключён.",
+    _tool("stock", "Поиск по складу только для справки. Не резервировать, не списывать и не привязывать складскую позицию к сделке.",
           {"query": _STR, "brand": _STR, "sku": _STR, "warehouse_id": _INT, "limit": _INT}),
     _tool("resolve_part",
-          "Подбор запчасти БЕЗ склада, с обязательным совпадением названных бренда и артикула. Возвращает проверенные варианты "
+          "Подбор запчасти, включая справочный поиск по складу только на чтение, с обязательным совпадением названных бренда и артикула. Возвращает варианты "
           "(status: matched — можно брать первый; ambiguous — нужно спросить человека). "
           "ВСЕГДА вызывай перед draft_add_offer_part: в карточке нужен точный бренд, артикул и цена.",
           {"query": {"type": "string", "description": "как сказал человек: «фильтр масляный w914/2»"},
@@ -1319,6 +1319,8 @@ class ToolRouter:
     @staticmethod
     def _apply_part(args: dict[str, Any], chosen: dict[str, Any]) -> None:
         """Подставляет в аргументы данные выбранной позиции."""
+        if chosen.get("source") == "склад":
+            args["_input_warning"] = "Склад использован только для поиска; будет свободная позиция, не привязанная к складскому остатку. Наличие и применяемость требуют проверки."
         if chosen.get("source") in {"указано человеком", "вручную по данным человека"}:
             args["_input_warning"] = "Свободная позиция по данным сотрудника; каталог и применяемость не подтверждены. Это не заказ у внешнего поставщика."
         args["name"] = chosen.get("name") or args.get("name")
@@ -1326,7 +1328,7 @@ class ToolRouter:
             args["brand"] = chosen["brand"]
         if chosen.get("sku"):
             args["sku"] = chosen["sku"]
-        if chosen.get("price") and not args.get("price"):
+        if chosen.get("source") != "склад" and chosen.get("price") and not args.get("price"):
             args["price"] = chosen["price"]
         if not args.get("price"):
             # Цену не выдумываем и 0 не подставляем: позиция с ценой 0 уже уезжала
@@ -1337,7 +1339,7 @@ class ToolRouter:
         # справочная сноска для человека. Нет поставщика → свободная позиция.
         args.pop("warehouse_id", None)
         args.pop("stock_ids", None)
-        if args.get("source") in (None, "", "stock"):
+        if args.get("source") in (None, ""):
             args["source"] = "manual"
 
     def _part_choice(self, *, tool: str, args: dict[str, Any],
@@ -1364,7 +1366,8 @@ class ToolRouter:
                 "url": c.get("url"),
                 "score": c.get("score"),
                 "why": c.get("why"),
-                "in_stock": c.get("qty") or None,
+                "in_stock": parts.in_stock(c),
+                "stock_records": c.get("stock_records") or [],
                 "stock_note": parts.in_stock_note(c),
                 "title": parts.describe(c),
             }
@@ -1382,6 +1385,8 @@ class ToolRouter:
                             "или назовите поставщика, если заказываем подбор.")
         else:
             question = f"Уточните запчасть «{query}» — какой вариант нужен?"
+        if any("склад" in item.lower() and "не полностью" in item.lower() for item in (tried or [])):
+            question += " Проверка склада не завершена полностью; отсутствие позиции не доказано."
         if status == "not_found" and tried and not args.get("sku"):
             question += " Проверено: " + "; ".join(tried[:2])
         if not shortlist:
@@ -1395,7 +1400,7 @@ class ToolRouter:
             "question": question,
             "candidates": shortlist,
             "tried": tried or [],
-            "hint": ("Ничего не добавлено. Первый вариант — самый вероятный. "
+            "hint": ("Ничего не добавлено. Проверь варианты и их источники. "
                      "Дождись выбора человека из списка. Со склада не списываем: "
                      "наличие указано справочно, добавление — заказом или свободной позицией."),
         }, ensure_ascii=False)
@@ -1566,7 +1571,7 @@ class ToolRouter:
         # Остаток склада остаётся только сноской для человека.
         args.pop("warehouse_id", None)
         args.pop("stock_ids", None)
-        if args.get("source") in (None, "", "stock"):
+        if args.get("source") in (None, ""):
             args["source"] = "manual"
         return self.execute(tool, args)
 

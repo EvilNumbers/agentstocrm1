@@ -1,4 +1,4 @@
-"""Диагностика точного бренда/артикула без склада; только чтение."""
+"""Диагностика точного бренда/артикула и склада; только чтение."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def run_partcheck(tools: Toolset, query: str) -> list[Check]:
     except (StocrmError, ValueError) as exc:
         checks.append(Check(FAIL, "Сделки недоступны", str(exc)))
 
-    checks.append(Check(INFO, "Поиск по складу отключён", "Проверяем артикул и бренд в номенклатуре, истории и интернете; остатки не запрашиваются."))
+    checks.append(Check(INFO, "Склад проверяется только для справки", "Складские позиции не привязываются к сделке и не списываются этой проверкой."))
     for field in ("QUERY", "NAME"):
         try:
             rows = _rows(tools, "wms/product_cards/get_filtered", filters={field: sku or query}, limit=3)
@@ -77,6 +77,16 @@ def run_partcheck(tools: Toolset, query: str) -> list[Check]:
         except (StocrmError, ValueError) as exc:
             checks.append(Check(WARN, f"Номенклатура: фильтр {field} — ошибка", str(exc)))
     result = tools.resolve_part(query=query, brand=brand, sku=sku)
+    stock_lookup = result.get("stock_lookup") or {}
+    stock_state = stock_lookup.get("status")
+    if stock_state in ("unavailable", "partial"):
+        checks.append(Check(WARN, "Склад: проверка не выполнена или неполная", "; ".join(stock_lookup.get("errors") or []) or "Проверка прервана; отсутствие позиции не доказано."))
+    elif stock_state == "ok":
+        checks.append(Check(OK, f"Склад: строк в проверенной выдаче: {stock_lookup.get('rows')}", "Остаток — справочно, не количество в сделке. Наличие и применяемость нужно проверить."))
+    elif stock_state == "empty":
+        checks.append(Check(INFO, "Склад: совпадений в проверенной выдаче нет", "Это не доказывает отсутствие позиции на складе."))
+    else:
+        checks.append(Check(INFO, "Склад: поиск пропущен", "Недостаточно данных для поиска."))
     online = result.get("internet")
     if online is not None:
         state = online.get("status")
@@ -102,7 +112,7 @@ def run_partcheck(tools: Toolset, query: str) -> list[Check]:
     for warning in result.get("warnings") or []:
         checks.append(Check(WARN, "  предупреждение: " + str(warning)))
     if status == "not_found":
-        checks.append(Check(WARN, "Что делать", "Названные артикул и бренд сохранены. Можно уточнить название или поставщика. Пустой ответ не доказывает отсутствие детали; склад для подбора не используется."))
+        checks.append(Check(WARN, "Что делать", "Названные артикул и бренд сохранены. Можно уточнить название или поставщика. Пустой ответ не доказывает отсутствие детали; склад используется только для справки."))
     return checks
 
 
