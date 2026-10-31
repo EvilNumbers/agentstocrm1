@@ -143,7 +143,7 @@ def search_brands(sku: str) -> dict[str, Any]:
         with requests.Session() as session:
             session.trust_env = False
             with session.post(_SEARCH_URL, data=payload,
-                              headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": _SEARCH_URL},
+                              headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": f'"{_SEARCH_URL}"'},
                               timeout=(2, 3), allow_redirects=False, stream=True, verify=True) as response:
                 if response.status_code != 200:
                     return unavailable(f"Сервер вернул HTTP {response.status_code}.")

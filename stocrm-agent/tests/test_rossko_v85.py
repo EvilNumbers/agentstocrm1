@@ -66,7 +66,7 @@ def test_wire_protocol_is_only_search_exact_fixed_endpoint(fake_rossko):
     trust, url, kw = fake_rossko[0]
     assert trust is False and url == 'https://api.rossko.ru/service/v2.1/GetSearch'
     assert kw['allow_redirects'] is False and kw['verify'] is True and kw['stream'] is True
-    assert kw['headers']['SOAPAction'] == url
+    assert kw['headers']['SOAPAction'] == f'"{url}"'
     root = ET.fromstring(kw['data'])
     body = next(iter(root))
     operation = next(iter(body))
