@@ -1385,6 +1385,10 @@ class ToolRouter:
         if status == "not_found" and tried and not args.get("sku"):
             question += " Проверено: " + "; ".join(tried[:2])
         if not shortlist:
+            if any("интернет" in item.lower() and any(word in item.lower() for word in ("недоступ", "ошибка", "не заверш")) for item in (tried or [])):
+                question += " Интернет-поиск был недоступен или не завершился; это не означает, что товара нет."
+            elif any("интернет" in item.lower() for item in (tried or [])):
+                question += " В полученной выдаче не удалось подтвердить производителя для этого артикула."
             question += " Можно добавить свободную позицию ровно по вашим данным, без проверки применяемости: напишите «добавь как указано». Неуказанные бренд/артикул останутся неизвестными. Также доступны «повтори поиск», «пропусти», «отмена»."
         payload = json.dumps({
             "status": "нужно уточнить запчасть",

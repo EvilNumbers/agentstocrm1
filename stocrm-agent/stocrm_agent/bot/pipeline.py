@@ -1767,14 +1767,20 @@ class BotPipeline:
                     items = [{"sku": "", "name": title, "normalized": "", "price": unit, "qty": qty, "brand": parts.find_brand_in_text(title)}]
         if not items:
             return None
+        # После «производитель» человек может назвать бренд не из словаря,
+        # и через запятую он относится к единственному артикулу всей просьбы.
+        if len(items) == 1:
+            spoken_brand = parts.explicit_brand_in_text(source)
+            if spoken_brand:
+                items[0]["brand"] = spoken_brand
         # Явный бренд конкретной строки не теряем при пакетном разборе.
         for segment in re.split(r"[\n;,]", source):
             keys = set(parts.sku_in_text(segment))
             keys.difference_update(parts.sku_exact(m.group(1)) for m in _DEAL_IN_TEXT.finditer(segment))
-            brand = parts.find_brand_in_text(segment)
+            brand = parts.explicit_brand_in_text(segment) or parts.find_brand_in_text(segment)
             if brand and len(keys) == 1:
                 for item in items:
-                    if item["normalized"] in keys:
+                    if item["normalized"] in keys and not item.get("brand"):
                         item["brand"] = brand
         for item in items:
             previous = (self.router.part_context or {}).get(item["normalized"], {})
@@ -1791,14 +1797,12 @@ class BotPipeline:
             # (скриншот 30.10: «Добавь артикулы Pc2031…» после карточки сделки 1313).
             seen = self._last_offer.get(user_id or 0)
             if not seen:
-                if len(items) < 2:
-                    return None
                 if re.search(r"поставщик|закупк|закупочн", source, re.I):
                     return PipelineResult(answer="Для заказа у поставщика или с закупочной ценой укажите позиции отдельными запросами с поставщиком и закупочной ценой. Свободную заявку вместо заказа не создаю; в CRM ничего не записано.")
                 group = {'raw_items': items, '_lock': threading.RLock()}
                 choice: dict[str, Any] = {'kind': 'part', 'tool': PART_TOOL, 'args': {}, 'candidates': [],
                           '_group': group, '_group_step': 'offer',
-                          'question': 'В какую сделку добавить все указанные позиции? Напишите номер сделки.'}
+                          'question': 'В какую сделку добавить указанные позиции? Напишите номер сделки.'}
                 result = PipelineResult(answer=choice['question'], choices=[choice])
                 self._track_part(result, user_id)
                 return result
@@ -2584,8 +2588,9 @@ class BotPipeline:
                 return tag
 
         # Безопасность общей заявки не зависит от переключателя быстрых ответов.
-        # При TG_FASTPATH=0 одиночные позиции остаются на обычном пути модели.
-        if (self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text))) and not _WORK_WORD.search(text):
+        # При TG_FASTPATH=0 одиночная позиция с явно названным производителем
+        # тоже проходит здесь, чтобы произвольный бренд не пропал.
+        if (self.fastpath or (len(self.router.parts_hint or []) > 1 and _ADD_VERB.search(text)) or (parts.explicit_brand_in_text(text) and _ADD_VERB.search(text))) and not _WORK_WORD.search(text):
             direct = await asyncio.to_thread(self._direct_parts, text, user_id)
             if direct is not None:
                 history.append({"role": "user", "content": text})

@@ -314,7 +314,7 @@ def render_part_choice(choice: dict[str, Any]) -> str:
     if candidates:
         first = candidates[0]
         label = " ".join(str(first.get(k) or "") for k in ("brand", "sku")).strip()
-        lines.append("Самый вероятный: " + (label or str(first.get("title") or "первый вариант")))
+        lines.append("Первый вариант (проверьте источник): " + (label or str(first.get("title") or "первый вариант")))
         if first.get("why"):
             lines.append(str(first["why"]))
         sources = {str(c.get("source") or "") for c in candidates}

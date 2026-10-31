@@ -2730,30 +2730,17 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             self._web_cache[cache_key] = (time.time(), result)
             return result
 
-        # Интернет — вспомогательный источник: строго ограниченное время на всё.
-        # Раньше цепочка поисковиков могла занять полторы минуты, и человек ждал.
-        deadline = time.monotonic() + websearch.budget()
-        prefix = f"{brand} {sku}" if brand else sku
-        queries = [f"{prefix} {term}".strip() if term else f"{prefix} запчасть", f"{prefix} артикул"]
+        # Один запрос к выбранному провайдеру — без переключения поисковиков,
+        # повторных запросов, обхода ограничений или капчи. Интернет — подсказка.
         hits: list[dict[str, Any]] = []
         errors: list[str] = []
-        for query in queries[:2]:
-            if len({b["brand"] for b in parts.brands_from_hits(hits, sku, brand=brand)}) >= (1 if brand else 2):
-                break
-            if time.monotonic() >= deadline:
-                errors.append("время на поиск в интернете вышло")
-                break
-            try:
-                found = websearch.search(query, limit=8,
-                                         required=[sku] + ([brand] if brand else []) + ([term] if term else []),
-                                         deadline=deadline)
-            except websearch.WebSearchError as exc:
-                errors.append(str(exc))
-                continue
-            result["queries"].append(query)
-            known = {h.get("url") for h in hits}
-            hits.extend({"title": h.title, "snippet": h.snippet, "url": h.url, "site": h.site}
-                        for h in found if h.url not in known)
+        try:
+            found = websearch.search_batch([sku], limit=8)
+            result["queries"].append(sku)
+            hits = [{"title": h.title, "snippet": h.snippet, "url": h.url, "site": h.site}
+                    for h in found]
+        except (websearch.WebSearchError, ValueError) as exc:
+            errors.append(str(exc))
 
         result["hits"] = len(hits)
         if not hits:

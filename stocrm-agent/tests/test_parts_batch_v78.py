@@ -127,16 +127,16 @@ def test_batch_search_exact_attribution_and_rank(env, monkeypatch):
     calls = []
     def search(skus, **kw):
         calls.append(skus)
-        return [websearch.Hit('PILENGA CH88011', 'https://one.example/a'),
-                websearch.Hit('ZEKKERT CH88014E', 'https://two.example/b'),
+        return [websearch.Hit('PILENGA CH88011 запчасть', 'https://one.example/a'),
+                websearch.Hit('ZEKKERT CH88014E запчасть', 'https://two.example/b'),
                 websearch.Hit('PILENGA CH88011 CH88014E ZEKKERT', 'https://bad.example/c'),
-                websearch.Hit('PILENGA CH88011', 'https://two.example/d'),
-                websearch.Hit('NEWCO CH88011', 'https://three.example/e')]
+                websearch.Hit('PILENGA CH88011 запчасть', 'https://two.example/d'),
+                websearch.Hit('NEWCO CH88011 запчасть', 'https://three.example/e')]
     monkeypatch.setattr(websearch, 'search_batch', search)
     first = send(pipe, 'Добавь товары Ch88011 за 1200\nCh88014e за 4200')
     assert calls == [['CH88011', 'CH88014E']]
     assert [x['brand'] for x in first.choices[0]['candidates']] == ['PILENGA', 'NEWCO']
-    assert 'Самый вероятный' in render_part_choice(first.choices[0])
+    assert 'Первый вариант' in render_part_choice(first.choices[0])
     second = pipe.resume_choice(first.choices[0], 0, user_key=19)
     assert [x['brand'] for x in second.choices[0]['candidates']] == ['ZEKKERT']
     stale = pipe.resume_choice(first.choices[0], 0, user_key=19)
