@@ -12,6 +12,7 @@ from typing import Any
 
 from .booking_dates import parse_when
 from .calendar import _positive, _rows, _stamp, _zone
+from .contact_search import phone_key
 
 
 def digits(phone: str) -> str:
@@ -24,7 +25,7 @@ def key(value: Any) -> str:
 
 def master_key(value: Any) -> str:
     name = key(value)
-    return {"рыжему": "рыжий", "сане": "саня"}.get(name, name)
+    return {"рыжему": "рыжий", "сане": "саня", "андрею": "андрей"}.get(name, name)
 
 
 class BookingNeeds(ValueError):
@@ -56,6 +57,8 @@ def _id_from(value: Any, field: str) -> int:
 class BookingMixin:
     def _booking_contacts(self: Any, phone: str, contact_id: int | None = None) -> list[dict[str, Any]]:
         """Полный ограниченный проход, включая дополнительные телефоны из contact/get_info."""
+        if not 10 <= len(phone_key(phone)) <= 15:
+            raise ValueError("Укажите полный номер телефона клиента")
         matches: list[dict[str, Any]] = []
         seen: set[str] = set()
         for page in range(1, 21):
@@ -69,7 +72,9 @@ class BookingMixin:
                 if not ident or ident in seen:
                     raise ValueError("Поиск контактов вернул неполные/повторные данные — создание дубля запрещено")
                 seen.add(ident)
-                phones = {digits(str(row.get("MAIN_PHONE") or ""))}
+                if contact_id and str(contact_id) != ident:
+                    continue  # CRM может игнорировать FILTER
+                phones = {phone_key(row.get("MAIN_PHONE"))}
                 raw = self._read("booking_contact_phones", "contact/get_info", {"CONTACT_ID": int(ident)})
                 structured = raw.get("STRUCTURIZED", {}) if isinstance(raw, dict) else {}
                 if str(structured.get("CONTACT_ID")) != ident or not isinstance(structured.get("FLAT"), dict):
@@ -81,19 +86,152 @@ class BookingMixin:
                     if not isinstance(prop, dict) or not isinstance(prop.get("INFO"), dict):
                         raise ValueError("Неизвестный формат телефонов контакта")
                     if prop["INFO"].get("TYPE") == "phone":
-                        phones.add(digits(str(prop["INFO"].get("MAIN") or "")))
+                        phones.add(phone_key(prop["INFO"].get("MAIN")))
                         items = prop.get("ITEMS", {})
                         if not isinstance(items, dict):
                             raise ValueError("Неизвестный формат дополнительных телефонов")
                         for item in items.values():
                             if not isinstance(item, dict):
                                 raise ValueError("Неизвестный формат дополнительного телефона")
-                            phones.add(digits(str(item.get("VALUE") or "")))
-                if digits(phone) in phones:
+                            phones.add(phone_key(item.get("VALUE")))
+                if phone_key(phone) in phones:
                     matches.append({"contact_id": int(ident), "title": row.get("TITLE"), "phone": row.get("MAIN_PHONE")})
             if len(rows) < 500:
                 return matches
         raise ValueError("Не удалось закончить поиск контакта по телефону; новую запись не создаю")
+
+    def _booking_client_offers(self: Any, contact_id: int) -> list[dict[str, Any]]:
+        """Полная выборка сделок контакта; не доверяем серверному фильтру."""
+        seen: set[int] = set()
+        selected: list[dict[str, Any]] = []
+        for page in range(1, 21):
+            raw = self._read("booking_existing_offers", "offers/get_from_filter",
+                             {"FILTER": {"CONTACT_ID": contact_id}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": page, "LIMIT": 500})
+            if raw is None or isinstance(raw, bool):
+                raise ValueError("CRM не подтвердила список сделок клиента; запись остановлена")
+            rows = _rows(raw)
+            for row in rows:
+                ident = _positive(row.get("OFFER_ID"), "Сделка")
+                owner = _positive(row.get("CONTACT_ID"), "Контакт сделки")
+                if ident in seen:
+                    raise ValueError("CRM повторяет страницы сделок; список не подтверждён")
+                seen.add(ident)
+                if owner != contact_id:
+                    continue
+                status = str(row.get("STATUS_NAME") or "").strip()
+                if not status:
+                    board = _positive(row.get("BOARD_ID"), "Воронка сделки")
+                    status_id = _positive(row.get("STATUS_ID"), "Статус сделки")
+                    found = [s for s in self.statuses(board) if str(s.get("status_id")) == str(status_id)
+                             and str(s.get("board_id")) == str(board) and s.get("title")]
+                    if len(found) != 1:
+                        raise ValueError("CRM не подтвердила статус сделки; выбор остановлен")
+                    status = str(found[0]["title"])
+                if key(status) not in {"успешно реализовано", "отказ", "мусор", "возврат"}:
+                    selected.append({"offer_id": ident, "status": status,
+                                     "board": str(row.get("BOARD_NAME") or ""),
+                                     "car": str(row.get("CAR_TITLE_TABLE") or "")})
+            if len(rows) < 500:
+                return selected
+        raise ValueError("Список сделок клиента неполный; запись остановлена")
+
+    def _booking_uncertain_client(self: Any, phone: str, contact_id: int | None) -> None:
+        for previous in self.drafts.list("all"):
+            if previous.get("status") not in ("partial", "applying"):
+                continue
+            check = previous.get("check") or {}
+            if check.get("kind") not in ("booking", "existing_booking"):
+                continue
+            old_phone = str(check.get("phone") or check.get("verified_phone") or "")
+            old_contact = check.get("contact_id") or (check.get("original") or {}).get("contact_id") or (previous.get("result") or {}).get("CONTACT_ID")
+            if ((old_phone and phone_key(old_phone) == phone_key(phone)) or
+                    (contact_id and str(old_contact) == str(contact_id))):
+                raise ValueError("У клиента есть незавершённая или неопределённая запись. Проверьте /drafts и календарь CRM; повтор заблокирован")
+
+    def _booking_uncertain_offer(self: Any, offer_id: int) -> None:
+        for previous in self.drafts.list("all"):
+            if previous.get("status") not in ("partial", "applying"):
+                continue
+            check = previous.get("check") or {}
+            if check.get("kind") not in ("booking", "existing_booking"):
+                continue
+            old_offer = (check.get("expected") or {}).get("OFFER_ID") or (previous.get("result") or {}).get("OFFER_ID")
+            if str(old_offer) == str(offer_id):
+                raise ValueError("По этой сделке есть неопределённая запись. Проверьте /drafts и календарь CRM; повтор заблокирован")
+
+    def resolve_booking_client(self: Any, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Проверить телефон, предложить активные сделки, не выбирать за человека."""
+        phone = str(args.get("phone") or "")
+        if not phone:
+            raise BookingNeeds("Укажите телефон клиента целиком.", "phone", args)
+        if not 10 <= len(phone_key(phone)) <= 15:
+            raise BookingNeeds("Укажите полный номер телефона клиента.", "phone", args)
+        contacts = self._booking_contacts(phone)
+        contact_ids = sorted(int(c["contact_id"]) for c in contacts)
+        previous_contacts = args.get("_contact_snapshot")
+        contact_id = args.get("contact_id")
+        if previous_contacts is not None and previous_contacts != contact_ids:
+            args.pop("contact_id", None)
+            args.pop("offer_choice", None)
+            args.pop("_offered_active_ids", None)
+            args.pop("change_status", None)
+            args.pop("reason_id", None)
+            contact_id = None
+        if len(contacts) > 1 and (contact_id is None or previous_contacts != contact_ids):
+            args.pop("contact_id", None)
+            args["_contact_snapshot"] = contact_ids
+            options = [{"value": c["contact_id"], "label": f"{c['title'] or 'Без имени'} · контакт №{c['contact_id']}"} for c in contacts]
+            raise BookingNeeds("Телефон найден у нескольких клиентов. Выберите нужного:", "contact_id", args, options)
+        args["_contact_snapshot"] = contact_ids
+        if contact_id is not None:
+            matches = [c for c in contacts if str(c["contact_id"]) == str(contact_id)]
+            if len(matches) != 1:
+                raise ValueError("Выбранный контакт больше не подтверждён по телефону")
+            contact = matches[0]
+        else:
+            contact = contacts[0] if contacts else None
+        contact_id = int(contact["contact_id"]) if contact else None
+        if contact_id:
+            args["contact_id"] = contact_id
+        self._booking_uncertain_client(phone, contact_id)
+        active = self._booking_client_offers(contact_id) if contact_id else []
+        ids = sorted(o["offer_id"] for o in active)
+        choice = args.get("offer_choice")
+        requested = args.get("requested_offer_id")
+        if requested is not None and choice is None:
+            if str(requested) not in {str(i) for i in ids}:
+                raise ValueError("Указанная сделка не подтверждена как активная сделка клиента с этим телефоном")
+            choice = str(requested)
+            args["offer_choice"] = choice
+            args["_offered_active_ids"] = ids
+        snapshot = args.get("_offered_active_ids")
+        if active and (choice is None or snapshot != ids):
+            if len(active) > 30:
+                raise ValueError("У клиента больше 30 активных сделок. Укажите номер нужной сделки вместе с телефоном клиента; сам не выбираю")
+            args.pop("offer_choice", None)
+            args.pop("change_status", None)
+            args.pop("reason_id", None)
+            args["_offered_active_ids"] = ids
+            options = [{"value": "new", "label": "Создать новую сделку"}]
+            options.extend({"value": str(o["offer_id"]), "label": f"Сделка №{o['offer_id']} · {o['status']}" + (f" · {o['car']}" if o['car'] else "") + (f" · {o['board']}" if o['board'] else "")} for o in active)
+            question = "У этого клиента есть активные сделки. Создать новую или выбрать существующую?\n" + "\n".join(f"{i}. {o['label']}" for i, o in enumerate(options, 1))
+            raise BookingNeeds(question, "offer_choice", args, options)
+        if choice and choice != "new":
+            if not contact_id or str(choice) not in {str(i) for i in ids}:
+                raise ValueError("Выбранная сделка больше не подтверждена как активная сделка клиента")
+            fields = ("start", "end", "duration_minutes", "master", "customer_id", "post_id", "reason_id", "comment", "change_status")
+            selected = {k: args[k] for k in fields if k in args}
+            selected.update(offer_id=int(choice), verified_phone=phone, verified_contact_id=contact_id)
+            return "draft_book_existing_offer", selected
+        if not contact and not str(args.get("client_name") or "").strip():
+            raise BookingNeeds("Как зовут нового клиента? Телефон и время сохранены.", "client_name", args)
+        new_fields = ("client_name", "phone", "start", "end", "duration_minutes", "master", "customer_id", "post_id", "board_id", "contact_id", "reason_id", "comment")
+        selected = {k: args[k] for k in new_fields if k in args}
+        selected["client_name"] = str(args.get("client_name") or (contact or {}).get("title") or "")
+        if contact and not selected["client_name"]:
+            selected["client_name"] = f"Контакт №{contact_id}"
+        selected["_approved_active_ids"] = ids
+        return "draft_book_new_offer", selected
 
     def _booking_offer(self: Any, offer_id: int) -> dict[str, Any]:
         """Только сделка: без ненужного запроса баланса на каждом ответе мастеру."""
@@ -184,7 +322,8 @@ class BookingMixin:
                              duration_minutes: int | None = None, master: str | None = None,
                              customer_id: int | None = None, post_id: int | None = None,
                              board_id: int | None = None, contact_id: int | None = None,
-                             reason_id: int | None = None, comment: str = "") -> dict[str, Any]:
+                             reason_id: int | None = None, comment: str = "",
+                             _approved_active_ids: list[int] | None = None) -> dict[str, Any]:
         args = {k: v for k, v in locals().copy().items() if k != "self" and v is not None}
         if not client_name or not str(client_name).strip():
             raise BookingNeeds("Как зовут клиента для новой сделки?", "client_name", args)
@@ -227,6 +366,12 @@ class BookingMixin:
             contact_id = int(contacts[0]["contact_id"])
         if contact_id is not None and str(contact_id) not in {str(c["contact_id"]) for c in contacts}:
             raise ValueError("Выбранный контакт не совпадает с названным телефоном")
+        self._booking_uncertain_client(phone, contact_id)
+        active_ids = sorted(o["offer_id"] for o in self._booking_client_offers(contact_id)) if contact_id else []
+        if active_ids and _approved_active_ids is None:
+            raise ValueError("У клиента есть активные сделки. Сначала выберите существующую сделку или создание новой в диалоге записи")
+        if _approved_active_ids is not None and sorted(_approved_active_ids) != active_ids:
+            raise ValueError("Активные сделки клиента изменились. Выберите действие заново; запись не начата")
         payload = {"CUSTOMER_ID": int(customer_id), "POST_ID": _positive(post_id, "Пост"),
                    "DATE_FROM": begin, "DATE_TO": finish, "COMMENT": comment}
         for previous in self.drafts.list("all"):
@@ -239,7 +384,9 @@ class BookingMixin:
                         and key(previous_check.get("client_name")) == key(client_name)
                         and previous_check.get("contact_id") == contact_id
                         and previous_check.get("status_id") == status_id
-                        and previous_check.get("reason_id") == reason_id):
+                        and previous_check.get("reason_id") == reason_id
+                        and previous_check.get("approved_active_ids") == active_ids
+                        and previous_check.get("contact_matches") == sorted(int(c["contact_id"]) for c in contacts)):
                     return previous
         post_name = self._calendar_validate(payload)
         create: dict[str, Any] = {"BOARD_ID": board_id, "CUSTOMER_ID": int(customer_id)}
@@ -262,18 +409,33 @@ class BookingMixin:
                                   summary=summary, steps=steps,
                                   extra={"check": {"kind": "booking", "expected": payload, "phone": phone, "client_name": client_name,
                                                    "contact_id": contact_id, "board_id": board_id, "status_id": status_id,
-                                                   "reason_id": reason_id}})
+                                                   "reason_id": reason_id, "approved_active_ids": active_ids,
+                                                   "contact_matches": sorted(int(c["contact_id"]) for c in contacts)}})
 
     def draft_book_existing_offer(self: Any, *, offer_id: int, start: str | None = None,
                                   end: str | None = None, duration_minutes: int | None = None,
                                   master: str | None = None, customer_id: int | None = None,
                                   post_id: int | None = None, reason_id: int | None = None,
-                                  comment: str = "", change_status: bool | None = None) -> dict[str, Any]:
+                                  comment: str = "", change_status: bool | None = None,
+                                  verified_phone: str | None = None, verified_contact_id: int | None = None) -> dict[str, Any]:
         args = {k: v for k, v in locals().copy().items() if k != "self" and v is not None}
         ident = _positive(offer_id, "Существующая сделка")
+        self._booking_uncertain_offer(ident)
         offer = self._booking_offer(ident)
         if offer.get("error") or str(offer.get("offer_id")) != str(ident):
             raise ValueError("Существующая сделка не найдена — проверьте её номер")
+        contact = offer.get("contact_id")
+        if re.fullmatch(r"[1-9]\d*", str(contact)):
+            self._booking_uncertain_client(verified_phone or "", int(contact))
+        if verified_phone:
+            if not verified_contact_id or str(offer.get("contact_id")) != str(verified_contact_id):
+                raise ValueError("Сделка не принадлежит выбранному клиенту; запись остановлена")
+            matches = self._booking_contacts(verified_phone)
+            if not any(str(c["contact_id"]) == str(verified_contact_id) for c in matches):
+                raise ValueError("Телефон клиента сделки не подтверждён")
+            self._booking_uncertain_client(verified_phone, verified_contact_id)
+            if ident not in {o["offer_id"] for o in self._booking_client_offers(verified_contact_id)}:
+                raise ValueError("Сделка больше не является активной сделкой клиента")
         board_id = _positive(offer.get("board_id"), "Воронка сделки")
         if offer.get("status_id") is None and not offer.get("status"):
             raise ValueError("CRM не вернула ни номер, ни название текущего статуса сделки. Не могу безопасно проверить его сохранение")
@@ -301,7 +463,7 @@ class BookingMixin:
             if check.get("kind") == "existing_booking" and check.get("expected") == expected:
                 if previous["status"] in ("partial", "applying"):
                     raise ValueError("Эта запись уже отправлялась; проверьте /drafts и STOCRM. Повтор заблокирован во избежание дублей")
-                if previous["status"] == "pending" and check.get("original") == self._existing_booking_snapshot(offer) and check.get("reason_id") == reason_id and check.get("change_status") == change_status:
+                if previous["status"] == "pending" and check.get("original") == self._existing_booking_snapshot(offer) and check.get("reason_id") == reason_id and check.get("change_status") == change_status and check.get("verified_phone") == verified_phone and check.get("binding_check_version") == 1 and check.get("contact_matches") == (sorted(int(c["contact_id"]) for c in matches) if verified_phone else None):
                     return previous
         post_name = self._calendar_validate(expected)
         status_payload = {"OFFER_ID": ident, "BOARD_ID": board_id, "STATUS_ID": status["status_id"]}
@@ -316,14 +478,32 @@ class BookingMixin:
         return self.drafts.create(tool="book_existing_offer", method=steps[0]["method"], payload=steps[0]["payload"],
                                   summary=summary, steps=steps, extra={"check": {
                                       "kind": "existing_booking", "expected": expected, "original": self._existing_booking_snapshot(offer),
-                                      "board_id": board_id, "status_id": status["status_id"], "reason_id": reason_id, "change_status": change_status}})
+                                      "board_id": board_id, "status_id": status["status_id"], "reason_id": reason_id, "change_status": change_status,
+                                      "verified_phone": verified_phone, "verified_contact_id": verified_contact_id,
+                                      "contact_matches": sorted(int(c["contact_id"]) for c in matches) if verified_phone else None,
+                                      "binding_check_version": 1}})
 
     @staticmethod
     def _existing_booking_snapshot(offer: dict[str, Any]) -> dict[str, str]:
         return {k: str(offer.get(k)) for k in ("offer_id", "board_id", "status_id", "contact_id", "status")}
 
     def _existing_booking_preflight(self: Any, check: dict[str, Any]) -> None:
+        if check.get("binding_check_version") != 1:
+            raise ValueError("Старый черновик записи не прошёл новую проверку клиента. Если запись не отправлялась, отмените черновик и подготовьте её заново")
+        self._booking_uncertain_offer(check["expected"]["OFFER_ID"])
+        old_contact = (check.get("original") or {}).get("contact_id")
+        if re.fullmatch(r"[1-9]\d*", str(old_contact)):
+            self._booking_uncertain_client(check.get("verified_phone") or "", int(str(old_contact)))
         self._invalidate_cache()
+        if check.get("verified_phone"):
+            phone, contact_id = check["verified_phone"], check.get("verified_contact_id")
+            self._booking_uncertain_client(phone, contact_id)
+            matches = self._booking_contacts(phone)
+            if (sorted(int(c["contact_id"]) for c in matches) != check.get("contact_matches") or
+                    not any(str(c["contact_id"]) == str(contact_id) for c in matches)):
+                raise ValueError("Контакты по телефону изменились; запись не начата")
+            if check["expected"]["OFFER_ID"] not in {o["offer_id"] for o in self._booking_client_offers(contact_id)}:
+                raise ValueError("Сделка больше не активна у клиента; запись не начата")
         offer = self._booking_offer(check["expected"]["OFFER_ID"])
         if offer.get("error") or self._existing_booking_snapshot(offer) != check["original"]:
             raise ValueError("Сделка изменилась после подготовки (статус, воронка или контакт). Обновите черновик; ничего не записано")
@@ -406,6 +586,8 @@ class BookingMixin:
         raise ValueError("Список существующих сделок неполный — создание новой остановлено")
 
     def _booking_preflight(self: Any, check: dict[str, Any]) -> None:
+        if "approved_active_ids" not in check or "contact_matches" not in check:
+            raise ValueError("Старый черновик не содержит проверки активных сделок. Отмените его, если запись не отправлялась, и подготовьте заново")
         self._invalidate_cache()
         self._calendar_validate(check["expected"])
         if not any(str(b["board_id"]) == str(check["board_id"]) and b.get("active") != "N" for b in self.boards()):
@@ -417,10 +599,16 @@ class BookingMixin:
             raise ValueError("Причины перехода в «Запись» изменились — создайте новый черновик")
         if not any(str(s["status_id"]) == str(check["status_id"]) and key(s.get("title")) == "запись" and s.get("active") != "N" for s in statuses):
             raise ValueError("Статус «Запись» изменился — подготовьте новый черновик")
-        contacts = self._booking_contacts(check["phone"], check.get("contact_id"))
+        contacts = self._booking_contacts(check["phone"])
         ids = {str(c["contact_id"]) for c in contacts}
+        if sorted(int(c["contact_id"]) for c in contacts) != check.get("contact_matches"):
+            raise ValueError("Контакты по телефону изменились после подготовки — запись не начата")
         if (check.get("contact_id") is None and ids) or (check.get("contact_id") is not None and str(check["contact_id"]) not in ids):
             raise ValueError("Контакт по телефону изменился после подготовки — создайте новый черновик, чтобы не получить дубль")
+        self._booking_uncertain_client(check["phone"], check.get("contact_id"))
+        active = sorted(o["offer_id"] for o in self._booking_client_offers(check["contact_id"])) if check.get("contact_id") else []
+        if active != check["approved_active_ids"]:
+            raise ValueError("Активные сделки клиента изменились после выбора. Проверьте их и подготовьте запись заново")
 
     def _apply_booking(self: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
         prior_ids: set[int] = set()
@@ -499,26 +687,38 @@ def parse_request(text: str) -> dict[str, Any] | None:
     if re.search(r"^\s*поставь\b", text, re.I) and re.search(r"\b(?:тег|метк)\w*", text, re.I):
         return None
     new_offer = bool(re.search(r"созда\w*\s+(?:новую\s+)?сделк", text, re.I))
-    existing_offer = (not new_offer and bool(re.search(r"\b(?:запиши|запишите|записать)\b|(?:поставь|сделай|создай).*сделк|(?:сделай|создай).*запись", text, re.I)))
+    existing_offer = (not new_offer and bool(re.search(
+        r"\b(?:запиши|запишите|записать|запишем|записывай)\b|(?:поставь|сделай|создай|оформи)[\s\S]*(?:сделк|запись|календар|клиент)", text, re.I)))
     if not (new_offer or existing_offer) or not re.search(r"календар|запи[сш]|поставь", text, re.I):
         return None
     args: dict[str, Any] = {}
-    if existing_offer:
-        offer = re.search(r"сделк\w*\s*(?:№|#)?\s*(\d+)", text, re.I)
+    offer = re.search(r"сделк\w*\s*(?:№|#)?\s*(\d+)", text, re.I)
+    # Телефон без слова «телефон», в том числе после «клиента»; не принимаем
+    # дату, номер сделки или поста за телефон.
+    phone = re.search(r"(?:номер(?:\s+телефона)?|телефон(?:а)?|клиент(?:а|у|ом)?)\s*[:—-]?\s*(\+?\d[\d ()-]{8,}\d)", text, re.I)
+    if phone is None:
+        phone = re.search(r"(?<!\d)(?:\+?7|8)[\d ()-]{9,17}\d(?!\d)", text)
+    if phone and not 10 <= len(digits(phone[1] if phone.lastindex else phone[0])) <= 15:
+        phone = None
+    is_client = bool(new_offer or re.search(r"\bклиент\w*", text, re.I) or phone)
+    if is_client:
+        args["_client_booking"] = True
+        if phone:
+            args["phone"] = (phone[1] if phone.lastindex else phone[0]).strip()
+        if offer:
+            args["requested_offer_id"] = int(offer[1])
+    elif existing_offer:
         args["offer_id"] = int(offer[1]) if offer else None
-        for field, pattern in (("post_id", r"пост\w*\s*(?:№|#)?\s*(\d+)"), ("customer_id", r"подразделени\w*\s*(?:№|#)?\s*(\d+)")):
-            match = re.search(pattern, text, re.I)
-            if match:
-                args[field] = int(match[1])
-    name = re.search(r"клиент(?:ом|а)?\s+(.+?)(?=\s+(?:номер|телефон)|[,;.]|$)", text, re.I)
-    phone = re.search(r"(?:номер(?:\s+телефона)?|телефон(?:а)?)\s*[:—-]?\s*(\+?\d[\d ()-]{4,})", text, re.I)
+    for field, pattern in (("post_id", r"пост\w*\s*(?:№|#)?\s*(\d+)"), ("customer_id", r"подразделени\w*\s*(?:№|#)?\s*(\d+)")):
+        match = re.search(pattern, text, re.I)
+        if match:
+            args[field] = int(match[1])
+    name = re.search(r"клиент(?:ом|а|у)?\s+(.+?)(?=\s+(?:номер|телефон|на|к|завтра|сегодня)|[,;.]|$)", text, re.I)
+    if name and is_client and not re.search(r"\d", name[1]):
+        args["client_name"] = name[1].strip()
     master = re.search(r"\bк\s+(?:мастеру\s+)?(.+?)(?=\s+(?:сегодня|завтра|послезавтра)\b|\s+и\s+|\s+на\s+|\s+в\s+|\s+\d|[,;.]|$)", text, re.I)
     if master is None:
         master = re.search(r"\bпоставь\s+(.+?)\s+сделк", text, re.I)
-    if name and not existing_offer:
-        args["client_name"] = name[1].strip()
-    if phone and not existing_offer:
-        args["phone"] = phone[1].strip()
     if master:
         args["master"] = master[1].strip()
     date_text = text
@@ -586,7 +786,7 @@ def answer_pending(pending: dict[str, Any], text: str) -> dict[str, Any]:
     field = pending["field"]
     options = pending["options"]
     if field in ("retry_booking", "correct_booking"):
-        if key(text) in ("1", "повторить", "повторить подготовку", "еще раз"):
+        if key(text) in ("1", "повторить", "повторить подготовку", "повторить проверку", "еще раз"):
             return args
         updated = repair_booking(args, text)
         if updated is not None:
