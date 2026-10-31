@@ -14,6 +14,7 @@ from typing import Any
 
 from .. import money as money_text
 from .. import parts
+from ..client import StocrmError
 from ..human import humanize_error, payload_text, polish
 from ..policy import ConfirmationPolicy
 from ..tools import Toolset
@@ -783,6 +784,9 @@ SYSTEM_PROMPT = """Правка цены существующей услуги �
    подразделения из CRM, не по местоположению собеседника.
    Если одновременно просят создать сделку/клиента и записать в календарь — ТОЛЬКО
    draft_book_new_offer: единый черновик и одно подтверждение; не дроби на инструменты.
+   Если указан телефон клиента, не связывай его со сделкой из истории: нужна проверка клиента
+   и выбор активной сделки человеком. Для новой сделки при наличии активных сделок сначала
+   нужен этот выбор в диалоге, обходить его отдельными инструментами нельзя.
    Телефон передавай как назван, год относительно текущей даты, конец/длительность не выдумывай.
    Для записи существующей сделки ВСЕГДА используй draft_book_existing_offer:
    инструмент СПРАШИВАЕТ, переводить ли сделку в «Запись» или сохранить текущий статус;
@@ -1998,14 +2002,34 @@ class BotPipeline:
             args = parse_request(text)
             if args is not None and pending:
                 previous = pending["args"]
-                same = args.get("offer_id") is None or str(args.get("offer_id")) == str(previous.get("offer_id"))
-                if same and ("offer_id" in args) == ("offer_id" in previous):
-                    patch = {k: v for k, v in args.items() if v is not None}
-                    args = {**previous, **patch}
-                    if "start" in patch:
-                        args.pop("end", None)
-                    if "master" in patch and "post_id" not in patch:
-                        args.pop("post_id", None)
+                if args.get("_client_booking") or previous.get("_client_booking"):
+                    from ..contact_search import phone_key
+                    same = bool(args.get("_client_booking") and previous.get("_client_booking") and args.get("phone") and previous.get("phone") and phone_key(args["phone"]) == phone_key(previous["phone"]))
+                    if same:
+                        # Для повторной формулировки оставляем факты, но не старый выбор
+                        # сделки/контакта: новая команда не является подтверждением выбора.
+                        safe_fields = ("phone", "client_name", "start", "end", "duration_minutes", "master", "customer_id", "post_id", "board_id", "comment")
+                        known = {k: previous[k] for k in safe_fields if k in previous}
+                        patch = {k: v for k, v in args.items() if v is not None}
+                        args = {**known, **patch}
+                        if "start" in patch:
+                            args.pop("end", None)
+                        if "master" in patch and "post_id" not in patch:
+                            args.pop("post_id", None)
+                    self._bookings.pop(ident, None)
+                    pending = None
+                else:
+                    same = args.get("offer_id") is None or str(args.get("offer_id")) == str(previous.get("offer_id"))
+                    if same and ("offer_id" in args) == ("offer_id" in previous):
+                        patch = {k: v for k, v in args.items() if v is not None}
+                        args = {**previous, **patch}
+                        if "start" in patch:
+                            args.pop("end", None)
+                        if "master" in patch and "post_id" not in patch:
+                            args.pop("post_id", None)
+                    else:
+                        self._bookings.pop(ident, None)
+                        pending = None
             if args is None and pending:
                 # Новая самостоятельная команда не должна становиться ответом на вопрос.
                 if re.search(r"^(?:покажи|найди|создай|добавь|удали|измени)\b", text, re.I):
@@ -2014,15 +2038,30 @@ class BotPipeline:
                 args = answer_pending(pending, text)
             if args is None:
                 return None
-            tool = "draft_book_existing_offer" if "offer_id" in args else "draft_book_new_offer"
-            if tool == "draft_book_existing_offer" and not args.get("offer_id"):
+            client_args = dict(args) if args.get("_client_booking") else None
+            if client_args is not None:
+                tool, call_args = await asyncio.to_thread(self.tools.resolve_booking_client, client_args)
+            else:
+                tool = "draft_book_existing_offer" if "offer_id" in args else "draft_book_new_offer"
+                call_args = args
+            if tool == "draft_book_existing_offer" and client_args is None and not args.get("offer_id"):
                 implicit = not re.search(r"сделк", text, re.I)
                 args["offer_id"] = self._last_offer.get(ident) if (implicit or re.search(r"\b(?:эту|текущую|открытую)\s+сделк", text, re.I)) else None
                 if implicit and not args["offer_id"] and pending is None:
                     return None  # контекст может быть в истории модели; номер не угадываем
                 if not args["offer_id"]:
                     raise BookingNeeds("Какую существующую сделку записать? Укажите номер сделки.", "offer_id", args)
-            outcome = await asyncio.to_thread(self.router.execute, tool, args)
+            outcome = await asyncio.to_thread(self.router.execute, tool, call_args)
+            if client_args is not None and outcome.meta.get("needs_booking"):
+                next_pending = outcome.meta["needs_booking"]
+                # Сохраняем данные клиента и выбранную сделку, а не перенимаем offer_id из старого контекста.
+                fields = ("start", "end", "duration_minutes", "master", "customer_id", "post_id", "reason_id", "comment", "change_status", "client_name", "phone", "contact_id", "board_id")
+                updated = {k: v for k, v in next_pending["args"].items() if k in fields and v is not None}
+                # Имя, автоматически взятое из CRM, нельзя принимать за названное
+                # человеком, если найденный по телефону контакт позже изменится.
+                if not client_args.get("client_name") and call_args.get("contact_id"):
+                    updated.pop("client_name", None)
+                next_pending["args"] = {**client_args, **updated}
             if not outcome.meta.get("needs_booking"):
                 if outcome.draft or outcome.applied:
                     self._bookings.pop(ident, None)
@@ -2044,14 +2083,24 @@ class BotPipeline:
             if pending:
                 old, patch = pending["args"], exc.pending["args"]
                 same = ("offer_id" in old) == ("offer_id" in patch) and (patch.get("offer_id") is None or str(patch.get("offer_id")) == str(old.get("offer_id")))
-                if same:
+                if old.get("_client_booking") or patch.get("_client_booking"):
+                    from ..contact_search import phone_key
+                    same = bool(old.get("_client_booking") and patch.get("_client_booking") and old.get("phone") and patch.get("phone") and phone_key(old["phone"]) == phone_key(patch["phone"]))
+                if same and not patch.get("_client_booking"):
                     exc.pending["args"] = {**old, **{k: v for k, v in patch.items() if v is not None}}
                     if "master" in patch and "post_id" not in patch:
                         exc.pending["args"].pop("post_id", None)
             self._bookings[ident] = exc.pending
             return PipelineResult(answer=str(exc), pending_booking=exc.pending)
+        except StocrmError as exc:
+            saved = dict(args or {})
+            waiting = {"question": "Данные записи сохранены. Повторить проверку CRM?", "field": "retry_booking",
+                       "args": saved, "options": [{"value": True, "label": "Повторить проверку"}]}
+            self._bookings[ident] = waiting
+            return PipelineResult(answer="Не удалось проверить клиента или сделки в CRM: " + humanize_error(exc) + "\nЗапись не начата. Данные сохранены; можно повторить проверку.", pending_booking=waiting)
         except ValueError as exc:
-            return PipelineResult(answer=f"Не удалось подготовить запись: {exc}. Ничего не записано.")
+            self._bookings.pop(ident, None)
+            return PipelineResult(answer=f"Не удалось подготовить запись: {exc}. Новая запись в этой попытке не начиналась.")
 
     async def handle_text(self, text: str, history: list[dict[str, Any]],
                           user_id: int | None = None) -> PipelineResult:
