@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -51,6 +52,32 @@ def _label(value: str, secrets: tuple[str, str]) -> str:
     return clean[:120] or "Без названия"
 
 
+def _rejection_code(message: str, secrets: tuple[str, str]) -> str:
+    """Только фиксированные категории; ни сообщение сервера, ни секреты не выводятся."""
+    text = message.casefold()
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            text = text.replace(secret.casefold(), " ")
+    if any(word in text for word in ("лимит", "превыш", "rate limit", "too many", "limit exceeded")):
+        return "R02"
+    if re.search(r"(?<![a-zа-яё])ip(?![a-zа-яё])", text) or "ip-адрес" in text or "ip адрес" in text:
+        return "R03"
+    if any(word in text for word in ("авторизац", "аутентификац", "авториз", "ключ", "парол", "логин", "credential", "unauthor", "authentication", "invalid key", "invalid api key", "key1", "key2")):
+        return "R01"
+    return "R04"
+
+
+def _rejection_message(message: str, secrets: tuple[str, str]) -> str:
+    code = _rejection_code(message, secrets)
+    hints = {
+        "R01": "В ответе упоминаются ключи или авторизация. Проверьте KEY1 и KEY2 локально в кабинете Росско; не создавайте новые ключи без необходимости.",
+        "R02": "В ответе упоминается ограничение или превышение лимита. Подождите и проверьте позже, без частых повторов.",
+        "R03": "В ответе упоминается IP-адрес. Проверьте локальные настройки доступа API в кабинете Росско.",
+        "R04": "Категорию отказа определить не удалось.",
+    }
+    return f"Росско не подтвердил запрос. Код {code}. {hints[code]} Настройки не изменены."
+
+
 def _parse_details(content: bytes, secrets: tuple[str, str]) -> tuple[list[Delivery], list[Address]]:
     decoded = content.decode("utf-8-sig")
     if "<!DOCTYPE" in decoded.upper() or "<!ENTITY" in decoded.upper():
@@ -63,8 +90,16 @@ def _parse_details(content: bytes, secrets: tuple[str, str]) -> tuple[list[Deliv
     result = _child(response, "CheckoutDetailsResult") if response is not None else None
     if result is None:
         raise LookupErrorSafe("Неожиданный формат ответа Росско. Настройки не изменены.")
-    if _text(result, "success").lower() not in ("true", "1"):
-        raise LookupErrorSafe("Росско не подтвердил запрос; причина неизвестна. Настройки не изменены.")
+    success_node = _child(result, "success")
+    if success_node is None:
+        raise LookupErrorSafe("Ответ Росско без поля success. Код R05. Настройки не изменены.")
+    success = (success_node.text or "").strip().lower()
+    if success in ("false", "0"):
+        # Поставщик может включить в message ключи или личные данные.
+        # Исходное сообщение никогда не отображается и не сохраняется.
+        raise LookupErrorSafe(_rejection_message(_text(result, "message"), secrets))
+    if success not in ("true", "1"):
+        raise LookupErrorSafe("Неожидательное значение success в ответе Росско. Код R06. Настройки не изменены.")
     types = _child(result, "DeliveryType")
     deliveries: list[Delivery] = []
     seen: set[str] = set()
