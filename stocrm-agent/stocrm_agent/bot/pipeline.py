@@ -18,6 +18,7 @@ from ..human import humanize_error, payload_text, polish
 from ..policy import ConfirmationPolicy
 from ..tools import Toolset
 from .fastpath import format_offer_card, format_offers_list, try_answer
+from .status_colors import append_llm_colors, with_status_colors
 from .llm import LLMClient, LLMError
 from .llm_tools import (
     _NEW_REQUEST_WORDS,
@@ -1978,9 +1979,9 @@ class BotPipeline:
                 card = self.tools.offer_card(int(rows[0]["offer_id"]))
                 if card.get("error"):
                     return PipelineResult(answer=str(card["error"]))
-                return PipelineResult(answer=format_offer_card(card))
+                return PipelineResult(answer=format_offer_card(with_status_colors(self.tools, [card])[0]))
             if rows:
-                return PipelineResult(answer=format_offers_list(rows))
+                return PipelineResult(answer=format_offers_list(with_status_colors(self.tools, rows)))
             return PipelineResult(answer=f"Клиент {contact.get('title') or 'без имени'} найден (контакт №{contact['contact_id']}), но CRM не вернула его сделки в полученной выборке. Укажите номер сделки для точной проверки.")
         except Exception as exc:  # noqa: BLE001 — ошибка поиска не означает отсутствие клиента
             self._contact_lookups[ident] = {"at": time.time(), "candidates": []}
@@ -2420,6 +2421,24 @@ class BotPipeline:
         if not result.drafts and not result.applied and re.search(
                 r"подготовил(?:а)? (?:добавление|черновик)|(?:заметка|работа|услуга|тег) (?:добавлен|создан|поставлен)|отменил", result.answer, re.IGNORECASE):
             result.answer = "Не могу подтвердить выполнение или отмену: инструмент не вернул подтверждённого результата. Проверьте /drafts и карточку сделки — не считайте это сообщение подтверждением записи."
+        # Списки, составленные моделью, помечаем по реальным данным текущего чтения.
+        # После записи/черновика прежний статус может быть неактуален — не размечаем.
+        if result.answer and not result.drafts and not result.applied:
+            color_rows: list[dict[str, Any]] = []
+            for key, outcome in read_results.items():
+                if key.split(":", 1)[0] not in ("find_offers", "offer_card"):
+                    continue
+                try:
+                    data = json.loads(outcome.payload)
+                except (ValueError, TypeError):
+                    continue  # обрезанный или ошибочный ответ нельзя интерпретировать
+                if isinstance(data, list):
+                    color_rows.extend(row for row in data if isinstance(row, dict))
+                elif isinstance(data, dict) and data.get("offer_id"):
+                    color_rows.append(data)
+            if color_rows:
+                colored = await asyncio.to_thread(with_status_colors, self.tools, color_rows)
+                result.answer = append_llm_colors(result.answer, colored)
         self._track_to(result, user_id)
         self._track_part(result, user_id)
         self._track_price(result, user_id)
