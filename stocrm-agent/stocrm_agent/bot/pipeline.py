@@ -2630,7 +2630,7 @@ class BotPipeline:
                 return PipelineResult(answer=f"Не удалось подготовить быструю сделку: {exc}. Ничего не записано.")
         try:
             status_ids = quick_read.status_identity(self.tools)
-            rows, incomplete = quick_read.status_offers(self.tools, status_ids)
+            rows, incomplete, by_name = quick_read.status_offers(self.tools, status_ids)
             if not rows:
                 message = 'В полученной выборке нет подтверждённых сделок в статусе «Быстрые сделки».'
                 if incomplete:
@@ -2641,6 +2641,8 @@ class BotPipeline:
             note = (f"\n\nПоказаны 10 из {len(rows)} подтверждённых; остальные не показаны." if len(rows) > 10 else '')
             if incomplete:
                 note += '\n\n⚠️ Список может быть неполным: часть сделок не удалось проверить.'
+            if by_name:
+                note += '\n\nℹ️ Часть статусов сверена по названию и справочнику: CRM не вернула ID. Это только просмотр.'
             choice = {"kind": "quick_read", "owner": user_id, "status_ids": status_ids,
                       "contacts": {oid: rows[oid] for oid in shown}, "offers": shown,
                       "question": 'Сделки в статусе «Быстрые сделки» (все контакты):\n\n' + "\n\n".join(details) + note}
@@ -2777,7 +2779,7 @@ class BotPipeline:
                 status_ids = quick_read.status_identity(self.tools)
                 if status_ids != choice.get('status_ids'):
                     raise ValueError('Статус изменился; повторите список')
-                rows, _ = quick_read.status_offers(self.tools, status_ids)
+                rows, _, _ = quick_read.status_offers(self.tools, status_ids)
                 oid = choice['offers'][index]
                 contact_id = choice['contacts'][oid]
                 if rows.get(oid) != contact_id:

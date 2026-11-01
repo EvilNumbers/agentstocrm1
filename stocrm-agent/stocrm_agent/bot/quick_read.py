@@ -10,6 +10,7 @@ from ..booking import key
 from ..calendar import _positive, _rows
 from ..contact_search import phone_key, detail_phones
 from .fastpath import format_offer_items
+from .status_view import match as match_view_status
 
 PHONE = "81111111110"
 NAME = "1111 быстрые сделки"
@@ -116,7 +117,7 @@ def offers(tools: Any, ids: tuple[int, int, int]) -> list[int]:
     raise ValueError("Список сделок неполный; повторите чтение в STOCRM")
 
 
-def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, int], bool]:
+def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, int], bool, bool]:
     """Сделки всех контактов, с локальной проверкой каждой строки.
 
     Не полагаемся на серверные фильтры: в некоторых панелях они игнорируются.
@@ -125,6 +126,7 @@ def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, in
     found: dict[int, int] = {}
     seen: set[int] = set()
     incomplete = False
+    by_name = False
     for page in range(1, 21):
         raw = tools._read('quick_status_offers', 'offers/get_from_filter',
                           {'FILTER': {}, 'SORT': {'DATE_CREATE': 'DESC'}, 'PAGE': page, 'LIMIT': 500})
@@ -134,34 +136,41 @@ def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, in
         if isinstance(raw, dict) and raw and not rows and not any(isinstance(raw.get(k), list) and not raw[k] for k in ('DATA', 'ITEMS', 'LIST', 'ROWS')):
             raise ValueError('Неизвестный формат списка сделок статуса')
         if not rows:
-            return found, incomplete
+            return found, incomplete, by_name
         for row in rows:
             try:
                 oid = _positive(row.get('OFFER_ID'), 'Сделка')
-                board = _positive(row.get('BOARD_ID'), 'Воронка сделки')
-                status = _positive(row.get('STATUS_ID'), 'Статус сделки')
             except ValueError:
                 incomplete = True
                 continue
             if oid in seen:
                 raise ValueError('CRM повторяет строки или страницы сделок; список не подтверждён')
             seen.add(oid)
-            if (board, status) == status_ids:
+            matched = match_view_status(tools, board=row.get('BOARD_ID'), status_id=row.get('STATUS_ID'),
+                status_id_missing='STATUS_ID' not in row, status_name=row.get('STATUS_NAME'),
+                expected_board=status_ids[0], expected_status=status_ids[1], expected_name='Быстрые сделки')
+            if matched == 'unknown':
+                incomplete = True
+            elif matched in ('id', 'name'):
                 try:
                     found[oid] = _positive(row.get('CONTACT_ID'), 'Контакт сделки')
+                    by_name |= matched == 'name'
                 except ValueError:
                     incomplete = True
-    return found, True
+    return found, True, by_name
 
 
 def status_detail(tools: Any, status_ids: tuple[int, int], oid: int, contact_id: int) -> str:
     card = tools.offer_card(oid, with_items=True)
-    actual = (card.get('offer_id'), card.get('contact_id'), card.get('board_id'), card.get('status_id'))
-    expected = (oid, contact_id, *status_ids)
-    if card.get('error') or tuple(map(str, actual)) != tuple(map(str, expected)):
+    actual = (card.get('offer_id'), card.get('contact_id'))
+    matched = match_view_status(tools, board=card.get('board_id'), status_id=card.get('status_id'),
+        status_id_missing=card.get('status_id_missing') is True, status_name=card.get('status'),
+        expected_board=status_ids[0], expected_status=status_ids[1], expected_name='Быстрые сделки')
+    if card.get('error') or tuple(map(str, actual)) != tuple(map(str, (oid, contact_id))) or matched not in ('id', 'name'):
         raise ValueError(f'Сделка №{oid}: контакт или статус изменились либо не подтверждены')
     contact = str(card.get('contact') or 'имя не получено')
-    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact} · контакт №{contact_id}\n' + format_offer_items(card)
+    note = '\nℹ️ Статус сверен по названию: CRM не вернула ID. Только просмотр.' if matched == 'name' else ''
+    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact} · контакт №{contact_id}\n' + format_offer_items(card) + note
 
 
 def status_details(tools: Any, status_ids: tuple[int, int], offers: dict[int, int]) -> list[str]:

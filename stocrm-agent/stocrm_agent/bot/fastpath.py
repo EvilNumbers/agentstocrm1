@@ -327,6 +327,7 @@ def is_status_offers_request(text: str) -> bool:
 def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, list[int]]:
     """Список только для проверенной пары (воронка, точный статус)."""
     from ..client import read_budget
+    from .status_view import match as match_view_status
 
     kind = str(request.get("kind") or "")
     board_name = request.get("board")
@@ -339,6 +340,7 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
     targets = specific | generic
     try:
         with read_budget(8.0):
+            tools._invalidate_quick_identity_cache()
             boards = tools.boards()
             if board_name:
                 name = _norm_status(board_name).rstrip(".")
@@ -390,6 +392,7 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             seen: set[str] = set()
             complete = False
             uncertain = False
+            by_name = False
             page_size = 100
             for page in range(1, 6):
                 try:
@@ -409,11 +412,14 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                     if ident in seen:
                         continue
                     seen.add(ident)
-                    if row.get("board_id") in (None, "") or row.get("status_id") in (None, ""):
+                    matched = match_view_status(tools, board=row.get('board_id'), status_id=row.get('status_id'),
+                        status_id_missing=row.get('status_id_missing') is True, status_name=row.get('status'),
+                        expected_board=int(board['board_id']), expected_status=int(status['status_id']),
+                        expected_name=status['title'])
+                    if matched == 'unknown':
                         uncertain = True
-                        continue
-                    if str(row["status_id"]) == str(status["status_id"]) and str(row["board_id"]) == str(board["board_id"]):
-                        # Наименование статуса берём из проверенного справочника ID, а не из чужой строки.
+                    elif matched in ('id', 'name'):
+                        by_name |= matched == 'name'
                         valid.append({**row, "status": status["title"]})
                 if len(valid) > 25:
                     uncertain = True
@@ -425,6 +431,8 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                 uncertain = True
             valid = valid[:25]
             qualifier = "\n⚠️ Проверка не завершена или список ограничен; он может быть неполным." if uncertain else ""
+            if by_name:
+                qualifier += "\nℹ️ Часть статусов сверена по названию и справочнику: CRM не вернула их ID. Это только просмотр."
             label = f"«{status['title']}» · воронка «{board['name']}»"
             if not valid:
                 return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
