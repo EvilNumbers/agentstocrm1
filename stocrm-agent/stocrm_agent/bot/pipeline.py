@@ -341,7 +341,7 @@ _MIXED_PART_HINT = re.compile(r"\b(?:артикул\w*|запчаст\w*|дет�
 
 def _mixed_work_and_part(text: str) -> bool:
     """Не превращаем составную просьбу в одиночную позицию без предупреждения."""
-    part = _MIXED_PART_HINT.search(text)
+    part = quick_parse._find_part(text)
     if not _ADD_VERB.search(text) or not part:
         return False
     if _MIXED_WORK_HINT.search(text):
@@ -1161,6 +1161,67 @@ class BotPipeline:
                          f"Осталось позиций: {left}.")
         log.info("позиция убрана из черновика %s: осталось %s", updated.get("token"), left)
         return result
+
+    def _edit_pending_composite(self, text: str, user_id: int | None) -> PipelineResult | None:
+        """Голос/текст исправляют только собственный ожидающий черновик, не CRM."""
+        if re.search(r'\b(?:в|из|по)\s+сделк\w*\b', text, re.I):
+            return None  # запрос изменить уже существующую строку CRM — отдельный сценарий
+        raw = text.strip(' .!')
+        price_patterns = (
+            r'^у\s+(.+?)\s+(?:цена|стоимость)\s*(?:на|до|равна|=)?\s*([\d]+(?:[.,]\d{1,2})?)\s*(?:руб\w*|₽)?$',
+            r'^(?:цена|стоимость)\s+(.+?)\s+(?:на\s+|до\s+|=\s*)?([\d]+(?:[.,]\d{1,2})?)\s*(?:руб\w*|₽)?$',
+            r'^(?:измени|поменяй|исправь|поставь)\s+цену\s+(.+?)\s+(?:на|до)\s+([\d]+(?:[.,]\d{1,2})?)\s*(?:руб\w*|₽)?$',
+        )
+        quantity_patterns = (
+            r'^(?:количество|количество у)\s+(.+?)\s+(?:на\s+|до\s+|=\s*)?(\d+|один|одна|две|два|три|четыре|пять|шесть|семь|восемь|девять|десять)\s*(?:шт\.?|штук\w*)?$',
+            r'^(?:измени|поменяй|исправь|поставь)\s+количество\s+(.+?)\s+(?:на|до)\s+(\d+|один|одна|две|два|три|четыре|пять|шесть|семь|восемь|девять|десять)\s*(?:шт\.?|штук\w*)?$',
+        )
+        match = next((m for p in price_patterns if (m := re.fullmatch(p, raw, re.I))), None)
+        mode = 'price'
+        if match is None:
+            match = next((m for p in quantity_patterns if (m := re.fullmatch(p, raw, re.I))), None)
+            mode = 'qty'
+        key = user_id or 0
+        entry = self._part_batch.get(key)
+        if not entry:
+            return None
+        if match is None:
+            if re.search(r'\b(?:цена|стоимость|количество|цену)\b', raw, re.I):
+                try:
+                    pending = self.tools.drafts.get(str(entry.get('token')))
+                except KeyError:
+                    return None
+                if pending.get('tool') == 'quick_deal' and pending.get('status') == 'pending':
+                    return PipelineResult(answer='Черновик не изменён. Укажите позицию и положительную цену или количество, например «цена позиции 2 800».')
+            return None
+        try:
+            draft = self.tools.drafts.get(str(entry.get('token')))
+        except KeyError:
+            self._part_batch.pop(key, None)
+            return PipelineResult(answer='Черновик не найден. Ничего не изменено.')
+        if draft.get('tool') != 'quick_deal':
+            return None
+        target = re.sub(r'^в\s+черновике\s+', '', match.group(1), flags=re.I).strip(' ,:')
+        ordinal = re.fullmatch(r'(?:позици[яию]\s*(?:№|#)?\s*)?(перв\w*|втор\w*|трет\w*|треть\w*|четверт\w*|пят\w*|\d+)', target, re.I)
+        number = None
+        if ordinal and (target.lower().startswith('позици') or not ordinal.group(1).isdigit()):
+            value = ordinal.group(1).lower()
+            number = int(value) if value.isdigit() else next((v for k, v in _ORDINALS.items() if value.startswith(k)), None)
+        query = None if number is not None else target
+        amount = match.group(2).lower().replace(',', '.')
+        try:
+            from ..quick_deal import edit_position
+            if mode == 'price':
+                outcome = edit_position(self.tools, str(entry['token']), number=number, query=query, price=float(amount))
+            else:
+                words = {'один': 1, 'одна': 1, 'два': 2, 'две': 2, 'три': 3, 'четыре': 4, 'пять': 5, 'шесть': 6, 'семь': 7, 'восемь': 8, 'девять': 9, 'десять': 10}
+                qty = int(amount) if amount.isdigit() else words[amount]
+                outcome = edit_position(self.tools, str(entry['token']), number=number, query=query, qty=qty)
+        except (ValueError, KeyError) as exc:
+            return PipelineResult(answer=f'Черновик не изменён: {exc}. Проверьте номер позиции.')
+        updated = outcome['draft']
+        self._part_batch[key] = {**entry, 'token': updated['token'], 'at': time.time()}
+        return PipelineResult(answer=f"Изменена позиция {outcome['number']}: {outcome['position']}. Проверьте весь новый черновик; старая кнопка не действует.", drafts=[updated])
 
     def _track_to(self, result: PipelineResult, user_id: int | None) -> None:
         """Запоминает вопрос ТО, на который человек ответит текстом (бренд/масло)."""
@@ -2675,7 +2736,7 @@ class BotPipeline:
 
     def _quick_continue(self, plan: dict[str, Any], user_id: int) -> PipelineResult:
         from ..quick_deal import prepare, status_reasons
-        missing = ([plan["work"]] if plan.get("work") else []) + plan["articles"]
+        missing = ([plan["work"]] if plan.get("work") else []) + plan.get("extra_works", []) + plan["articles"]
         for item in missing:
             if item.get("price") is None:
                 self._quick_pending[user_id] = {"plan": plan, "item": item, "at": time.time()}
@@ -2741,7 +2802,7 @@ class BotPipeline:
                                   "plan": plan, "question": "Выберите причину перехода в статус «Быстрые сделки»:"}
                         self._quick_choices[user_id] = choice
                         return PipelineResult(choices=[choice])
-                draft = prepare(self.tools, ids, selected, plan.get("work"), plan["articles"], plan.get("reason_id"))
+                draft = prepare(self.tools, ids, selected, plan.get("work"), plan["articles"], plan.get("reason_id"), extra_works=plan.get("extra_works"))
                 self._part_batch[user_id] = {"token": draft["token"], "at": time.time()}
                 return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
             shown = rows[:10]
@@ -2837,7 +2898,7 @@ class BotPipeline:
                 if oid is None:
                     plan["new"] = True
                     return self._quick_continue(plan, user_id)
-                draft = prepare(self.tools, ids, oid, plan.get("work"), plan["articles"])
+                draft = prepare(self.tools, ids, oid, plan.get("work"), plan["articles"], extra_works=plan.get("extra_works"))
                 self._part_batch[user_id] = {"token": draft["token"], "at": time.time()}
                 return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
             oid = choice["offers"][index]
@@ -2906,6 +2967,11 @@ class BotPipeline:
             history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': body}])
             del history[:max(0, len(history) - self.s.max_history_messages)]
             return PipelineResult(answer=body)
+        if _ADD_VERB.search(text):
+            try:
+                parts.check_sku_tokens(text)
+            except ValueError as exc:
+                return PipelineResult(answer=f"{exc}. Ничего не записано.")
         if _mixed_work_and_part(text):
             self._quick_pending.pop(user_id or 0, None)
             self._quick_choices.pop(user_id or 0, None)
@@ -2913,7 +2979,7 @@ class BotPipeline:
                 plan = quick_parse.parse_existing_mixed(text)
                 return await asyncio.to_thread(self._quick_continue, plan, user_id or 0)
             except Exception as exc:
-                return PipelineResult(answer=f'Не удалось однозначно разобрать услугу и товар: {exc}. Ничего не записано. Укажите номер сделки, одну услугу с ценой и артикул с брендом и ценой.')
+                return PipelineResult(answer=f'Не удалось однозначно разобрать услугу и товар: {exc}. Ничего не записано. Укажите номер сделки, услуги с отдельными ценами и артикул с брендом и ценой.')
         self._quick_choices.pop(user_id or 0, None)
         quick_price = await asyncio.to_thread(self._quick_price_reply, text, user_id or 0)
         if quick_price is not None:
@@ -2933,6 +2999,9 @@ class BotPipeline:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": contact_create.answer}])
             del history[:max(0, len(history) - self.s.max_history_messages)]
             return contact_create
+        draft_edit = await asyncio.to_thread(self._edit_pending_composite, text, user_id)
+        if draft_edit is not None:
+            return draft_edit
         edit_reply = self._direct_price_edit(text, history, user_id)
         if edit_reply is not None:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": edit_reply.answer}])

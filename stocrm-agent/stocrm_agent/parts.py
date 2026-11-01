@@ -62,9 +62,11 @@ BRAND_ALIASES: dict[str, str] = {
     # фильтры
     "mann": "MANN", "mannfilter": "MANN", "mann+hummel": "MANN", "ман": "MANN", "манн": "MANN",
     "filtron": "FILTRON", "фильтрон": "FILTRON",
-    "mahle": "MAHLE", "мале": "MAHLE", "knecht": "MAHLE", "кнехт": "MAHLE",
+    "mahle": "MAHLE", "мале": "MAHLE", "knecht": "KNECHT", "кнехт": "KNECHT",
     "sakura": "SAKURA", "сакура": "SAKURA",
-    "ashika": "ASHIKA", "ашика": "ASHIKA", "асакаши": "ASHIKA",
+    "ashika": "ASHIKA", "ашика": "ASHIKA",
+    "asakashi": "ASAKASHI", "асакаши": "ASAKASHI",
+    "js asakashi": "ASAKASHI", "джей эс асакаши": "ASAKASHI",
     "nipparts": "NIPPARTS", "ниппартс": "NIPPARTS",
     "kashiyama": "KASHIYAMA", "кашияма": "KASHIYAMA",
     "blue print": "BLUEPRINT", "blueprint": "BLUEPRINT", "блюпринт": "BLUEPRINT",
@@ -103,6 +105,35 @@ BRAND_ALIASES: dict[str, str] = {
     "mazda": "MAZDA", "мазда": "MAZDA",
     "mitsubishi": "MITSUBISHI", "мицубиси": "MITSUBISHI",
     "lada": "LADA", "лада": "LADA", "ваз": "LADA",
+    # Каталожные написания и распространённые русские произношения.
+    "febi": "FEBI", "феби": "FEBI", "febi bilstein": "FEBI", "феби бильштайн": "FEBI",
+    "febest": "FEBEST", "фебест": "FEBEST",
+    "advics": "ADVICS", "адвикс": "ADVICS",
+    "lynx": "LYNXAUTO", "lynxauto": "LYNXAUTO", "линкс": "LYNXAUTO", "линкс авто": "LYNXAUTO",
+    "kyb": "KYB", "kayaba": "KYB", "каяба": "KYB", "кайяба": "KYB",
+    "stellox": "STELLOX", "стеллокс": "STELLOX", "стелокс": "STELLOX",
+    "sat": "SAT", "сат": "SAT", "sangsin": "SANGSIN", "сангсин": "SANGSIN",
+    "sidem": "SIDEM", "сайдем": "SIDEM", "сидем": "SIDEM",
+    "miles": "MILES", "майлз": "MILES", "милес": "MILES",
+    "jikiu": "JIKIU", "джикиу": "JIKIU", "kortex": "KORTEX", "кортекс": "KORTEX",
+    "patron": "PATRON", "патрон": "PATRON", "trialli": "TRIALLI", "триалли": "TRIALLI",
+    "meyle": "MEYLE", "мейле": "MEYLE", "мейли": "MEYLE",
+    "swag": "SWAG", "сваг": "SWAG", "bilstein": "BILSTEIN", "бильштайн": "BILSTEIN",
+    "corteco": "CORTECO", "кортеко": "CORTECO", "monroe": "MONROE", "монро": "MONROE",
+    "moog": "MOOG", "муг": "MOOG", "aisin": "AISIN", "айсин": "AISIN",
+    "akebono": "AKEBONO", "акебоно": "AKEBONO", "nissens": "NISSENS", "ниссенс": "NISSENS",
+    "elring": "ELRING", "эльринг": "ELRING", "ajusa": "AJUSA", "ахуса": "AJUSA",
+    "delphi": "DELPHI", "делфи": "DELPHI", "hengst": "HENGST", "хенгст": "HENGST",
+    "purflux": "PURFLUX", "пурфлюкс": "PURFLUX", "contitech": "CONTITECH", "контитек": "CONTITECH",
+    "dayco": "DAYCO", "дэйко": "DAYCO", "hepu": "HEPU", "хепу": "HEPU",
+    "filtron": "FILTRON", "филтрон": "FILTRON", "champion": "CHAMPION", "чемпион": "CHAMPION",
+    "brisk": "BRISK", "бриск": "BRISK", "beru": "BERU", "беру": "BERU",
+    "gmb": "GMB", "джи эм би": "GMB", "ctr": "CTR", "си ти ар": "CTR", "цтр": "CTR",
+    "ntn": "NTN", "нтн": "NTN", "nsk": "NSK", "нск": "NSK", "koyo": "KOYO", "койо": "KOYO",
+    "jp group": "JP GROUP", "джей пи групп": "JP GROUP", "topran": "TOPRAN", "топран": "TOPRAN",
+    "startvolt": "STARTVOLT", "старвольт": "STARTVOLT", "finwhale": "FINWHALE", "финвал": "FINWHALE",
+    "sufix": "SUFIX", "суфикс": "SUFIX", "marshall": "MARSHALL", "маршалл": "MARSHALL",
+    "ngk": "NGK", "эн джи кей": "NGK", "энджикей": "NGK", "трв": "TRW", "ти ар дабл ю": "TRW",
     # масла и автохимия — их спрашивают чаще всего
     "bardahl": "BARDAHL", "бардаль": "BARDAHL", "бардал": "BARDAHL",
     "motul": "MOTUL", "мотюль": "MOTUL", "мотул": "MOTUL",
@@ -131,6 +162,14 @@ BRAND_ALIASES: dict[str, str] = {
     "g-energy": "G-ENERGY", "g energy": "G-ENERGY", "джи энерджи": "G-ENERGY",
     "srs": "SRS", "amsoil": "AMSOIL",
 }
+
+# Дополнения хранятся отдельно, чтобы проще проверять и расширять словарь.
+from .brand_catalog_v121 import BRAND_ROWS
+for _canonical, _aliases in BRAND_ROWS:
+    for _alias in _aliases:
+        if _alias in BRAND_ALIASES and BRAND_ALIASES[_alias] != _canonical:
+            raise ValueError(f"Неоднозначный алиас бренда: {_alias}")
+        BRAND_ALIASES[_alias] = _canonical
 
 # Слова-шум: не помогают отличить одну позицию от другой.
 # Названия типов деталей («масляный», «воздушный», «колодки») здесь НЕ перечислены —
@@ -298,7 +337,7 @@ def manual_brand(text: str) -> str | None:
         return None
     if not known_brand(value) or normalize_text(value) in {"не знаю", "неизвестно", "неизвестен", "добавь как указано", "добавить как указано", "отмена", "пропусти", "пропустить", "повтори поиск", "manual", "retry", "skip"}:
         return None
-    return value
+    return _brand_index().get(brand_key(value), value)
 
 
 # Индекс алиасов: ключ считается той же функцией brand_key, поэтому «трв»/«trw»/«TRW»
@@ -309,7 +348,13 @@ _BRAND_INDEX: dict[str, str] | None = None
 def _brand_index() -> dict[str, str]:
     global _BRAND_INDEX
     if _BRAND_INDEX is None:
-        _BRAND_INDEX = {brand_key(alias): canonical for alias, canonical in BRAND_ALIASES.items()}
+        index: dict[str, str] = {}
+        for alias, canonical in BRAND_ALIASES.items():
+            key = brand_key(alias)
+            if key in index and index[key] != canonical:
+                raise ValueError(f"Неоднозначные варианты брендов: {alias}")
+            index[key] = canonical
+        _BRAND_INDEX = index
     return _BRAND_INDEX
 
 
@@ -352,9 +397,6 @@ def _canonical_brand_cached(text: str) -> str:
     index = _brand_index()
     if key in index:
         return index[key]
-    for alias_key, canonical in index.items():
-        if alias_key and (key.startswith(alias_key) or alias_key.startswith(key)):
-            return canonical
     return str(value or "").strip().upper()
 
 
@@ -385,16 +427,31 @@ def brand_match(query_brand: str | None, candidate_brand: str | None) -> int:
     return 0
 
 
+@lru_cache(maxsize=1)
+def _brand_patterns() -> tuple[tuple[re.Pattern[str], str], ...]:
+    patterns = []
+    for alias, canonical in BRAND_ALIASES.items():
+        words = normalize_text(alias).translate(_LOOKALIKE).split()
+        if words and not alias.isdigit() and (len(brand_key(alias)) >= 3 or brand_key(alias) in {brand_key("zf"), brand_key("зф")}):
+            pattern = r"(?<![0-9a-zа-я])" + r"\s*".join(map(re.escape, words)) + r"(?![0-9a-zа-я])"
+            patterns.append((re.compile(pattern), canonical))
+    return tuple(patterns)
+
+
 def find_brand_in_text(text: str) -> str | None:
-    """Ищет бренд в свободной фразе: «фильтр манн w914/2» → MANN, «колодки trw» → TRW."""
-    text = re.sub(r"\b(?:без|с|with|without)\s+ABS\b", " ", text, flags=re.I)
-    key = brand_key(text)
-    if not key:
-        return None
-    for alias_key, canonical in sorted(_brand_index().items(), key=lambda kv: -len(kv[0])):
-        if len(alias_key) >= 3 and alias_key in key:
-            return canonical
-    return None
+    """Находит целое имя бренда в свободной фразе, не подстроку другого слова."""
+    text = re.sub(r"\b(?:без|с|with|without)\s+(?:ABS|АБС)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:по\s+вин|вин[\s-]*(?:код(?:у|а|ом)?|номер(?:у|а|ом)?))\b", " ", text, flags=re.I)
+    normalized = normalize_text(text).translate(_LOOKALIKE)
+    matches = []
+    # 555 — числовой бренд; отдельно от цен и произвольных номеров.
+    for match in re.finditer(r"\b(?:бренд|производитель|товар|запчасть|колодки|фильтр|свеча)\s+(555)(?![0-9A-Za-zА-Яа-яЁё])", normalized):
+        matches.append((match.start(1), -3, "555"))
+    for pattern, canonical in _brand_patterns():
+        for match in pattern.finditer(normalized):
+            matches.append((match.start(), -(match.end() - match.start()), canonical))
+    return min(matches)[2] if matches else None
+
 
 
 _NOT_BRAND = {
@@ -459,9 +516,43 @@ def latin_sku(value: str | None) -> str:
     if not text or not _has_cyrillic(text):
         return text
     if re.search(r"[A-Za-z]", text):
-        return text.translate(_TO_LATIN).upper()
+        return text.upper().translate(_TO_LATIN)
     return text.upper().translate(_CYR_TO_LAT)
 
+
+
+def sku_for_write(value: str | None, *, allow_empty: bool = False) -> str:
+    """Нормализовать ввод до черновика; неизвестные символы не угадывать."""
+    text = strip_accents_case(value or "")
+    if not text and allow_empty:
+        return ""
+    # Не позволяем Unicode upper() незаметно превращать ß в SS или удалять Ь/Ъ.
+    if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 ./_-]+", text) or re.search(r"[ЬЪьъ]", text):
+        raise ValueError('Неоднозначный артикул: введите его латинскими буквами и цифрами')
+    # В смешанной записи безопасно заменяются лишь визуальные двойники.
+    if re.search(r"[A-Za-z]", text) and any(_has_cyrillic(c) and c.upper() not in "АВСЕНКМОРТХУ" for c in text):
+        raise ValueError('Неоднозначный артикул: введите его латинскими буквами и цифрами')
+    normalized = latin_sku(text).upper()
+    if not normalized or not re.fullmatch(r"[A-Z0-9 ./_-]+", normalized) or not re.search(r"[A-Z0-9]", normalized):
+        raise ValueError('Артикул должен содержать только латинские буквы и цифры; уточните его')
+    return normalized
+
+
+def sku_is_latin(value: str | None, *, allow_empty: bool = False) -> bool:
+    text = str(value or "").strip()
+    return bool((not text and allow_empty) or (text and re.fullmatch(r"[A-Za-z0-9 ./_-]+", text) and re.search(r"[A-Za-z0-9]", text)))
+
+
+def check_sku_tokens(text: str) -> None:
+    """Не пропускать смешанный артикул с неоднозначной кириллицей."""
+    for token in re.findall(r"[^\s,;:!?()]+", text or ""):
+        if re.fullmatch(r"\d+(?:руб(?:ль|ля|лей)?|шт(?:ук[аи]?)?)\.?", token, re.I):
+            continue
+        if re.search(r"[0-9]", token):
+            if any(ch.isalpha() and not (ch.isascii() or "\u0400" <= ch <= "\u04ff") for ch in token):
+                raise ValueError('Неоднозначный артикул: введите его латинскими буквами и цифрами')
+            if (re.search(r"[A-Za-z]", token) and _has_cyrillic(token)) or re.search(r"[ЬЪьъ]", token):
+                sku_for_write(token.strip(_SKU_EDGE))
 
 def latin_norm(value: str | None) -> str:
     """Артикул для сравнения: латиницей и без разделителей — «GDВ1550» → «GDB1550»."""
@@ -545,6 +636,16 @@ def sku_spans(text: str) -> list[tuple[str, str, int, int]]:
             index += 1
             continue
         token = latin_norm(word)
+        # Буквенно-цифровое имя производителя BESF1TS — не артикул.
+        if re.search(r"[A-ZА-Я]", word) and brand_key(word) in _brand_index():
+            # Если бренд одновременно похож на SKU, явное «артикул CS20»
+            # сохраняет его как артикул, но «CS20 AB1234» — бренд + артикул.
+            previous = words[index - 1].lower() if index else ""
+            next_sku = (index + 1 < len(words) and _looks_like_sku(latin_norm(words[index + 1]))
+                        and not _is_price_number(words, index + 1))
+            if previous not in {"артикул", "артикула", "арт", "код"} or next_sku:
+                index += 1
+                continue
 
         if (token and _looks_like_sku(token) and not is_viscosity(word)
                 and not _is_russian_word(word) and not _is_price_number(words, index)):
@@ -658,9 +759,12 @@ _NON_PART_RESULT = re.compile(
 
 def explicit_brand_in_text(text: str) -> str | None:
     """Производитель, явно названный человеком, в том числе неизвестный словарю."""
-    stop = r"(?:артикул|арт|код|цен[аыуой]|стоимость|за|по|для|в|на|и|товар|запчасть|деталь|добавь|пожалуйста)\b"
-    word = r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё&'-]{1,39}"
-    match = re.search(rf"\b(?:производител[ьяюем]*|бренд(?:а|ом)?)\s*[:—-]?\s*((?!{stop}){word}(?:\s+(?!{stop}){word}){{0,2}})", text or "", re.I)
+    numeric = re.search(r"\b(?:производител[ьяюем]*|бренд(?:а|ом)?)\s*[:—-]?\s*(555)(?![0-9A-Za-zА-Яа-яЁё])", text or "", re.I)
+    if numeric:
+        return "555"
+    stop = r"(?:артикул|арт|код|цен[аыуой]|стоимость|за|по|для|в|на|и|товар|запчасть|деталь|масло|колодки|добавь|пожалуйста)\b"
+    word = r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9&+.'/-]{0,39}"
+    match = re.search(rf"\b(?:производител[ьяюем]*|бренд(?:а|ом)?)\s*[:—-]?\s*((?!{stop}){word}(?:\s+(?:&\s*)?(?!{stop}){word}){{0,3}})", text or "", re.I)
     if not match:
         return None
     word = match.group(1)

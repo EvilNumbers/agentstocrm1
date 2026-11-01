@@ -315,7 +315,7 @@ def test_text_export_is_not_an_archive_and_has_windows_encoding(tmp_path):
     events, text = exported(target)
     assert len(events) == 1 and 'СТОCRM: диагностический журнал' not in text  # Latin STOCRM
     assert 'STOCRM: диагностический журнал' in text and '=== ИТОГ СБОРА ===' in text
-    assert 'Версия кода сборщика: 118' in text
+    assert 'Версия кода сборщика: 121' in text
 
 
 def test_failed_replace_preserves_previous_output_and_state(tmp_path, monkeypatch):
