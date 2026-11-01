@@ -1471,6 +1471,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if not (name or "").strip():
             raise ValueError("Нужно название запчасти (name)")
 
+        sku = parts.sku_for_write(sku, allow_empty=True)
+        brand = parts.manual_brand(brand) if brand else brand
+
         # Такая позиция уже есть в сделке? Тогда предупреждаем в самом черновике:
         # раньше «поменяй цену масла» превращалось в «добавь второе масло», и в сделке
         # оказывались две одинаковые позиции с разными ценами.
@@ -4453,6 +4456,23 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             current = self.drafts.get(token)
         except KeyError:
             current = None
+        def unsafe_part_write(value: Any) -> bool:
+            if isinstance(value, list):
+                return any(unsafe_part_write(v) for v in value)
+            if not isinstance(value, dict):
+                return False
+            if value.get("method") in {"offer/require/add", "offer/order/add_free_order", "offer/order/add"}:
+                def bad_fields(node: Any) -> bool:
+                    if isinstance(node, list):
+                        return any(bad_fields(v) for v in node)
+                    if isinstance(node, dict):
+                        return any((str(k).upper() == "SKU" and not parts.sku_is_latin(v, allow_empty=True)) or bad_fields(v) for k, v in node.items())
+                    return False
+                if bad_fields(value.get("payload") or {}):
+                    return True
+            return any(unsafe_part_write(v) for v in value.values())
+        if current and unsafe_part_write(current):
+            raise ValueError("В старом черновике артикул не латиницей. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторявайте")
         if current and _forbidden_supplier_order(current.get("steps") or [{"method": current.get("method"), "payload": current.get("payload")} ]):
             raise ValueError("Черновик привязан к складской позиции или потенциальному заказу поставщику; применение запрещено. Запись не начата; старые partial не повторяйте.")
         if current and (current.get("tool") == "add_offer_note" or current.get("check", {}).get("kind") == "added_note"):
@@ -4533,6 +4553,15 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     any(not parts.known_brand((step.get('payload') or {}).get('BRAND')) for step in writes
                         if step.get('method') in {'offer/require/add', 'offer/order/add_free_order'})):
                 raise ValueError("В старом черновике не указан бренд товара. Отмените его, если запись не отправлялась, и укажите бренд вручную. Запись не начата")
+            def bad_sku(value: Any) -> bool:
+                if isinstance(value, list):
+                    return any(bad_sku(v) for v in value)
+                if isinstance(value, dict):
+                    return any((str(k).upper() == "SKU" and not parts.sku_is_latin(v, allow_empty=True))
+                               or bad_sku(v) for k, v in value.items())
+                return False
+            if any(not parts.sku_is_latin(c.get("sku"), allow_empty=True) for c in checks) or bad_sku(writes):
+                raise ValueError("В старом черновике артикул не латиницей. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторяйте")
             def has_stock_reference(value: Any) -> bool:
                 if isinstance(value, list):
                     return any(has_stock_reference(v) for v in value)

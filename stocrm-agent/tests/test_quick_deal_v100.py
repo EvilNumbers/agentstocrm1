@@ -251,8 +251,7 @@ def test_draft_tampering_and_changed_contact_prevent_all_writes(env):
 
 def test_extra_actions_not_silently_dropped(env):
     session, _, pipe = env
-    for text in ('новая быстрая сделка диагностика 1000 и добавь работу замена масла 2000',
-                 'новая быстрая сделка диагностика 1000 и добавь артикул NGK CR9E цена 300 и добавь работу масло 500'):
+    for text in ('новая быстрая сделка диагностика 1000 и добавь артикул NGK CR9E цена 300 и добавь работу масло 500',):
         response = send(pipe, text)
         assert not response.drafts and 'не удалось' in response.answer.lower()
     assert not writes(session)

@@ -142,11 +142,14 @@ def _confirm_new_work(tools: Any, oid: int, before: Counter[tuple[str, float]],
     raise ValueError('Новая работа не обнаружена при контрольном чтении')
 
 
+def _works(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return ([payload['work']] if payload.get('work') else []) + list(payload.get('extra_works') or [])
+
+
 def positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    work = payload.get('work')
-    return ([{'kind': 'work', 'title': str(work.get('title') or ''), 'price': work.get('price')}] if work else []) + [
+    return [{'kind': 'work', 'title': str(work.get('title') or ''), 'price': work.get('price')} for work in _works(payload)] + [
         {'kind': 'article', 'title': str(item.get('sku') or ''), 'brand': item.get('brand'),
-         'price': item.get('price'), 'qty': item.get('qty')} for item in payload.get('articles') or []]
+         'price': item.get('price'), 'qty': item.get('qty'), 'product_hint': item.get('product_hint')} for item in payload.get('articles') or []]
 
 
 def summary_for(payload: dict[str, Any]) -> str:
@@ -167,11 +170,77 @@ def summary_for(payload: dict[str, Any]) -> str:
         rows.append('Без услуг и товаров.')
     policy = ('Системный контакт передаётся при создании; после ответа CRM на перевод позиции добавляются по номеру сделки без проверки текущего статуса, контакта и воронки, даже если статус или контакт изменится. Фактический перевод и контакт не сверяются.'
               if not oid else 'Проверьте номер: позиции добавляются в указанную сделку без проверки её текущего статуса, контакта и воронки, даже если они изменились.')
-    if payload.get('work'):
+    if _works(payload):
         policy += (' Бот сравнит работы сделки по названию и сумме до и после записи; номер работы не требуется. '
                    'Не меняйте работы сделки одновременно: совпадающую чужую работу невозможно отличить.')
-    return summary + '\n' + '\n'.join(rows) + '\n' + policy + '\nСвободные позиции без заказа поставщику.'
+    return summary + '\n' + '\n'.join(rows) + '\n' + policy + '\n🔎 Перед подтверждением проверьте номер сделки, каждый артикул, бренд, количество и цену: распознавание речи может ошибаться.\nСвободные позиции без заказа поставщику.'
 
+
+
+def _position_index(items: list[dict[str, Any]], *, number: int | None, query: str | None) -> int:
+    if number is not None:
+        if 1 <= number <= len(items):
+            return number - 1
+        raise ValueError('Укажите существующий номер позиции в черновике')
+    needle = key(query)
+    if not needle:
+        raise ValueError('Укажите номер или название одной позиции')
+    if needle in {'товар', 'товара', 'товару', 'товары', 'артикул', 'артикула', 'артикулу', 'запчасть', 'запчасти'}:
+        candidates = [i for i, item in enumerate(items) if item['kind'] == 'article']
+    elif needle in {'фильтр', 'фильтра', 'фильтру', 'фильтров', 'фильтры'}:
+        candidates = [i for i, item in enumerate(items) if item['kind'] == 'article' and str(item.get('product_hint') or '').startswith('фильтр')]
+    elif needle in {'услуга', 'услугу', 'услуги', 'работа', 'работу', 'работы'}:
+        candidates = [i for i, item in enumerate(items) if item['kind'] == 'work']
+    else:
+        candidates = [i for i, item in enumerate(items) if needle in key(item['title'])]
+        # Русские окончания в устной форме: диагностика / диагностику.
+        if not candidates and len(needle) >= 5 and needle[-1] in 'ауыеоиюя':
+            stem = needle[:-1]
+            candidates = [i for i, item in enumerate(items) if key(item['title']).startswith(stem)]
+    if len(candidates) != 1:
+        raise ValueError('Позиция не найдена или их несколько; назовите её номер или точный артикул')
+    return candidates[0]
+
+
+def edit_position(tools: Any, token: str, *, number: int | None = None, query: str | None = None,
+                  price: float | None = None, qty: int | None = None) -> dict[str, Any]:
+    """Только ожидающий составной черновик: атомарно заменить, старую кнопку отключить."""
+    if (price is None) == (qty is None):
+        raise ValueError('Укажите одну новую цену или количество')
+    if price is not None and (isinstance(price, bool) or not math.isfinite(price) or price <= 0):
+        raise ValueError('Цена должна быть положительной')
+    if qty is not None and (type(qty) is not int or not 1 <= qty <= 9999):
+        raise ValueError('Количество должно быть целым от 1 до 9999')
+    store = tools.drafts
+    with store._locked():
+        draft = store._verify_unlocked(token)
+        if draft.get('tool') != 'quick_deal' or draft.get('method') != 'quick_deal' or draft.get('steps'):
+            raise ValueError('Изменить можно только ожидающий составной черновик')
+        payload = copy.deepcopy(draft['payload'])
+        items = positions(payload)
+        index = _position_index(items, number=number, query=query)
+        payload['confirmation_policy'] = 'multi_work_v119'
+        all_works = _works(payload)
+        if index < len(all_works):
+            if qty is not None:
+                raise ValueError('Количество можно изменить только у товара')
+            target = payload['work'] if index == 0 and payload.get('work') else payload['extra_works'][index - (1 if payload.get('work') else 0)]
+        else:
+            target = payload['articles'][index - len(all_works)]
+        if price is not None:
+            target['price'] = float(price)
+        else:
+            target['qty'] = qty
+        if any(not parts.sku_is_latin(item.get('sku')) for item in payload.get('articles') or []):
+            raise ValueError('В старом черновике артикул не латиницей; отмените его без попыток записи и подготовьте заново')
+        # _create_unlocked сохраняет файл: старый черновик закрываем ДО его сохранения.
+        draft.update(status='discarded', reason='состав изменён человеком; старая кнопка недействительна')
+        updated = store._create_unlocked(tool='quick_deal', method='quick_deal', payload=payload,
+                    summary=summary_for(payload), risk='high', steps=None, extra={'check': {'kind': 'quick_deal'}})
+        draft['replacement_token'] = updated['token']
+        store._save()
+        return {'status': 'pending', 'token': updated['token'], 'draft': dict(updated),
+                'position': items[index]['title'], 'number': index + 1}
 
 def drop_position(tools: Any, token: str, *, number: int | None, query: str | None) -> dict[str, Any]:
     """Пересоздать ожидающий черновик атомарно; старые кнопки не применяют новую версию."""
@@ -182,19 +251,17 @@ def drop_position(tools: Any, token: str, *, number: int | None, query: str | No
             raise ValueError('Состав черновика не подтверждён')
         payload = copy.deepcopy(draft['payload'])
         items = positions(payload)
-        if number is not None:
-            index = number - 1 if 1 <= number <= len(items) else None
-        else:
-            needle = key(query)
-            matches = [i for i, item in enumerate(items) if needle and needle in key(item['title'])]
-            index = matches[0] if len(matches) == 1 else None
-        if index is None:
-            raise ValueError('Укажите номер одной позиции из последнего черновика')
+        index = _position_index(items, number=number, query=query)
         removed = items[index]
+        all_works = _works(payload)
         if removed['kind'] == 'work':
-            payload['work'] = None
+            del all_works[index]
+            payload['work'] = all_works[0] if all_works else None
+            payload['extra_works'] = all_works[1:]
         else:
-            del payload['articles'][index - (1 if payload.get('work') else 0)]
+            del payload['articles'][index - len(all_works)]
+        if any(not parts.sku_is_latin(item.get('sku')) for item in payload.get('articles') or []):
+            raise ValueError('В старом черновике артикул не латиницей; отмените его без попыток записи и подготовьте заново')
         draft.update(status='discarded', reason='состав изменён человеком; старая кнопка недействительна')
         if not positions(payload):
             store._save()
@@ -218,26 +285,31 @@ def _diagnose(tools: Any, event: str, **fields: Any) -> None:
 
 
 def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
-            work: dict[str, Any] | None, articles: list[dict[str, Any]], reason_id: int | None = None) -> dict[str, Any]:
+            work: dict[str, Any] | None, articles: list[dict[str, Any]], reason_id: int | None = None,
+            extra_works: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if not offer_id and quick_read.identity(tools) != ids:
         raise ValueError('Контакт создания или воронка статуса изменились')
-    if not work and not articles and offer_id:
+    all_works = ([work] if work else []) + list(extra_works or [])
+    if len(all_works) > 10:
+        raise ValueError('Слишком много услуг в одном запросе')
+    if not all_works and not articles and offer_id:
         raise ValueError('Назовите работу или артикул')
-    if work and not str(work.get('title') or '').strip():
+    if any(not str(item.get('title') or '').strip() for item in all_works):
         raise ValueError('Название работы не указано')
     if offer_id:
         _assert_offer(tools, ids, offer_id, number_only=True)
-    for item in ([work] if work else []) + articles:
+    for item in all_works + articles:
         price = item.get('price')
         if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
             raise ValueError('Для каждой работы и запчасти нужна положительная цена')
+    articles = [dict(item, sku=parts.sku_for_write(item.get('sku'))) for item in articles]
     for item in articles:
         if not item.get('sku') or not parts.known_brand(item.get('brand')) or type(item.get('qty')) is not int or not 1 <= item['qty'] <= 9999:
             raise ValueError('Артикул, бренд и количество не подтверждены')
     reason = _status_reason(tools, ids, reason_id) if not offer_id else None
     payload = {'contact_id': ids[0], 'board_id': ids[1], 'status_id': ids[2],
-               'offer_id': offer_id, 'work': work, 'articles': articles, 'reason': reason,
-               'confirmation_policy': 'deal_number_only_v117'}
+               'offer_id': offer_id, 'work': work, 'extra_works': list(extra_works or []), 'articles': articles, 'reason': reason,
+               'confirmation_policy': 'multi_work_v119'}
     summary = summary_for(payload)
     # Атомарный запрет на параллельные / непроверенные составные операции.
     store = tools.drafts
@@ -260,10 +332,13 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
     # validate fingerprint before consulting any payload or doing I/O
     current = tools.drafts.verify(token)
     p = current['payload']
-    if p.get('confirmation_policy') != 'deal_number_only_v117':
+    if (p.get('confirmation_policy') not in {'deal_number_only_v117', 'multi_work_v119'} or
+            (p.get('confirmation_policy') == 'deal_number_only_v117' and p.get('extra_works'))):
         raise ValueError('Старый черновик не содержит новых условий проверки. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторяйте')
     if any(not parts.known_brand(item.get('brand')) for item in p.get('articles') or []):
         raise ValueError('В старом черновике не указан бренд. Отмените его, если запись не отправлялась, и укажите бренд вручную; CRM не изменена')
+    if any(not parts.sku_is_latin(item.get('sku')) for item in p.get('articles') or []):
+        raise ValueError('В старом черновике артикул не латиницей. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторяйте')
     ids = (int(p['contact_id']), int(p['board_id']), int(p['status_id']))
     oid = p.get('offer_id')
     identity_changed = quick_read.identity(tools) != ids if not oid else False
@@ -329,9 +404,8 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             result['status_not_read_back'] = True
             mark('ответ на запрос перевода получен; текущий статус не проверяется', 'status_response')
         oid = int(oid)
-        if p.get('work'):
+        for work in _works(p):
             _assert_offer(tools, ids, oid, number_only=True)
-            work = p['work']
             mark('проверка исходного списка работ', 'work_before')
             before = _work_snapshot(tools, oid)
             data = {'OFFER_ID': oid, 'TYPE': tools.free_form_type, 'DESCRIPTION': work['title'], 'TITLE': work['title'], 'WORKING_HOUR': 1.0, 'SUM': float(work['price']), 'PRICE_OF_HOUR': float(work['price'])}
