@@ -741,6 +741,56 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                      name=getattr(user, "full_name", "") or "",
                      is_admin=is_admin(user))
 
+    @router.message(F.text.regexp(r'^/offer_test(?:@\w+)?(?:\s+\d+)?\s*$'))
+    async def cmd_offer_test(message: Message) -> None:
+        if not is_admin(message.from_user):
+            await message.answer('Диагностика сделки доступна только администратору.')
+            return
+        match = re.fullmatch(r'/offer_test(?:@\w+)?\s+([1-9]\d{0,9})\s*', (message.text or '').strip())
+        if not match:
+            await message.answer('Укажите номер: /offer_test 1335. Это только чтение, без записи в CRM.')
+            return
+        oid = int(match.group(1))
+        diag = await asyncio.to_thread(tools.offer_identity_diagnostic, oid)
+        if diag['status'] != 'ok':
+            await message.answer(f'Сделка №{oid}: не удалось подтвердить поля в ответе CRM. Это не доказывает отсутствия сделки. Запись не выполнялась.')
+            return
+        await message.answer('\n'.join([
+            f'Диагностика сделки №{oid} (только чтение):',
+            'Номер сделки совпал: ' + ('да' if diag['offer_id_matches'] else 'нет'),
+            'ID контакта получен: ' + ('да' if diag['contact_id_present'] else 'нет'),
+            f"ID воронки: {diag['board_id'] if diag['board_id'] is not None else 'не получен'}",
+            f"ID статуса: {diag['status_id'] if diag['status_id'] is not None else 'не получен'}",
+            'Название статуса получено: ' + ('да' if diag['status_name_present'] else 'нет'),
+            'Личные данные и ключи не выводятся; эта проверка не снимает блокировку.'
+        ]))
+
+    @router.message(F.text.regexp(r'^/balance_test(?:@\w+)?(?:\s+\d+)?\s*$'))
+    async def cmd_balance_test(message: Message) -> None:
+        if not is_admin(message.from_user):
+            await message.answer('Диагностика баланса доступна только администратору.')
+            return
+        match = re.fullmatch(r'/balance_test(?:@\w+)?\s+([1-9]\d{0,9})\s*', (message.text or '').strip())
+        if not match:
+            await message.answer('Укажите номер: /balance_test 1334. Это только чтение, без записи в CRM.')
+            return
+        oid = int(match.group(1))
+        diag = await asyncio.to_thread(tools.balance_diagnostic, oid)
+        if diag['status'] == 'error':
+            await message.answer(f'Баланс сделки №{oid}: CRM не вернула ответ или чтение завершилось ошибкой. Суммы и долг неизвестны; запись не выполнялась.')
+            return
+        lines = [f'Диагностика баланса сделки №{oid} (только чтение):',
+                 f"Тип ответа: {diag['response_type']}"]
+        if diag['response_type'] == 'object':
+            lines.extend([f"Рублёвых строк: {diag['rub_count']}",
+                          f"Строк неверного формата: {diag['malformed_rows']}",
+                          f"Строк без корректной суммы: {diag['invalid_amounts']}",
+                          f"Строк без ID или типа сущности: {diag['missing_entity']}",
+                          f"Строк с другим ID или типом: {diag['wrong_entity']}",
+                          'Известные обёртки: ' + (', '.join(diag['known_wrappers']) or 'нет')])
+        lines.append('Суммы, личные данные и ключи не выводятся. Это диагностика структуры, не подтверждение долга.')
+        await message.answer('\n'.join(lines))
+
     # ------------------------------------------------------ меню подтверждений
     @router.message(F.text.startswith("/settings"))
     async def cmd_settings(message: Message) -> None:

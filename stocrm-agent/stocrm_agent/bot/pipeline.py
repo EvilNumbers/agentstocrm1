@@ -2629,14 +2629,21 @@ class BotPipeline:
             except Exception as exc:
                 return PipelineResult(answer=f"Не удалось подготовить быструю сделку: {exc}. Ничего не записано.")
         try:
-            ids = quick_read.identity(self.tools)
-            rows = quick_read.offers(self.tools, ids)
+            status_ids = quick_read.status_identity(self.tools)
+            rows, incomplete = quick_read.status_offers(self.tools, status_ids)
             if not rows:
-                return PipelineResult(answer="Подтверждённых быстрых сделок этого контакта не найдено.")
-            shown = rows[:10]
-            details = quick_read.details(self.tools, ids, shown)
-            choice = {"kind": "quick_read", "owner": user_id, "ids": ids, "offers": shown,
-                      "question": "\n\n".join(details) + (f"\n\nПоказаны 10 из {len(rows)}; остальные не показаны." if len(rows) > 10 else "")}
+                message = 'В полученной выборке нет подтверждённых сделок в статусе «Быстрые сделки».'
+                if incomplete:
+                    message += ' ⚠️ Список неполон: принадлежность некоторых сделок не удалось проверить.'
+                return PipelineResult(answer=message)
+            shown = list(rows)[:10]
+            details = quick_read.status_details(self.tools, status_ids, {oid: rows[oid] for oid in shown})
+            note = (f"\n\nПоказаны 10 из {len(rows)} подтверждённых; остальные не показаны." if len(rows) > 10 else '')
+            if incomplete:
+                note += '\n\n⚠️ Список может быть неполным: часть сделок не удалось проверить.'
+            choice = {"kind": "quick_read", "owner": user_id, "status_ids": status_ids,
+                      "contacts": {oid: rows[oid] for oid in shown}, "offers": shown,
+                      "question": 'Сделки в статусе «Быстрые сделки» (все контакты):\n\n' + "\n\n".join(details) + note}
             self._quick_choices[user_id] = choice
             return PipelineResult(choices=[choice])
         except Exception as exc:
@@ -2766,6 +2773,16 @@ class BotPipeline:
             choice['item']['brand'] = str(selected['brand'])
             return self._quick_continue(choice['plan'], user_id)
         try:
+            if choice.get('kind') == 'quick_read':
+                status_ids = quick_read.status_identity(self.tools)
+                if status_ids != choice.get('status_ids'):
+                    raise ValueError('Статус изменился; повторите список')
+                rows, _ = quick_read.status_offers(self.tools, status_ids)
+                oid = choice['offers'][index]
+                contact_id = choice['contacts'][oid]
+                if rows.get(oid) != contact_id:
+                    raise ValueError('Контакт или статус сделки больше не подтверждён; повторите список')
+                return PipelineResult(answer=quick_read.status_detail(self.tools, status_ids, oid, contact_id), structured_offer_details=True)
             ids = quick_read.identity(self.tools)
             if choice.get("kind") == "quick_reason":
                 from ..quick_deal import status_reasons
