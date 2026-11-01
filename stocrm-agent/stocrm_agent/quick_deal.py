@@ -68,8 +68,20 @@ def _assert_offer(tools: Any, ids: tuple[int, int, int], oid: int, *, after_stat
         if quick_read.identity(tools) != ids:
             raise ValueError('Системный контакт или статус изменились')
         row, _ = tools._search_offer_row(oid)
-        if row and tuple(str(row.get(k)) for k in fields) == tuple(map(str, ids)):
+        if row and str(row.get('OFFER_ID')) == str(oid) and tuple(str(row.get(k)) for k in fields) == tuple(map(str, ids)):
             return
+        # При отсутствующем ключе пробуем только чтение в формате волны 81 —
+        # без REQUIRED_FIELDS. Название не подменяет ID; все идентификаторы
+        # должны совпасть в каждой из двух строк, повторов записи здесь нет.
+        if (row and 'STATUS_ID' not in row and str(row.get('OFFER_ID')) == str(oid)
+                and str(row.get('CONTACT_ID')) == str(ids[0]) and str(row.get('BOARD_ID')) == str(ids[1])):
+            try:
+                legacy = tools._search_offer_row_without_required_fields(oid)
+            except Exception:  # noqa: BLE001 — ошибка чтения не подтверждает статус
+                legacy = None
+            if (legacy and str(legacy.get('OFFER_ID')) == str(oid)
+                    and tuple(str(legacy.get(k)) for k in fields) == tuple(map(str, ids))):
+                return
         if not row:
             problem = 'сделка не найдена в ответе CRM'
         else:
