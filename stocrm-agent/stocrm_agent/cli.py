@@ -55,6 +55,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # отчёт собирается даже при неполных настройках — поэтому раньше Config
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "support-log":
+        from .diagnostic_journal import main as journal_main
+
+        return journal_main(argv[1:])
     if argv and argv[0] == "support":
         from .support import main as support_main
 

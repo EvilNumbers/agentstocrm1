@@ -23,13 +23,19 @@ def _redact(value: Any) -> Any:
 
 
 class AuditLog:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, diagnostic: Any = None) -> None:
+        self.diagnostic = diagnostic
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
     def write(self, event: str, **fields: Any) -> None:
         from .diagnostics import TRACE_ID
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic.audit(event, fields)
+            except Exception:
+                pass  # диагностика не должна влиять на выполнение
         trace = TRACE_ID.get()
         if fields.get("token"):
             fields["draft_fingerprint"] = hashlib.sha256(str(fields["token"]).encode()).hexdigest()[:12]

@@ -38,6 +38,8 @@ from ..access import AccessList
 from ..audit import AuditLog
 from ..client import StocrmClient, StocrmError
 from ..config import Config
+from ..diagnostic_journal import DiagnosticJournal, DiagnosticLogHandler, error_kind
+from ..envfile import load_env_file
 from ..crmcheck import check_crm, format_checks, summary
 from ..drafts import DraftStore
 from ..draft_recovery import lock_refusal
@@ -64,6 +66,7 @@ log = logging.getLogger("stocrm.bot")
 
 MAX_TEXT = 3500
 PROBE_TIMEOUT = 6.0          # сколько ждём на проверку маршрута
+_ACTIVE_DIAGNOSTIC: DiagnosticJournal | None = None
 
 
 # --------------------------------------------------------------------- helpers
@@ -92,10 +95,13 @@ def build_tools(app_config: Config) -> Toolset:
         app_config.domain, app_config.sid,
         timeout=app_config.timeout, retries=app_config.retries, session=session,  # type: ignore[arg-type]
     )
+    diagnostic = (_ACTIVE_DIAGNOSTIC if _ACTIVE_DIAGNOSTIC is not None
+                  and _ACTIVE_DIAGNOSTIC.state.resolve() == app_config.state_dir.resolve() else DiagnosticJournal(app_config.state_dir))
+    client.diagnostic = diagnostic
     return Toolset(
         client,
         DraftStore(app_config.drafts_path, ttl_seconds=app_config.draft_ttl_seconds),
-        AuditLog(app_config.audit_path),
+        AuditLog(app_config.audit_path, diagnostic=diagnostic),
         page_size=app_config.page_size,
         max_pages=app_config.max_pages,
         price_method=app_config.price_method,
@@ -620,7 +626,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 await bot.send_message(
                     chat.id,
                     "⚠️ Внутренняя ошибка при обработке сообщения. Подробности — "
-                    "в файле .state/bot.log. Если повторяется — пришлите последние строки оттуда.",
+                    "в журнале. Если повторяется — запустите collect_log.bat и пришлите файл support_log.txt.",
                 )
         return True
 
@@ -1030,6 +1036,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
     # ---------------------------------------------------------- голос/аудио
     async def handle_audio(message: Message, file_id: str, suffix: str,
                            file_size: int | None = None) -> None:
+        tools.audit.write('bot.voice.start', file_size=file_size, source='voice')
         if file_size and file_size > 20 * 1024 * 1024:
             await message.answer("⚠️ Файл больше 20 МБ — Telegram не даст его скачать. "
                                  "Разбейте запись на части.")
@@ -1043,6 +1050,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         try:
             await message.bot.download(file_id, destination=buffer)
         except Exception as exc:  # noqa: BLE001 — сеть, лимиты Telegram, права
+            tools.audit.write('bot.voice.error', error_class=type(exc).__name__, error=type(exc).__name__, phase='start')
             log.warning("не удалось скачать голосовое: %s", exc)
             await message.answer(
                 "⚠️ Не удалось скачать голосовое из Telegram.\n\n"
@@ -1057,6 +1065,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         try:
             text = await pipeline.transcribe(audio, filename=f"voice{suffix}")
         except STTError as exc:
+            tools.audit.write('bot.voice.error', error_class=type(exc).__name__, error=type(exc).__name__, phase='prepare')
             log.warning("распознавание не удалось: %s", exc)
             await message.answer(
                 "⚠️ Не удалось распознать голосовое.\n\n"
@@ -1067,6 +1076,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         if not text.strip():
             await message.answer("Пустая расшифровка — попробуйте ещё раз.")
             return
+        tools.audit.write('bot.voice.finish', input_chars=len(text), outcome='reply')
         await run_and_reply(message, text, prefix=f"🎙 Распознано: «{text.strip()}»")
 
     @router.message(F.text.startswith("/parts_test"))
@@ -1810,13 +1820,28 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Загружаем путь состояния до запуска бота: ошибки конфигурации тоже видны в журнале.
+    load_env_file()
+    global _ACTIVE_DIAGNOSTIC
+    from pathlib import Path
+    _ACTIVE_DIAGNOSTIC = DiagnosticJournal(Config.from_env(require=False).state_dir)
+    diagnostic_handler = DiagnosticLogHandler(_ACTIVE_DIAGNOSTIC)
+    logging.getLogger().addHandler(diagnostic_handler)
+    from .. import CODE_WAVE
+    _ACTIVE_DIAGNOSTIC.emit('runtime.start', wave=CODE_WAVE, pid=os.getpid())
     _attach_file_log()
     try:
         bot, dp, set_commands, _tools = create_app()
     except SystemExit as exc:                      # нет ключей — сообщение уже понятное
+        _ACTIVE_DIAGNOSTIC.emit('runtime.start_error', error_class=type(exc).__name__, error_kind=error_kind(exc))
+        logging.getLogger().removeHandler(diagnostic_handler)
         print(exc)
         print("Инструкция: docs/SETUP_FREE.md · проверка: python -m stocrm_agent.cli doctor")
         raise SystemExit(2) from exc
+    except Exception as exc:
+        _ACTIVE_DIAGNOSTIC.emit('runtime.start_error', error_class=type(exc).__name__, error_kind=error_kind(exc))
+        logging.getLogger().removeHandler(diagnostic_handler)
+        raise
     try:
         await set_commands()
     except Exception as exc:  # noqa: BLE001 — сеть/токен: не мешаем запуску
@@ -1847,6 +1872,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     except Exception as exc:
+        _ACTIVE_DIAGNOSTIC.emit('runtime.poll_error', error_class=type(exc).__name__, error_kind=error_kind(exc))
         if not _is_network_error(exc):
             raise
         print()
@@ -1877,6 +1903,8 @@ async def main() -> None:
         boot_record.update({"event": "bot.lifecycle.stop", "ts": time.time()})
         write_runtime_snapshot(Path(app_cfg.state_dir), boot_record)
         _tools.audit.write("bot.lifecycle.stop", wave=CODE_WAVE, pid=os.getpid())
+        _ACTIVE_DIAGNOSTIC.emit('runtime.stop', wave=CODE_WAVE, pid=os.getpid())
+        logging.getLogger().removeHandler(diagnostic_handler)
         warm.cancel()
         try:
             _tools.client.close()          # закрываем соединения с панелью

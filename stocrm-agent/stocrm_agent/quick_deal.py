@@ -4,10 +4,12 @@ from __future__ import annotations
 import math
 import copy
 import time
+from collections import Counter
 from typing import Any
 
 from .booking import _id_from, key
 from .calendar import _positive, _rows
+from .client import _as_items
 from .bot import quick_read
 from . import parts
 
@@ -77,6 +79,69 @@ def _assert_offer(tools: Any, ids: tuple[int, int, int], oid: int, *,
     raise ValueError(f'Сделка №{oid}: {problem}')
 
 
+def _work_snapshot(tools: Any, oid: int) -> Counter[tuple[str, float]]:
+    """Список работ по номеру сделки; номера самих работ не нужны."""
+    from .tools import _known_work_sum
+    found: Counter[tuple[str, float]] = Counter()
+    seen_on_previous_pages: set[tuple[int, str, float]] = set()
+    seen_count = 0
+    for page in range(1, 21):
+        raw = tools._read('quick_work_snapshot', 'work/get_filtered',
+                          {'FILTER': {'OFFER_ID': oid}, 'SORT': {'WORK_ID': 'ASC'}, 'PAGE': page, 'LIMIT': 200})
+        if raw is None or isinstance(raw, bool) or not isinstance(raw, (dict, list)) or raw == {}:
+            raise ValueError('CRM не подтвердила полный список работ')
+        rows = _as_items(raw)
+        if not rows:
+            return found
+        page_signatures: set[tuple[int, str, float]] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError('Неизвестный формат списка работ')
+            owner = _positive(row.get('OFFER_ID'), 'Сделка работы')
+            title = key(row.get('TITLE') or row.get('DOCUMENT_TITLE'))
+            amount = _known_work_sum(row.get('SUM'))
+            if not title or amount is None:
+                raise ValueError('Название или сумма работы не получены; список не подтверждён')
+            signature = (owner, title, amount)
+            # Без номера работы одинаковые строки на разных страницах нельзя отличить
+            # от повторной страницы: останавливаемся, не угадываем.
+            if signature in seen_on_previous_pages:
+                raise ValueError('Строки работ повторяются на разных страницах; список не подтверждён')
+            page_signatures.add(signature)
+            seen_count += 1
+            if seen_count > 2000:
+                raise ValueError('Список работ слишком большой; проверка не завершена')
+            if owner == oid:
+                found[(title, amount)] += 1
+        seen_on_previous_pages.update(page_signatures)
+    raise ValueError('Список работ неполный; проверка не завершена')
+
+
+def _confirm_new_work(tools: Any, oid: int, before: Counter[tuple[str, float]],
+                      work: dict[str, Any]) -> None:
+    """Повторяет только чтение. Сравнение не доказывает авторство при параллельной записи."""
+    wanted = (key(work['title']), round(float(work['price']), 2))
+    for attempt, delay in enumerate((0.0, 0.5, 1.0, 2.0)):
+        if delay:
+            time.sleep(delay)
+        after = _work_snapshot(tools, oid)
+        added = after - before
+        _diagnose(tools, 'quick.check', phase='work_check', offer_id=oid, attempt=attempt,
+                  before_count=sum(before.values()), after_count=sum(after.values()),
+                  added_count=sum(added.values()), removed_count=sum((before - after).values()),
+                  verified=added == Counter({wanted: 1}) and not (before - after))
+        if before - after:
+            raise ValueError('Прежний список работ изменился; результат не подтверждён')
+        if not added:
+            continue
+        if sum(added.values()) != 1:
+            raise ValueError('Обнаружено несколько новых работ; результат неоднозначен')
+        if added != Counter({wanted: 1}):
+            raise ValueError('Название или сумма новой работы не подтверждены')
+        return
+    raise ValueError('Новая работа не обнаружена при контрольном чтении')
+
+
 def positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     work = payload.get('work')
     return ([{'kind': 'work', 'title': str(work.get('title') or ''), 'price': work.get('price')}] if work else []) + [
@@ -101,6 +166,9 @@ def summary_for(payload: dict[str, Any]) -> str:
         rows.append('Без услуг и товаров.')
     policy = ('Системный контакт передаётся при создании; фактический контакт сделки не сверяется. После перевода статус проверяется по названию; затем позиции добавляются по номеру сделки, даже если статус или контакт изменится.'
               if not oid else 'Статус выбранной сделки проверяется по названию; затем позиции добавляются по её номеру, даже если статус или контакт изменится.')
+    if payload.get('work'):
+        policy += (' Бот сравнит работы сделки по названию и сумме до и после записи; номер работы не требуется. '
+                   'Не меняйте работы сделки одновременно: совпадающую чужую работу невозможно отличить.')
     return summary + '\n' + '\n'.join(rows) + '\n' + policy + '\nСвободные позиции без заказа поставщику.'
 
 
@@ -138,6 +206,16 @@ def drop_position(tools: Any, token: str, *, number: int | None, query: str | No
                 'removed': removed['title'], 'draft': dict(updated)}
 
 
+def _diagnose(tools: Any, event: str, **fields: Any) -> None:
+    """Только диагностический журнал; отказ записи не влияет на сделку."""
+    try:
+        diagnostic = getattr(tools.audit, 'diagnostic', None)
+        if diagnostic is not None:
+            diagnostic.audit(event, fields)
+    except Exception:
+        pass
+
+
 def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
             work: dict[str, Any] | None, articles: list[dict[str, Any]], reason_id: int | None = None) -> dict[str, Any]:
     if (quick_read.identity(tools) != ids if not offer_id else quick_read.status_identity(tools)[0] != ids[1]):
@@ -158,7 +236,7 @@ def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
     reason = _status_reason(tools, ids, reason_id) if not offer_id else None
     payload = {'contact_id': ids[0], 'board_id': ids[1], 'status_id': ids[2],
                'offer_id': offer_id, 'work': work, 'articles': articles, 'reason': reason,
-               'confirmation_policy': 'status_name_offer_number_v110'}
+               'confirmation_policy': 'work_title_sum_confirmation_v113'}
     summary = summary_for(payload)
     # Атомарный запрет на параллельные / непроверенные составные операции.
     store = tools.drafts
@@ -170,15 +248,18 @@ def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
             check = other.get('check') or {}
             if check.get('kind') == 'standalone_offer' and str(check.get('contact_id')) == str(ids[0]) and (other.get('status') in ('pending', 'applying', 'partial') or other.get('archived_partial')):
                 raise ValueError('По системному контакту есть незавершённое создание сделки. Проверьте /drafts')
-        return dict(store._create_unlocked(tool='quick_deal', method='quick_deal', payload=payload,
+        draft = dict(store._create_unlocked(tool='quick_deal', method='quick_deal', payload=payload,
                                           summary=summary, risk='high', steps=None, extra={'check': {'kind': 'quick_deal'}}))
+    _diagnose(tools, 'quick.draft', token=draft['token'], offer_id=offer_id,
+              source='existing' if offer_id else 'new', draft_count=len(positions(payload)), tool='quick_deal')
+    return draft
 
 
 def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
     # validate fingerprint before consulting any payload or doing I/O
     current = tools.drafts.verify(token)
     p = current['payload']
-    if p.get('confirmation_policy') != 'status_name_offer_number_v110':
+    if p.get('confirmation_policy') != 'work_title_sum_confirmation_v113':
         raise ValueError('Старый черновик не содержит новых условий проверки. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторяйте')
     if any(not parts.known_brand(item.get('brand')) for item in p.get('articles') or []):
         raise ValueError('В старом черновике не указан бренд. Отмените его, если запись не отправлялась, и укажите бренд вручную; CRM не изменена')
@@ -204,17 +285,20 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
     if not oid:
         result['REQUESTED_CONTACT_ID'] = ids[0]
     stage = 'подготовка'
+    phase = 'prepare'
     try:
-        def mark(message: str) -> None:
-            nonlocal stage
-            stage = message
+        def mark(message: str, code: str) -> None:
+            nonlocal stage, phase
+            stage, phase = message, code
             tools.drafts.mark(token, 'applying', quick_stage=stage, quick_touched_at=time.time(), result=dict(result))
+            _diagnose(tools, 'quick.stage', token=token, phase=phase, offer_id=oid,
+                      completed_count=len(result['completed']), result=result)
         if not oid:
-            mark('создание сделки отправляется')
+            mark('создание сделки отправляется', 'create_sent')
             response = tools.client.call('offer/new/with_contact', {'PHONE': quick_read.PHONE, 'CONTACT_ID': ids[0], 'BOARD_ID': ids[1]})
             oid = _positive(response, 'Сделка') if isinstance(response, (int, str)) and not isinstance(response, bool) else _id_from(response, 'OFFER_ID')
             result['OFFER_ID'] = oid
-            mark('получен номер сделки')
+            mark('получен номер сделки', 'created')
             if oid in prior:
                 raise ValueError('CRM вернула ID существовавшей сделки')
             tools._invalidate_cache()
@@ -229,39 +313,29 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
                 status['REASON_ID'] = p['reason']['id']
             if _status_reason(tools, ids, (p.get('reason') or {}).get('id')) != p.get('reason'):
                 raise ValueError('Причина статуса изменилась')
-            mark('смена статуса отправляется')
+            mark('смена статуса отправляется', 'status_sent')
             tools.client.call('offer/status/change', status)
             _assert_offer(tools, ids, oid, after_status_change=True)
             result['completed'].append('статус «Быстрые сделки»')
-            mark('статус подтверждён')
+            mark('статус подтверждён', 'status_confirmed')
         oid = int(oid)
         if p.get('work'):
             _assert_offer(tools, ids, oid, number_only=True)
             work = p['work']
-            before = tools.offer_works(oid, limit=200)
-            if len(before) >= 200:
-                raise ValueError('Список работ неполон')
-            known = {str(w.get('work_id')) for w in before if w.get('work_id')}
+            mark('проверка исходного списка работ', 'work_before')
+            before = _work_snapshot(tools, oid)
             data = {'OFFER_ID': oid, 'TYPE': tools.free_form_type, 'DESCRIPTION': work['title'], 'TITLE': work['title'], 'WORKING_HOUR': 1.0, 'SUM': float(work['price']), 'PRICE_OF_HOUR': float(work['price'])}
-            mark('добавление работы отправляется')
+            mark('добавление работы отправляется', 'work_sent')
             response = tools.client.call('work/add', {'DATA': data})
-            wid = _id_from(response, 'WORK_ID')
-            result['WORK_ID'] = wid
-            mark('проверка работы')
-            if str(wid) in known:
-                raise ValueError('CRM вернула номер существовавшей работы')
-            # _find_work / _verify_work_sum сами сверяют работу с номером сделки.
-            check = {'offer_id': oid, 'work_id': wid, 'title': work['title'], 'sum': work['price']}
-            row = tools._find_work(check)
-            if not row or key(row.get('title')) != key(work['title']):
-                raise ValueError('Название новой работы не подтверждено')
-            problem = tools._verify_work_sum(check)
-            if problem:
-                raise ValueError(problem)
-            if check.get('actual_sum') is None or abs(float(check['actual_sum']) - float(work['price'])) >= 0.01:
-                raise ValueError('Стоимость работы отличается от подтверждённой суммы')
+            if response is False or not (response is None or response is True or isinstance(response, (dict, list)) or
+                                         (isinstance(response, (int, float)) and not isinstance(response, bool) and response > 0)):
+                raise ValueError('Ответ CRM на добавление работы не подтверждён')
+            if isinstance(response, dict) and 'OFFER_ID' in response and str(response['OFFER_ID']) != str(oid):
+                raise ValueError('Ответ CRM указывает на другую сделку')
+            mark('проверка работы по названию и сумме', 'work_check')
+            _confirm_new_work(tools, oid, before, work)
             result['completed'].append(f'работа «{work["title"]}»')
-            mark('работа подтверждена')
+            mark('работа подтверждена', 'work_confirmed')
         for item in p.get('articles') or []:
             _assert_offer(tools, ids, oid, number_only=True)
             tools.drafts.assert_part_unblocked({'offer_id': oid, 'sku': item['sku'], 'brand': item['brand']})
@@ -269,37 +343,43 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             if problem:
                 raise ValueError('Список товаров до записи неполон')
             known = {str(r.get('order_id')) for r in before if r.get('order_id')}
-            mark(f'искомый артикул {item["sku"]}: запрос отправляется')
+            mark(f'искомый артикул {item["sku"]}: запрос отправляется', 'require_sent')
             response = tools.client.call('offer/require/add', {'OFFER_ID': oid, 'TITLE': item['sku'], 'BRAND': item['brand'], 'SKU': item['sku']})
             rid = _id_from(response, 'REQUIRE_ID')
             result.setdefault('REQUIRE_IDS', []).append(rid)
-            mark(f'артикул {item["sku"]}: получен номер искомой позиции')
+            mark(f'артикул {item["sku"]}: получен номер искомой позиции', 'require_received')
             # Нельзя отправлять свободную строку в чужую искомую запчасть.
             if _id_from(response, 'OFFER_ID') != oid:
                 raise ValueError('CRM не подтвердила, что искомый артикул принадлежит этой сделке')
-            mark(f'артикул {item["sku"]}: искомая позиция подтверждена ответом CRM')
+            mark(f'артикул {item["sku"]}: искомая позиция подтверждена ответом CRM', 'require_confirmed')
             _assert_offer(tools, ids, oid, number_only=True)
-            mark(f'свободная позиция {item["sku"]}: запрос отправляется')
+            mark(f'свободная позиция {item["sku"]}: запрос отправляется', 'order_sent')
             response = tools.client.call('offer/order/add_free_order', {'REQUIRE_ID': rid, 'NAME': item['sku'], 'BRAND': item['brand'], 'SKU': item['sku'], 'PRICE': float(item['price']), 'NEED_MARKUP': False, 'AMOUNT': item['qty'], 'CURRENT_VOLUME': item['qty'], 'MIN_VOLUME': 1})
             order_id = _id_from(response, 'ORDER_ID')
             result.setdefault('ORDER_IDS', []).append(order_id)
-            mark(f'проверка позиции {item["sku"]}')
+            mark(f'проверка позиции {item["sku"]}', 'order_check')
             if str(order_id) in known:
                 raise ValueError('CRM вернула номер существовавшей позиции')
             # Проверка добавленной строки ниже сверяет её принадлежность сделке.
             check = {'offer_id': oid, 'sku': item['sku'], 'name': item['sku'], 'brand': item['brand'], 'price': item['price'], 'qty': item['qty'], 'order_id': order_id}
             info = tools._check_added_line(check)
+            _diagnose(tools, 'quick.check', token=token, phase='order_check', offer_id=oid,
+                      ORDER_ID=order_id, problem_count=len(info.get('problems') or []),
+                      verified=not bool(info.get('error') or info.get('problems')),
+                      error=str(info.get('error') or ''))
             if info.get('error') or info.get('problems'):
                 raise ValueError(str(info.get('error') or info.get('problems')))
             result['completed'].append(f'артикул {item["sku"]}')
-            mark(f'позиция {item["sku"]} подтверждена')
+            mark(f'позиция {item["sku"]} подтверждена', 'order_confirmed')
         result['SUMMARY'] = f'Быстрая сделка №{oid}: ' + ', '.join(result['completed'])
         tools.drafts.mark(token, 'applied', applied_at=time.time(), result=result)
+        _diagnose(tools, 'quick.success', token=token, phase=phase, offer_id=oid, status='applied', completed_count=len(result['completed']), result=result)
         return {'status': 'applied', 'token': token, 'method': 'quick_deal', 'result': result, 'verified': True}
     except BaseException as exc:
         warning = (f'Быстрая сделка выполнена не полностью. Этап: {stage}. Известные данные: {result}. '
                    f'Причина: {exc}. Проверьте CRM и /drafts; автоматический повтор запрещён.')
         tools.drafts.mark(token, 'partial', failed_at=time.time(), result=result, check_warning=warning, done_steps={'methods': result['completed'], 'error': str(exc)})
+        _diagnose(tools, 'quick.partial', token=token, phase=phase, offer_id=oid, status='partial', error=str(exc), error_class=type(exc).__name__, completed_count=len(result['completed']), result=result)
         if not isinstance(exc, Exception):
             raise
         return {'status': 'partial', 'token': token, 'method': 'quick_deal', 'result': result, 'warning': warning, 'verified': False}

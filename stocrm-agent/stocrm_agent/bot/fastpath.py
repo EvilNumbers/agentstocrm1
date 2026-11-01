@@ -206,7 +206,7 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
     lines = [f"📋 Последние сделки ({len(rows)}):"]
     for number, row in enumerate(rows, 1):
         marker = row.get("status_marker")
-        head = f"{number}. №{row.get('offer_id')}" + (f" {marker}" if marker else "")
+        head = (f"{marker} " if marker else "") + f"{number}. №{row.get('offer_id')}"
         if row.get("contact"):
             head += f" {row['contact']}"
         if row.get("car"):
