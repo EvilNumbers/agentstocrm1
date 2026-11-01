@@ -103,7 +103,7 @@ def test_balance_and_item_reads_overlap_without_extra_requests(env, monkeypatch)
         assert method == 'payment/get_balance'
         balance_started.set()
         assert items_started.wait(2), 'позиции запущены только после баланса'
-        return {'RUB_CASH': {'CURRENCY_VALUE': 0}}
+        return {'RUB_CASH': {'CURRENCY_VALUE': 0, 'ENTITY_ID': 1654, 'ENTITY_TYPE': 'OFFER'}}
     def get_items(_):
         assert balance_started.wait(2)
         items_started.set()

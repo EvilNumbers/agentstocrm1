@@ -38,11 +38,10 @@ def test_list_and_debt_and_isolated_selection(env):
     assert all(c['method'] not in {'offer/new/with_contact', 'work/add', 'offer/status/change', 'offer/order/add_free_order'} for c in session.calls)
 
 
-def test_wrong_name_and_ambiguous_status_fail_closed(env):
+def test_global_status_read_does_not_require_system_contact_and_ambiguous_status_fails_closed(env):
     session, pipe = env
     session.data['contacts/get_from_filter'][-1]['TITLE'] = 'Другой клиент'
-    assert 'не подтверждён' in send(pipe, 'покажи быстрые сделки').answer
-    session.data['contacts/get_from_filter'][-1]['TITLE'] = '1111 быстрые сделки'
+    assert send(pipe, 'покажи быстрые сделки').choices
     session.data['offer/all_statuses']['52'] = {'STATUS_ID': 52, 'BOARD_ID': 2, 'TITLE': 'Быстрые сделки', 'ACTIVE': 'Y'}
     assert 'не найдены однозначно' in send(pipe, 'покажи быстрые сделки').answer
 

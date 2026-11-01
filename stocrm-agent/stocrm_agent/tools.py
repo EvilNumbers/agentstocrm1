@@ -722,6 +722,16 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     self._cache.pop(cache_key, None)
 
     def _read(self, tool: str, method: str, payload: dict[str, Any] | None = None) -> Any:
+        if method == 'offers/get_from_filter':
+            # WIKI-A-593/595: запрашиваем поля, нужные для идентификации и карточки,
+            # явно; панель может не включать некоторые поля по умолчанию.
+            payload = dict(payload or {})
+            required = payload.get('REQUIRED_FIELDS') or []
+            if not isinstance(required, list):
+                raise ValueError('Неизвестный формат REQUIRED_FIELDS')
+            fields = ('OFFER_ID', 'CONTACT_ID', 'BOARD_ID', 'STATUS_ID', 'CONTACT_TITLE',
+                      'BOARD_NAME', 'STATUS_NAME', 'OFFER_SUM', 'WORKS_SUM', 'ORDERS_SUM', 'PAYMENT_STATUS')
+            payload['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields]))
         # Динамические данные объединяются только пока HTTP в полёте (TTL=0).
         # Небольшой буфер завершённых ответов — лишь для справочников.
         stable = {"boards/get_all", "offer/all_statuses", "users/get_from_filter",
@@ -928,6 +938,52 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 break
         return None, seen
 
+    def offer_identity_diagnostic(self, offer_id: int) -> dict[str, Any]:
+        """Только свежая проверка полей сделки, без вывода содержимого CRM."""
+        offer_id = int(offer_id)
+        if offer_id <= 0:
+            raise ValueError('Нужен положительный номер сделки')
+        try:
+            row, _ = self._search_offer_row(offer_id)
+        except Exception:  # noqa: BLE001 — сырой текст может содержать секреты
+            return {'status': 'error'}
+        if not row:
+            return {'status': 'not_found'}
+        def number(value: Any) -> int | None:
+            if isinstance(value, bool) or not re.fullmatch(r'[1-9][0-9]{0,19}', str(value)):
+                return None
+            return int(value)
+        return {'status': 'ok',
+                'offer_id_matches': number(row.get('OFFER_ID')) == offer_id,
+                'contact_id_present': number(row.get('CONTACT_ID')) is not None,
+                'board_id': number(row.get('BOARD_ID')),
+                'status_id': number(row.get('STATUS_ID')),
+                'status_name_present': isinstance(row.get('STATUS_NAME'), str) and bool(row.get('STATUS_NAME', '').strip())}
+
+    def balance_diagnostic(self, offer_id: int) -> dict[str, Any]:
+        """Только структура ответа и флаги проверки; суммы и данные клиента не возвращаем."""
+        offer_id = int(offer_id)
+        if offer_id <= 0:
+            raise ValueError('Нужен положительный номер сделки')
+        try:
+            balance = self._read('balance_diagnostic', 'payment/get_balance',
+                                 {'ENTITY_ID': offer_id, 'ENTITY_TYPE': 'OFFER'})
+        except Exception:  # noqa: BLE001 — сырые ошибки могут содержать секреты
+            return {'status': 'error'}
+        kind = ('null' if balance is None else 'boolean' if isinstance(balance, bool) else
+                'object' if isinstance(balance, dict) else 'array' if isinstance(balance, list) else 'other')
+        result: dict[str, Any] = {'status': 'ok', 'response_type': kind}
+        if not isinstance(balance, dict):
+            return result
+        rub = [v for k, v in balance.items() if isinstance(k, str) and k.startswith('RUB_')]
+        result['rub_count'] = len(rub)
+        result['known_wrappers'] = [key for key in ('DATA', 'ITEMS', 'BALANCE', 'BALANCES', 'RESPONSE') if key in balance]
+        result['malformed_rows'] = sum(not isinstance(v, dict) for v in rub)
+        result['invalid_amounts'] = sum(not isinstance(v, dict) or _known_work_sum(v.get('CURRENCY_VALUE')) is None for v in rub)
+        result['missing_entity'] = sum(isinstance(v, dict) and (v.get('ENTITY_ID') in (None, False, '') or v.get('ENTITY_TYPE') in (None, False, '')) for v in rub)
+        result['wrong_entity'] = sum(isinstance(v, dict) and ((v.get('ENTITY_ID') not in (None, False, '') and not _same_id(v.get('ENTITY_ID'), offer_id)) or (v.get('ENTITY_TYPE') not in (None, False, '', 'OFFER'))) for v in rub)
+        return result
+
     def offer_card(self, offer_id: int, *, with_items: bool = False) -> dict[str, Any]:
         """Карточка сделки.
 
@@ -1005,9 +1061,11 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         total = _known_work_sum(row.get("OFFER_SUM"))
         rub = {k: v for k, v in (balance or {}).items() if str(k).startswith("RUB_")} if isinstance(balance, dict) else {}
         amounts = [_known_work_sum(v.get("CURRENCY_VALUE")) if isinstance(v, dict) else None for v in rub.values()]
+        # Без номера и типа источника нельзя доказать, что баланс относится к этой
+        # сделке. В документированном ответе оба поля присутствуют (WIKI-A-612).
         balance_known = bool(rub) and all(v is not None for v in amounts) and all(
-            isinstance(v, dict) and (v.get("ENTITY_ID") in (None, False, "") or str(v.get("ENTITY_ID")) == str(offer_id))
-            and (v.get("ENTITY_TYPE") in (None, False, "", "OFFER"))
+            isinstance(v, dict) and v.get("ENTITY_ID") not in (None, False, "")
+            and _same_id(v.get("ENTITY_ID"), offer_id) and v.get("ENTITY_TYPE") == "OFFER"
             for v in rub.values()
         )
         if total is not None and balance_known:
@@ -1038,11 +1096,15 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "offer_works", "work/get_filtered",
             {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"WORK_ID": "ASC"}, "PAGE": 1, "LIMIT": limit},
         )
+        if raw is None or isinstance(raw, bool):
+            raise ValueError("CRM не подтвердила список работ")
         rows = _as_items(raw.get("DATA") if isinstance(raw, dict) and "DATA" in raw else raw)
         out = []
         for r in rows[:limit]:
+            if not isinstance(r, dict) or r.get("OFFER_ID") in (None, False, ""):
+                raise ValueError("CRM вернула работу без номера сделки; принадлежность не подтверждена")
             row_offer = r.get("OFFER_ID")
-            if row_offer not in (None, False, "") and int(row_offer) != int(offer_id):
+            if not _same_id(row_offer, offer_id):
                 continue
             performers = r.get("PERFORMERS")
             names: list[dict[str, Any]] = []

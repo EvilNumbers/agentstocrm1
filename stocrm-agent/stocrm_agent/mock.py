@@ -538,6 +538,11 @@ class MockSession:
         data = self.data.get(method)
         if data is None:
             return MockResponse({"CODE": 404, "MESSAGE": f"demo: метод {method} не замокан", "RESPONSE": False}, 200)
+        if method == 'payment/get_balance' and isinstance(data, dict):
+            # Документированный ответ содержит ID сделки и тип сущности. В тестах
+            # можно явно задать чужой ID или тип для проверки отказа.
+            data = {k: ({'ENTITY_ID': body.get('ENTITY_ID'), 'ENTITY_TYPE': body.get('ENTITY_TYPE'), **v}
+                        if isinstance(v, dict) else v) for k, v in data.items()}
         return MockResponse({"CODE": 200, "MESSAGE": "ok", "RESPONSE": _apply_query(data, json)})
 
     def get(self, url: str, params: Any = None, timeout: float | None = None) -> MockResponse:

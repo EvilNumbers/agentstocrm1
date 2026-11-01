@@ -244,6 +244,7 @@ _STATUS_TITLES: dict[str, set[str]] = {
     "estimate": {"просчет", "в просчете", "просчет запчастей", "проценка", "проценка запчастей"},
     "estimate_parts": {"просчет запчастей", "проценка запчастей"},
     "assembled": {"заказ собран", "заказы собраны", "собранный заказ", "собранные заказы", "собрано", "собран"},
+    "waiting_payment": {"ожидает оплаты", "ожидание оплаты", "в ожидании оплаты"},
 }
 _PREFIX = r"(?:(?:покажи|покажите|найди|найдите|дай|дайте|какие|выведи|выведите|список)\s+)?(?:(?:мне|нам|все|всё|последние|сейчас|у нас|список)\s+)*"
 _SUBJECT = r"(?:сделки|сделок|сделку|заказы|заказов|заказ-наряды|заказ наряды|наряды|что)"
@@ -252,6 +253,10 @@ _CATEGORY_REQUEST = re.compile(
     _PREFIX + _SUBJECT + r"(?:\s+(?:сейчас|у нас|которые))?\s+(?:в|на)\s+"
     r"(?P<stage>записи|заказе|просч[её]те(?:\s+запчаст(?:ей|и|ями))?|проценке(?:\s+запчаст(?:ей|и|ями))?)"
     r"(?:\s+сейчас)?" + _BOARD_SUFFIX, re.I)
+_PAYMENT_WAIT_REQUEST = re.compile(
+    _PREFIX + _SUBJECT + r"(?:\s+(?:сейчас|у нас))?\s+"
+    r"(?:(?:которые\s+)?(?:в\s+ожидании\s+оплаты|ожидают\s+оплаты)|"
+    r"ожидающие\s+оплаты)(?:\s+сейчас)?" + _BOARD_SUFFIX, re.I)
 _ASSEMBLED_REQUEST = re.compile(
     _PREFIX + r"(?:(?:собранные|собранных)\s+(?:заказы|заказов|сделки|сделок|заказ-наряды)|"
     r"(?:заказы|сделки|заказ-наряды)\s+(?:собраны|собранные))"
@@ -261,7 +266,8 @@ _EXPLICIT_REQUEST = re.compile(
     r"(?P<title>[^!?]{1,100}?)" + _BOARD_SUFFIX, re.I)
 _STATUS_MARKERS = re.compile(
     r"\b(?:в|на)\s+(?:работе|записи|заказе|просч[её]те|проценке)\b|"
-    r"\bсобранн\w*\b|\bсобраны\b|\b(?:статусе|статусом|статусу)\b", re.I)
+    r"\bсобранн\w*\b|\bсобраны\b|\b(?:статусе|статусом|статусу)\b|"
+    r"\b(?:ожидают|ожидающие)\s+оплаты\b", re.I)
 _LIST_SUBJECT = re.compile(r"\b(?:сделки|сделок|заказы|заказов|наряды|заказ-наряды)\b", re.I)
 _WRITE_ACTION = re.compile(r"\b(?:добав\w*|созда\w*|измен\w*|помен\w*|удал\w*|перевед\w*|"
                            r"перевод\w*|смени\w*|назнач\w*|запиш\w*|записать|собери\w*|собрать|отмен\w*)\b", re.I)
@@ -290,6 +296,9 @@ def _status_request(text: str) -> dict[str, str | None] | None:
     if explicit:
         return {"kind": "explicit", "board": explicit.group("board"),
                 "title": explicit.group("title").strip().rstrip(".").strip(' «»"')}
+    waiting_payment = _PAYMENT_WAIT_REQUEST.fullmatch(message)
+    if waiting_payment:
+        return {"kind": "waiting_payment", "board": waiting_payment.group("board")}
     assembled = _ASSEMBLED_REQUEST.fullmatch(message)
     if assembled:
         return {"kind": "assembled", "board": assembled.group("board")}
