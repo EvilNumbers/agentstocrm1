@@ -304,7 +304,7 @@ def _safe_str(name: str, value: Any) -> str | None:
         allowed = {'pending', 'applying', 'applied', 'partial', 'discarded', 'error', 'reply', 'cancelled',
                    'ok', 'unknown', 'quick', 'status_list', 'deal_detail', 'other', 'text', 'voice',
                    'warning', 'info', 'critical', 'post', 'get', 'new', 'existing',
-                   'create_sent', 'created', 'status_sent', 'status_confirmed', 'work_sent', 'work_check',
+                   'create_sent', 'created', 'status_sent', 'status_confirmed', 'status_response', 'work_sent', 'work_check',
                    'work_confirmed', 'work_before', 'require_sent', 'require_received', 'require_confirmed', 'order_sent',
                    'order_check', 'order_confirmed', 'prepare', 'start', 'finish', 'empty', 'failed', 'html', 'server_error', 'unstructured'}
         return value if value.lower() in allowed else 'other'

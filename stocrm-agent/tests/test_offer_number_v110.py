@@ -22,7 +22,7 @@ def test_explicit_number_uses_only_deal_and_works_without_contact(env, monkeypat
     result = send(pipe, 'быстрая сделка №1900 диагностика 1000 рублей')
     assert len(result.drafts) == 1, result.answer
     draft = result.drafts[0]
-    assert '№1900' in draft['summary'] and 'контакт изменится' in draft['summary']
+    assert '№1900' in draft['summary'] and 'без проверки' in draft['summary']
     assert not writes(session)
     assert tools.apply_draft(draft['token'])['status'] == 'applied'
     assert [x['payload']['DATA']['OFFER_ID'] for x in writes(session)] == [1900]
@@ -70,7 +70,7 @@ def test_contact_changes_after_creation_but_number_is_followed(env, monkeypatch,
 def test_new_creation_uses_system_contact_but_does_not_verify_row_contact(env, monkeypatch):
     session, tools, pipe = env
     selection = send(pipe, 'новая быстрая сделка диагностика 1000 рублей').drafts[0]
-    assert 'фактический контакт сделки не сверяется' in selection['summary']
+    assert 'Фактический перевод и контакт не сверяются' in selection['summary']
     original = tools._search_offer_row
     def wrong_initial(oid):
         row, n = original(oid)
@@ -117,18 +117,17 @@ def test_list_and_card_do_not_require_contact_id(env, monkeypatch):
     assert not writes(session)
 
 
-def test_selected_status_must_match_before_confirmation_and_apply(env):
+def test_explicit_number_does_not_require_any_status_before_confirmation_or_apply(env):
     session, tools, pipe = env
     existing(session, 1900)
     row = session.data['offers/get_from_filter'][-1]
-    row['STATUS_NAME'] = 'Мусор'
-    assert not send(pipe, 'быстрая сделка №1900 диагностика 1000 рублей').drafts
-    row['STATUS_NAME'] = 'Быстрые сделки'
+    row.update(STATUS_NAME='Мусор', CONTACT_ID=9999, BOARD_ID=7)
     draft = send(pipe, 'быстрая сделка №1900 диагностика 1000 рублей').drafts[0]
-    row['STATUS_NAME'] = 'Мусор'
-    with pytest.raises(ValueError):
-        tools.apply_draft(draft['token'])
+    row['STATUS_NAME'] = 'Запись'
     assert not writes(session)
+    assert tools.apply_draft(draft['token'])['status'] == 'applied'
+    assert [x['method'] for x in writes(session)] == ['work/add']
+    assert writes(session)[0]['payload']['DATA']['OFFER_ID'] == 1900
 
 
 def test_existing_foreign_number_from_creation_is_rejected(env, monkeypatch):

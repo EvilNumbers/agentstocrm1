@@ -341,7 +341,22 @@ _MIXED_PART_HINT = re.compile(r"\b(?:артикул\w*|запчаст\w*|дет�
 
 def _mixed_work_and_part(text: str) -> bool:
     """Не превращаем составную просьбу в одиночную позицию без предупреждения."""
-    return bool(_ADD_VERB.search(text) and _MIXED_WORK_HINT.search(text) and _MIXED_PART_HINT.search(text))
+    part = _MIXED_PART_HINT.search(text)
+    if not _ADD_VERB.search(text) or not part:
+        return False
+    if _MIXED_WORK_HINT.search(text):
+        return True
+    # Работа с произвольным названием до артикула не должна молча исчезнуть.
+    prefix = quick_parse._DEAL_REF.sub(' ', text[:part.start()])
+    prefix = re.sub(r'\b(?:в\s+)?сделк\w*\b|\b(?:добав\w*|внес\w*)\b', ' ', prefix, flags=re.I)
+    if re.search(r'\d\s*(?:руб\w*\.?|₽)?\s*(?:,|;|\bи\b)\s*$', prefix, re.I):
+        return True
+    # Даже без цены неизвестная услуга до «и артикул» не должна пропасть.
+    before_and = re.search(r'^(.*?)\bи\s*$', prefix, re.I)
+    if before_and:
+        words = re.sub(r'\b(?:мне|нам|пожалуйста|ещ[её]|шт|штук\w*)\b|\d+', ' ', before_and.group(1), flags=re.I)
+        return bool(re.search(r'[а-яёa-z]{3}', words, re.I))
+    return False
 #: «за 1000», «на 1 000 ₽», «стоимостью 500» — где заканчивается название услуги.
 _WORK_PRICE_CUT = re.compile(
     r"\b(?:за|по|стоимостью|цена|ценой|итого)\b", re.IGNORECASE)
@@ -2702,11 +2717,15 @@ class BotPipeline:
                 self._quick_choices[user_id] = choice
                 return PipelineResult(answer=question, choices=[choice])
             return PipelineResult(answer=f"Не удалось подтвердить бренд артикула {sku}. Некоторые источники могут быть недоступны или поиск неполон — отсутствие товара не доказано. Введите бренд вручную или напишите «отмена». Цена и остальные позиции сохранены; запись не начата.")
+        if plan.get('ordinary_mixed') and not plan.get('offer_id'):
+            self._quick_pending[user_id] = {'plan': plan, 'at': time.time(), 'stage': 'offer_id'}
+            return PipelineResult(answer='В какую сделку добавить услугу и товар? Укажите номер сделки. Запись ещё не начата.')
         self._quick_pending.pop(user_id, None)
         try:
-            # Просмотр и выбор существующих сделок не зависят от контакта.
-            ids = quick_read.identity(self.tools) if plan['new'] else (0, *quick_read.status_identity(self.tools))
+            # Для указанного номера не запрашиваем справочник статусов или контакт.
             selected = plan.get("offer_id")
+            ids = (quick_read.identity(self.tools) if plan['new'] else
+                   (0, 0, 0) if selected else (0, *quick_read.status_identity(self.tools)))
             # Указанный номер проверяется точечно в prepare, а не сканированием всех сделок.
             rows = [] if plan["new"] or selected else quick_read.offers(self.tools, ids)
             if plan.get('existing_only') and not selected and not rows:
@@ -2736,7 +2755,7 @@ class BotPipeline:
             self._quick_choices[user_id] = choice
             return PipelineResult(choices=[choice])
         except Exception as exc:
-            return PipelineResult(answer=f"Не удалось подготовить быструю сделку: {exc}. Ничего не записано.")
+            return PipelineResult(answer=f"Не удалось подготовить составную запись: {exc}. Ничего не записано.")
 
     def _quick_price_reply(self, text: str, user_id: int) -> PipelineResult | None:
         pending = self._quick_pending.get(user_id)
@@ -2748,6 +2767,15 @@ class BotPipeline:
         if re.fullmatch(r"\s*(?:отмена|отменить|нет)\s*", text, re.I):
             self._quick_pending.pop(user_id, None)
             return PipelineResult(answer="Отменено. Ничего не записано.")
+        if pending.get('stage') == 'offer_id':
+            if _looks_like_new_request(text.lower()):
+                self._quick_pending.pop(user_id, None)
+                return None
+            match = re.fullmatch(r'\s*(?:(?:сделк(?:а|у|е|и|ой)\s*)?(?:№|#|номер\s*)?\s*)(\d+)\s*[.!]?\s*', text, re.I)
+            if not match or int(match.group(1)) <= 0:
+                return PipelineResult(answer='Укажите положительный номер сделки или напишите «отмена». Ничего не записано.')
+            pending['plan']['offer_id'] = int(match.group(1))
+            return self._quick_continue(pending['plan'], user_id)
         if pending.get('stage') == 'brand':
             if _looks_like_new_request(text.lower()):
                 self._quick_pending.pop(user_id, None)
@@ -2801,9 +2829,7 @@ class BotPipeline:
                 plan["reason_id"] = choice["offers"][index]
                 plan["new"] = True
                 return self._quick_continue(plan, user_id)
-            ids = (0, *quick_read.status_identity(self.tools))
-            if ids[1] != choice["ids"][1]:
-                raise ValueError("Воронка статуса изменилась; повторите список")
+            ids = choice["ids"]
             if choice.get("kind") == "quick_select":
                 from ..quick_deal import prepare
                 oid = choice["offers"][index] if index < len(choice["offers"]) else None
@@ -2881,7 +2907,13 @@ class BotPipeline:
             del history[:max(0, len(history) - self.s.max_history_messages)]
             return PipelineResult(answer=body)
         if _mixed_work_and_part(text):
-            return PipelineResult(answer='В запросе вижу и услугу, и товар. Для обычной сделки пока не могу безопасно обработать их вместе: ничего не подготовлено и не записано. Сначала проверьте позиции в CRM, чтобы не создать дубль; затем попросите отдельно добавить услугу и отдельно товар, указав номер сделки и цену каждой позиции.')
+            self._quick_pending.pop(user_id or 0, None)
+            self._quick_choices.pop(user_id or 0, None)
+            try:
+                plan = quick_parse.parse_existing_mixed(text)
+                return await asyncio.to_thread(self._quick_continue, plan, user_id or 0)
+            except Exception as exc:
+                return PipelineResult(answer=f'Не удалось однозначно разобрать услугу и товар: {exc}. Ничего не записано. Укажите номер сделки, одну услугу с ценой и артикул с брендом и ценой.')
         self._quick_choices.pop(user_id or 0, None)
         quick_price = await asyncio.to_thread(self._quick_price_reply, text, user_id or 0)
         if quick_price is not None:

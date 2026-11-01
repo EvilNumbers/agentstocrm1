@@ -42,7 +42,7 @@ def test_name_check_and_all_positions_without_any_row_status_id(env, monkeypatch
 
 
 @pytest.mark.parametrize('name', [None, '', 'Мусор', 'Быстрые сделки другой статус'])
-def test_wrong_or_missing_name_after_status_stops_before_items(env, monkeypatch, name):
+def test_wrong_or_missing_name_after_status_does_not_stop_numbered_items(env, monkeypatch, name):
     session, tools, pipe = env
     selected = draft(pipe)
     original = tools._search_offer_row
@@ -54,11 +54,10 @@ def test_wrong_or_missing_name_after_status_stops_before_items(env, monkeypatch,
     monkeypatch.setattr(tools, '_search_offer_row', changed)
     monkeypatch.setattr(quick_deal.time, 'sleep', lambda _: None)
     result = tools.apply_draft(selected['token'])
-    assert result['status'] == 'partial' and not result['verified']
-    assert [x['method'] for x in writes(session)] == ['offer/new/with_contact', 'offer/status/change']
+    assert result['status'] == 'applied' and result['result']['status_not_read_back']
+    assert [x['method'] for x in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order']
     with pytest.raises(ValueError):
         tools.apply_draft(selected['token'])
-    assert not send(pipe, 'новая быстрая сделка диагностика 1000 рублей').drafts
 
 
 def test_name_is_authoritative_even_when_id_mismatches(env, monkeypatch):
@@ -160,7 +159,7 @@ def test_moves_before_first_item_after_initial_name_confirmation(env, monkeypatc
     assert [x['method'] for x in writes(session)][-3:] == ['work/add', 'offer/require/add', 'offer/order/add_free_order']
 
 
-def test_duplicate_name_in_directory_stops_after_status_change(env, monkeypatch):
+def test_duplicate_name_in_directory_after_status_change_does_not_block_items(env, monkeypatch):
     session, tools, pipe = env
     selected = draft(pipe)
     original = tools.client.call
@@ -172,8 +171,8 @@ def test_duplicate_name_in_directory_stops_after_status_change(env, monkeypatch)
     monkeypatch.setattr(tools.client, 'call', add_ambiguous)
     monkeypatch.setattr(quick_deal.time, 'sleep', lambda _: None)
     result = tools.apply_draft(selected['token'])
-    assert result['status'] == 'partial'
-    assert [x['method'] for x in writes(session)] == ['offer/new/with_contact', 'offer/status/change']
+    assert result['status'] == 'applied' and result['result']['status_not_read_back']
+    assert [x['method'] for x in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order']
 
 
 def test_old_pending_draft_requires_fresh_confirmation(env):
