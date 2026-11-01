@@ -128,7 +128,7 @@ def _short_title(text: str, limit: int = 26) -> str:
     return clean if len(clean) <= limit else clean[: limit - 1].rstrip() + "…"
 
 
-def drafts_keyboard(drafts: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
+def drafts_keyboard(drafts: list[dict[str, Any]], *, quick_page: int = 0) -> InlineKeyboardMarkup | None:
     rows = []
     for number, draft in enumerate(drafts, 1):
         token = draft.get("token")
@@ -136,6 +136,10 @@ def drafts_keyboard(drafts: list[dict[str, Any]]) -> InlineKeyboardMarkup | None
             continue
         if draft.get("batch_preparing"):
             rows.append([InlineKeyboardButton(text="❌ Отменить незавершённую сборку", callback_data=f"dr:{token}")])
+            continue
+        if draft.get("status") == "partial" and draft.get("tool") == "quick_deal":
+            rows.append([InlineKeyboardButton(text="🔎 Проверил CRM: снять блокировку", callback_data=f"qm:{token}")])
+            rows.append([InlineKeyboardButton(text="🗑 Убрать из списка (блокировка останется)", callback_data=f"ra:{token}")])
             continue
         if draft.get("status") == "partial":
             rows.extend([
@@ -155,23 +159,66 @@ def drafts_keyboard(drafts: list[dict[str, Any]]) -> InlineKeyboardMarkup | None
             InlineKeyboardButton(text=label, callback_data=f"ap:{token}"),
             InlineKeyboardButton(text="❌ Отмена", callback_data=f"dr:{token}"),
         ])
-        # Несколько позиций в одном черновике: каждую можно убрать отдельно,
-        # не отменяя всю просьбу (номер — как в списке выше).
-        if not items or len(items) < 2:
+        if draft.get("tool") == "quick_deal" and draft.get("status") == "pending":
+            from ..quick_deal import positions
+            quick_items = positions(draft.get("payload") or {})
+            pages = max(1, (len(quick_items) + DROP_BUTTONS_LIMIT - 1) // DROP_BUTTONS_LIMIT)
+            page = max(0, min(quick_page, pages - 1))
+            for index in range(page * DROP_BUTTONS_LIMIT, min((page + 1) * DROP_BUTTONS_LIMIT, len(quick_items))):
+                item = quick_items[index]
+                title = ("Работа: " if item["kind"] == "work" else "Артикул: ") + item["title"]
+                rows.append([InlineKeyboardButton(text=f"✂️ {index + 1}. {_short_title(title, 48)}", callback_data=f"dp:{token}:{index + 1}")])
+            navigation = []
+            if page:
+                navigation.append(InlineKeyboardButton(text="← Позиции", callback_data=f"qpg:{token}:{page - 1}"))
+            if page + 1 < pages:
+                navigation.append(InlineKeyboardButton(text="Позиции →", callback_data=f"qpg:{token}:{page + 1}"))
+            if navigation:
+                rows.append(navigation)
             continue
+        if (check.get("kind") in ("added_work", "added_line") and draft.get("status") == "pending"):
+            title = check.get("title") or check.get("name") or check.get("sku") or "позиция"
+            kind = "Работа" if check.get("kind") == "added_work" else "Товар"
+            rows.append([InlineKeyboardButton(text=f"✂️ Убрать {kind.lower()}: {_short_title(str(title), 35)}", callback_data=f"dp:{token}:1")])
+            continue
+        if not items or draft.get("status") != "pending":
+            continue
+        pages = max(1, (len(items) + DROP_BUTTONS_LIMIT - 1) // DROP_BUTTONS_LIMIT)
+        page = max(0, min(quick_page, pages - 1))
         line: list[InlineKeyboardButton] = []
-        for number, item in enumerate(items[:DROP_BUTTONS_LIMIT], 1):
+        for index in range(page * DROP_BUTTONS_LIMIT, min((page + 1) * DROP_BUTTONS_LIMIT, len(items))):
+            item = items[index]
             title = item.get("name") or item.get("sku") or "позиция"
-            line.append(InlineKeyboardButton(
-                text=f"✂️ {number}. {_short_title(title, 18)}",
-                callback_data=f"dp:{token}:{number}",
-            ))
+            line.append(InlineKeyboardButton(text=f"✂️ {index + 1}. {_short_title(title, 18)}", callback_data=f"dp:{token}:{index + 1}"))
             if len(line) == 2:
                 rows.append(line)
                 line = []
         if line:
             rows.append(line)
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton(text="← Позиции", callback_data=f"qpg:{token}:{page - 1}"))
+        if page + 1 < pages:
+            navigation.append(InlineKeyboardButton(text="Позиции →", callback_data=f"qpg:{token}:{page + 1}"))
+        if navigation:
+            rows.append(navigation)
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def quick_choice_keyboard(token: str, choice: dict[str, Any]) -> InlineKeyboardMarkup:
+    kind = choice.get('kind')
+    if kind == 'quick_reason':
+        labels = [str(r['title']) for r in choice['reasons']]
+    elif kind == 'quick_brand':
+        labels = [f"{c.get('brand')} · {c.get('sku')} · {c.get('source') or 'источник'}" for c in choice['candidates']]
+    else:
+        labels = [f"📋 Сделка №{oid}" for oid in choice['offers']]
+    rows = [[InlineKeyboardButton(text=label[:100], callback_data=f"quick:{token}:{index}")]
+            for index, label in enumerate(labels)]
+    if kind in ('quick_select', 'quick_brand'):
+        label = '➕ Создать новую' if kind == 'quick_select' else '✍️ Ввести бренд вручную'
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"quick:{token}:{len(labels)}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 CHOICES_PER_PAGE = 6
@@ -644,6 +691,12 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             # Спрашиваем исполнителя ДО создания черновика; кнопки подтверждения покажем после выбора.
             for choice in result.choices:
                 token = remember_choice(choice)
+                if choice.get("kind") in ("quick_read", "quick_select", "quick_reason", "quick_brand"):
+                    keyboard = quick_choice_keyboard(token, choice)
+                    pieces = chunk(choice["question"])
+                    for index, piece in enumerate(pieces):
+                        await message.answer(piece, reply_markup=keyboard if index == len(pieces) - 1 else None)
+                    continue
                 if choice.get("kind") == "part":
                     await message.answer(render_part_choice(choice),
                                          reply_markup=part_keyboard(token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}))
@@ -884,11 +937,12 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
     async def cmd_drafts(message: Message) -> None:
         pending = tools.drafts.list("pending")
         partial = tools.drafts.list("partial")
+        applying_quick = [d for d in tools.drafts.list("applying") if d.get("tool") == "quick_deal"]
         archived = [d for d in tools.drafts.list("all") if d.get("archived_partial") or (
             d.get("tool") == "add_offer_part" and d.get("status") in {"applied", "discarded"}
             and not (d.get("review") or {}).get("verified") and not d.get("merged_into")
             and (d.get("check_warning") or (d.get("status") == "discarded" and d.get("done_steps"))))]
-        if not pending and not partial and not archived:
+        if not pending and not partial and not archived and not applying_quick:
             await message.answer("Черновиков нет.")
             return
         if pending:
@@ -896,6 +950,11 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 "Ожидают подтверждения:\n" + render_drafts(pending),
                 reply_markup=drafts_keyboard(pending),
             )
+        if applying_quick:
+            stale = [d for d in applying_quick if time.time() - float(d.get("quick_touched_at") or d.get("claimed_at") or time.time()) >= 3600]
+            lines = [f"{i}. {d['summary']} — этап: {d.get('quick_stage') or 'выполняется'}" for i, d in enumerate(applying_quick, 1)]
+            await message.answer("Заявки выполняются или прервались. Не повторяйте; после часа без обновлений проверьте CRM вручную:\n" + "\n".join(lines),
+                                 reply_markup=drafts_keyboard([{**d, "status": "partial"} for d in stale]))
         if partial:
             lines = [f"{number}. ⚠️ {d['summary']} — требует проверки; целиком повторять нельзя" for number, d in enumerate(partial, 1)]
             await message.answer("Требуют проверки в STOCRM:\n" + "\n".join(lines), reply_markup=drafts_keyboard(partial))
@@ -1063,6 +1122,39 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         if await _pending_access_add(message, actor_of(message.from_user)):
             return
         await message.answer("Пришлите голосовое сообщение, аудиофайл или текст.")
+
+    @router.callback_query(F.data.startswith("quick:"))
+    async def on_quick_choice(callback: CallbackQuery) -> None:
+        parts = (callback.data or "").split(":")
+        entry = pending_choices.get(parts[1]) if len(parts) == 3 else None
+        choice: dict[str, Any] = (entry or {}).get("choice") or {}
+        user_id = callback.from_user.id
+        if (not entry or choice.get("kind") not in ("quick_read", "quick_select", "quick_reason", "quick_brand") or choice.get("owner") != user_id
+                or time.time() - entry["created_at"] > 1800
+                or pipeline._quick_choices.get(user_id) is not choice):
+            await callback.answer("Выбор устарел или принадлежит другому сотруднику.", show_alert=True)
+            return
+        size = len(choice.get("offers") or []) + (1 if choice.get("kind") in ("quick_select", "quick_brand") else 0)
+        if not parts[2].isdigit() or int(parts[2]) >= size:
+            await callback.answer("Некорректная кнопка", show_alert=True)
+            return
+        pending_choices.pop(parts[1], None)
+        await callback.answer()
+        result = await asyncio.to_thread(pipeline.quick_read_choice, choice, user_id, int(parts[2]))
+        if isinstance(callback.message, Message):
+            with contextlib.suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            if result.choices and result.choices[0].get("kind") in ("quick_read", "quick_select", "quick_reason", "quick_brand"):
+                next_choice = result.choices[0]
+                next_token = remember_choice(next_choice)
+                await callback.message.answer(next_choice["question"], reply_markup=quick_choice_keyboard(next_token, next_choice))
+                return
+            body = result.answer or "Готово."
+            if result.drafts:
+                body += "\n\n" + drafts_block(result.drafts, body)
+            pieces = chunk(body)
+            for index, piece in enumerate(pieces):
+                await callback.message.answer(piece, reply_markup=drafts_keyboard(result.drafts) if index == 0 else None)
 
     @router.callback_query(F.data.startswith("book:"))
     async def on_booking_choice(callback: CallbackQuery) -> None:
@@ -1375,13 +1467,60 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             await callback.message.answer(text_out, reply_markup=drafts_keyboard(result.drafts))
         await callback.answer("Продолжаем" if result.choices else "Готово")
 
+    @router.callback_query(F.data.startswith("qpg:"))
+    async def on_quick_draft_page(callback: CallbackQuery) -> None:
+        data = (callback.data or '').split(':')
+        if len(data) != 3 or not data[2].isdigit():
+            await callback.answer("Некорректная страница", show_alert=True)
+            return
+        try:
+            draft = tools.drafts.verify(data[1])
+            if draft.get('tool') == 'quick_deal':
+                from ..quick_deal import positions
+                count = len(positions(draft['payload']))
+            elif (draft.get('check') or {}).get('kind') == 'added_lines':
+                count = len(draft['check'].get('items') or [])
+            else:
+                raise ValueError('Неподдерживаемый черновик')
+            pages = max(1, (count + DROP_BUTTONS_LIMIT - 1) // DROP_BUTTONS_LIMIT)
+            page = int(data[2])
+            if not 0 <= page < pages:
+                raise ValueError('Страница устарела')
+        except (ValueError, KeyError):
+            await callback.answer("Черновик устарел или закрыт", show_alert=True)
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await callback.message.answer(f"Позиции черновика: страница {page + 1} из {pages}. Нажмите ✂️ для удаления, затем проверьте новый состав.", reply_markup=drafts_keyboard([draft], quick_page=page))
+
     # ---------------------------------------------------------- подтверждение
-    @router.callback_query(F.data.startswith(("ap:", "dr:", "dp:", "rv:", "rc:", "rp:", "ra:", "rx:")))
+    @router.callback_query(F.data.startswith(("ap:", "dr:", "dp:", "rv:", "rc:", "rp:", "ra:", "rx:", "qm:", "qc:")))
     async def on_callback(callback: CallbackQuery) -> None:
         action, _, token = (callback.data or "").partition(":")
         actor = callback.from_user
         try:
-            if action in ("ra", "rx") or (action == "dr" and tools.drafts.get(token).get("status") == "partial"):
+            if action == "qm" and token == "cancel":
+                await callback.answer("Блокировка сохранена")
+                return
+            if action in ("qm", "qc"):
+                if not is_admin(actor):
+                    await callback.answer("Снять блокировку может только администратор после проверки CRM.", show_alert=True)
+                    return
+                draft = tools.drafts.get(token)
+                if draft.get("tool") != "quick_deal" or not (draft.get("status") in ("partial", "applying") or draft.get("archived_partial")):
+                    raise ValueError("Этот черновик больше не требует ручной проверки")
+                if draft.get("status") == "applying" and time.time() - float(draft.get("quick_touched_at") or draft.get("claimed_at") or time.time()) < 3600:
+                    raise ValueError("Заявка может ещё выполняться; дождитесь завершения")
+                if action == "qm":
+                    info = str(draft.get("check_warning") or "Результат не подтверждён")
+                    await safe_edit(_cb_msg(callback), "Проверьте сделку и каждый этап в CRM. " + info + "\n\nТолько после проверки разрешить новые заявки? Старую запись бот не повторит.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="Да, CRM проверена — снять блокировку", callback_data=f"qc:{token}"),
+                        InlineKeyboardButton(text="Оставить блокировку", callback_data=f"qm:cancel")]]))
+                else:
+                    tools.drafts.resolve_quick_manually(token, user_id=actor.id)
+                    tools.audit.write("bot.quick_manual_review", token=token, user_id=actor.id)
+                    await safe_edit(_cb_msg(callback), "Блокировка снята по вашему подтверждению. Старую заявку не повторял; учитывайте уже выполненные шаги.")
+            elif action in ("ra", "rx") or (action == "dr" and tools.drafts.get(token).get("status") == "partial"):
                 if action != "rx":
                     await safe_edit(_cb_msg(callback), "Убрать черновик из списка? Это НЕ удалит и НЕ отменит уже созданные позиции в CRM.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="Да, убрать из списка", callback_data=f"rx:{token}"),
@@ -1420,6 +1559,10 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                                     "В сделке ничего не изменилось.")
                     return
                 updated = dict(outcome.get("draft") or {})
+                owner_key = actor.id if actor else 0
+                batch = pipeline._part_batch.get(owner_key)
+                if batch and batch.get("token") == token:
+                    pipeline._part_batch[owner_key] = {**batch, "token": updated.get("token"), "at": time.time()}
                 text_out = (f"✂️ Убрал: {outcome.get('removed')}. "
                             f"Осталось позиций: {outcome.get('left')}.\n\n"
                             + render_drafts([updated]))
@@ -1439,6 +1582,8 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                                                    "API принял запрос, но результат в карточке не перечитан. Проверьте его в STOCRM."
                                                    if result.get("verified") is False else "")))
                 await safe_edit(_cb_msg(callback), text)
+                if result.get("status") == "partial" and result.get("method") == "quick_deal" and callback.message:
+                    await callback.message.answer("Повтор этой заявки заблокирован. После проверки CRM администратор может снять блокировку в /drafts.", reply_markup=drafts_keyboard([tools.drafts.get(token)]))
         except (StocrmError, ValueError, KeyError) as exc:
             await notify_problem(callback, humanize_error(exc, context="Не удалось выполнить действие с черновиком"))
             with contextlib.suppress(KeyError, ValueError):

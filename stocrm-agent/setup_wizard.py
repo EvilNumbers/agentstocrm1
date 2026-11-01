@@ -167,7 +167,7 @@ def reexec_in_venv() -> None:
     raise SystemExit(result.returncode)
 
 
-REQUIRED_IMPORTS = ("aiogram", "httpx", "mcp", "requests")
+REQUIRED_IMPORTS = ("aiogram", "httpx", "mcp", "requests", "aiohttp_socks", "socksio")
 PIP_LOG = ROOT / "pip-install.log"
 
 # Рабочий диапазон: 3.10 - 3.13. Всё, что новее, ещё не имеет готовых пакетов:
@@ -305,13 +305,32 @@ def check_python() -> bool:
 
 
 def deps_probe() -> tuple[bool, str]:
-    """Настоящий тест — не код возврата pip, а то, что модули импортируются."""
+    """Проверяет импорты, версии требований и зависимости без сетевых запросов."""
+    script = """
+import importlib.metadata as metadata
+from pathlib import Path
+from pip._vendor.packaging.requirements import Requirement
+for line in Path('requirements.txt').read_text(encoding='utf-8').splitlines():
+    line = line.strip()
+    if not line or line.startswith('#'):
+        continue
+    req = Requirement(line)
+    if req.marker and not req.marker.evaluate():
+        continue
+    actual = metadata.version(req.name)
+    if req.specifier and not req.specifier.contains(actual, prereleases=True):
+        raise RuntimeError(f'{req.name}: установлено {actual}, требуется {req.specifier}')
+"""
     probe = subprocess.run(
-        [str(VENV_PYTHON), "-c", f"import {', '.join(REQUIRED_IMPORTS)}"],
+        [str(VENV_PYTHON), "-c", f"import {', '.join(REQUIRED_IMPORTS)}\n" + script],
         cwd=ROOT, capture_output=True, text=True,
     )
     message = (probe.stderr or probe.stdout or "").strip().splitlines()
-    return probe.returncode == 0, (message[-1] if message else "")
+    if probe.returncode != 0:
+        return False, (message[-1] if message else "Проверка зависимостей не выполнена")
+    check = subprocess.run([str(VENV_PYTHON), "-m", "pip", "check"], cwd=ROOT, capture_output=True, text=True)
+    details = (check.stdout or check.stderr or "").strip().splitlines()
+    return check.returncode == 0, (details[-1] if details and check.returncode else "")
 
 
 def deps_ok() -> bool:
@@ -425,7 +444,7 @@ def run_with_spinner(command: list[str], label: str, timeout: int = 900) -> int:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     try:
         proc = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE, text=True, env=env)
+                                stderr=subprocess.DEVNULL, text=True, env=env)
     except OSError as exc:
         say(f"      не удалось запустить: {exc}")
         return 1
@@ -591,9 +610,9 @@ def diagnose(tail: str) -> None:
         say("  затем запустите setup еще раз.")
     elif "ssl" in low or "certificate" in low or "сертификат" in low:
         say("  ПРИЧИНА: подмена сертификата — антивирус, файрвол или корпоративный прокси.")
-        say("  ЧТО ДЕЛАТЬ: временно отключите проверку HTTPS для pip или доверьтесь сертификату:")
-        say('    .venv\\Scripts\\python.exe -m pip install --trusted-host pypi.org '
-            '--trusted-host files.pythonhosted.org -r requirements.txt')
+        say("  ЧТО ДЕЛАТЬ: проверьте дату, сертификаты системы и настройки корпоративного прокси.")
+        say("  При необходимости попросите администратора настроить доверенный корневой сертификат.")
+        say("  Мастер не отключает проверку TLS для установки пакетов.")
     elif "proxy" in low or "407" in low or "timed out" in low or "timeout" in low:
         say("  ПРИЧИНА: не проходит соединение — прокси, VPN или блокировка PyPI.")
         say("  ЧТО ДЕЛАТЬ: если в компании прокси, укажите его:")
@@ -664,9 +683,6 @@ def install_deps() -> None:
         ("обычная установка", ["install", "-r", requirements, "--timeout", "60", "--retries", "5"]),
         ("без кэша (лечит битые загрузки)",
          ["install", "-r", requirements, "--no-cache-dir", "--timeout", "60", "--retries", "5"]),
-        ("с доверием к сертификатам PyPI (антивирус/прокси)",
-         ["install", "-r", requirements, "--trusted-host", "pypi.org",
-          "--trusted-host", "files.pythonhosted.org", "--timeout", "60", "--retries", "5"]),
         ("через индекс PyPI напрямую",
          ["install", "-r", requirements, "--index-url", "https://pypi.org/simple",
           "--timeout", "60", "--retries", "5"]),
@@ -695,7 +711,7 @@ def install_deps() -> None:
                 break
 
     say("")
-    say("[ОШИБКА] Зависимости не установились — интернет тут ни при чём, дело в другом.")
+    say("[ОШИБКА] Не удалось установить или проверить зависимости.")
     diagnose(tail)
     say("Можно поставить вручную и посмотреть полный вывод:")
     if os.name == "nt":

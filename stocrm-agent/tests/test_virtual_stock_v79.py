@@ -42,7 +42,7 @@ def test_legitimate_large_line_quantity_is_not_automatically_wrong():
 
 def test_readback_prefers_line_quantity_over_ambiguous_quantity(setup_tools):
     session, tools = setup_tools
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', price=1200)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', brand='TESTBRAND', price=1200)
     original = session._add_order
     def add(method, payload):
         response = original(method, payload)
@@ -60,7 +60,7 @@ def test_readback_prefers_line_quantity_over_ambiguous_quantity(setup_tools):
 
 def test_ambiguous_mismatch_is_unverified_not_a_false_factual_error(setup_tools):
     session, tools = setup_tools
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', price=1200)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', brand='TESTBRAND', price=1200)
     original = session._add_order
     def add(method, payload):
         response = original(method, payload)
@@ -79,7 +79,7 @@ def test_ambiguous_mismatch_is_unverified_not_a_false_factual_error(setup_tools)
 
 def test_explicit_line_quantity_mismatch_is_still_detected(setup_tools):
     session, tools = setup_tools
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', price=1200)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', brand='TESTBRAND', price=1200)
     original = session._add_order
     def add(method, payload):
         response = original(method, payload)
@@ -106,8 +106,8 @@ def test_batch_ignores_nested_virtual_stock_and_completes(setup_tools, monkeypat
     monkeypatch.setattr(websearch, 'search_batch', lambda *args, **kwargs: [])
     send = lambda text: asyncio.run(pipe.handle_text(text, [], 19))
     send('Добавь в сделку 1654 CH88011 за 1200 и CH88014E за 4200')
-    send('добавь как указано')
-    draft = send('добавь как указано').drafts[0]
+    send('TESTBRAND')
+    draft = send('TESTBRAND').drafts[0]
     original = session._add_order
     def add(method, payload):
         response = original(method, payload)

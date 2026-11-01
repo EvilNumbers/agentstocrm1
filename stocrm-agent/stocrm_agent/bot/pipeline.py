@@ -21,6 +21,7 @@ from ..policy import ConfirmationPolicy
 from ..tools import Toolset
 from .fastpath import format_offer_card, format_offers_list, is_status_offers_request, try_answer
 from .status_colors import append_llm_colors, with_status_colors
+from . import quick_read, quick_parse
 from .llm import LLMClient, LLMError
 from .llm_tools import (
     _NEW_REQUEST_WORDS,
@@ -933,6 +934,8 @@ class BotPipeline:
         # последние показанные списки: user_id → номера сделок в том порядке, как их увидел человек
         self._lists: dict[int, list[int]] = {}
         self._bookings: dict[int, dict[str, Any]] = {}
+        self._quick_choices: dict[int, dict[str, Any]] = {}
+        self._quick_pending: dict[int, dict[str, Any]] = {}
         self._contact_lookups: dict[int, dict[str, Any]] = {}
         self._contact_create_pending: dict[int, dict[str, Any]] = {}
         self._offer_create_pending: dict[int, dict[str, Any]] = {}
@@ -980,6 +983,8 @@ class BotPipeline:
         self._to_pending.pop(key, None)
         self._lists.pop(key, None)
         self._bookings.pop(key, None)
+        self._quick_choices.pop(key, None)
+        self._quick_pending.pop(key, None)
         self._contact_lookups.pop(key, None)
         self._contact_create_pending.pop(key, None)
         self._offer_create_pending.pop(key, None)
@@ -1126,8 +1131,8 @@ class BotPipeline:
                 "❌ Убрал последнюю позицию — черновик отменён. "
                 "В сделке ничего не изменилось."
             ))
-        self._part_batch[key] = {**entry, "at": time.time()}
         updated = dict(outcome.get("draft") or draft)
+        self._part_batch[key] = {**entry, "token": updated.get("token"), "at": time.time()}
         left = int(outcome.get("left") or 0)
         result = PipelineResult(drafts=[updated])
         result.answer = (f"✂️ Убрал: {outcome.get('removed')}. "
@@ -1312,6 +1317,8 @@ class BotPipeline:
 
         if not candidates and low in {"добавь как указано", "добавить как указано"}:
             args = dict(choice.get("args") or {})
+            if not parts.known_brand(args.get("brand")):
+                return PipelineResult(answer="Бренд не подтверждён. Введите бренд вручную; цена и остальные данные сохранены. Ничего не записано.")
             candidate = {"index": 0, "name": args.get("name") or args.get("sku"), "sku": args.get("sku"), "brand": args.get("brand"), "source": "вручную по данным человека"}
             if not candidate["name"]:
                 return PipelineResult(answer="Назовите деталь для свободной позиции.")
@@ -1342,6 +1349,15 @@ class BotPipeline:
                 self._track_part(result, key)
                 return result
             args = dict(choice["args"])
+            if not parts.known_brand(args.get("brand")):
+                brand = parts.manual_brand(text)
+                if brand:
+                    args['brand'] = brand
+                    candidate = {"index": 0, "name": args.get("name") or args.get("sku"), "sku": args.get("sku"), "brand": brand, "source": "указано человеком"}
+                    self._part_pending.pop(key, None)
+                    return self.resume_choice({**choice, "args": args, "candidates": [candidate]}, 0, user_key=key)
+                if low not in {"повтори поиск", "повторить поиск", "поищи снова"} and not re.search(r"\bартикул(?:ом|а)?\b", low):
+                    return PipelineResult(answer="Введите название бренда вручную, повторите поиск или отмените заявку. Неизвестный бренд не подставляю.")
             explicit_sku = re.search(r"артикул(?:ом|а)?\s*[:№#]?\s*([A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9./ -]{2,24})", text, re.I)
             if explicit_sku:
                 found = parts.sku_spans(explicit_sku.group(1))
@@ -1569,7 +1585,7 @@ class BotPipeline:
             item = dict(item)
             sku = item['sku']
             found: dict[str, Any]
-            if item.get('brand'):
+            if parts.known_brand(item.get('brand')):
                 candidate, note = self._human_part_stock(item)
                 stock_notes.append(note)
                 found = {'status': 'matched', 'best': candidate}
@@ -1579,11 +1595,14 @@ class BotPipeline:
                 except Exception as exc:  # noqa: BLE001
                     found = {'status': 'not_found', 'candidates': [], 'warnings': [str(exc)]}
                 best = found.get('best')
+                if best and not parts.known_brand(best.get('brand')):
+                    found = {**found, 'status': 'not_found', 'best': None, 'candidates': []}
+                    best = None
                 if best and parts.sku_exact(best.get('sku')) != parts.sku_exact(sku):
                     found = {'status': 'not_found', 'candidates': []}
                 elif found.get('status') == 'ambiguous':
                     exact_candidates = [c for c in found.get('candidates') or []
-                                        if parts.sku_exact(c.get('sku')) == parts.sku_exact(sku)]
+                                        if parts.sku_exact(c.get('sku')) == parts.sku_exact(sku) and parts.known_brand(c.get('brand'))]
                     found = {**found, 'candidates': exact_candidates,
                              'status': 'ambiguous' if exact_candidates else 'not_found'}
                 if (found.get('status') == 'not_found' and len(parts.normalize_sku(sku)) >= 4
@@ -1753,15 +1772,16 @@ class BotPipeline:
             except websearch.WebSearchError:
                 return PipelineResult(answer="Поиск временно недоступен или ограничен. Автоматически не повторяю; можно указать бренд или выбрать ручное добавление.", choices=[choice])
         if low in {'добавь как указано', 'добавить как указано', 'manual'} and not choice['candidates']:
+            if not parts.known_brand(item.get('brand')):
+                choice['question'] = f"Бренд для {item['sku']} не подтверждён. Введите бренд вручную; цена и остальные позиции сохранены. Источники могут быть недоступны, отсутствие товара не доказано."
+                return PipelineResult(answer=choice['question'], choices=[choice])
             state['selected'] = {'sku': item['sku'], 'brand': item.get('brand'), 'name': item.get('name') or item['sku'], 'source': 'вручную по данным человека'}
         else:
             picked = self._pick_candidate(choice['candidates'], value)
             if picked:
                 state['selected'] = picked
             else:
-                brand = parts.find_brand_in_text(value)
-                if not brand and re.fullmatch(r'[A-Za-z][A-Za-z&-]{2,40}', value.strip()) and value.strip().lower() not in parts._NOT_BRAND:
-                    brand = value.strip().upper()
+                brand = parts.manual_brand(value)
                 if brand and not choice['candidates']:
                     state['selected'] = {'sku': item['sku'], 'brand': brand, 'name': f"{brand} {item['sku']}", 'source': 'указано человеком'}
                 else:
@@ -2600,6 +2620,183 @@ class BotPipeline:
             self._bookings.pop(ident, None)
             return PipelineResult(answer=f"Не удалось подготовить запись: {exc}. Новая запись в этой попытке не начиналась.")
 
+    def _quick_read(self, text: str, user_id: int) -> PipelineResult:
+        self._quick_choices.pop(user_id, None)
+        if not quick_read.is_read_request(text):
+            try:
+                plan = quick_parse.parse(text)
+                return self._quick_continue(plan, user_id)
+            except Exception as exc:
+                return PipelineResult(answer=f"Не удалось подготовить быструю сделку: {exc}. Ничего не записано.")
+        try:
+            ids = quick_read.identity(self.tools)
+            rows = quick_read.offers(self.tools, ids)
+            if not rows:
+                return PipelineResult(answer="Подтверждённых быстрых сделок этого контакта не найдено.")
+            shown = rows[:10]
+            details = quick_read.details(self.tools, ids, shown)
+            choice = {"kind": "quick_read", "owner": user_id, "ids": ids, "offers": shown,
+                      "question": "\n\n".join(details) + (f"\n\nПоказаны 10 из {len(rows)}; остальные не показаны." if len(rows) > 10 else "")}
+            self._quick_choices[user_id] = choice
+            return PipelineResult(choices=[choice])
+        except Exception as exc:
+            return PipelineResult(answer=f"Не удалось подтвердить быстрые сделки: {exc}. Ничего не записано.")
+
+    def _quick_continue(self, plan: dict[str, Any], user_id: int) -> PipelineResult:
+        from ..quick_deal import prepare, status_reasons
+        missing = ([plan["work"]] if plan.get("work") else []) + plan["articles"]
+        for item in missing:
+            if item.get("price") is None:
+                self._quick_pending[user_id] = {"plan": plan, "item": item, "at": time.time()}
+                what = f"артикула {item['sku']}" if item.get("sku") else f"работы «{item['title']}»"
+                return PipelineResult(answer=f"Укажите цену продажи {what} в рублях. Ноль вместо неизвестной цены не подставляю; запись ещё не начата.")
+        for item in plan['articles']:
+            if parts.known_brand(item.get('brand')):
+                continue
+            sku = str(item['sku'])
+            try:
+                found = self.tools.resolve_part(query=sku, sku=sku, offer_id=plan.get('offer_id'), allow_web=True)
+                candidates = list(found.get('candidates') or [])
+                if found.get('best'):
+                    candidates.insert(0, found['best'])
+                candidates = [c for c in candidates if parts.known_brand(c.get('brand'))
+                              and parts.sku_exact(str(c.get('sku') or '')) == parts.sku_exact(sku)]
+            except Exception:  # noqa: BLE001 — недоступный источник не означает отсутствия товара
+                found, candidates = {}, []
+            unique: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for candidate in candidates:
+                key = parts.brand_key(str(candidate['brand']))
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(candidate)
+            if len(unique) == 1 and found.get('status') == 'matched':
+                item['brand'] = str(unique[0]['brand'])
+                continue
+            pending = {'plan': plan, 'item': item, 'at': time.time(), 'stage': 'brand'}
+            self._quick_pending[user_id] = pending
+            if unique:
+                brand_shown = unique[:20]
+                question = (f"Для артикула {sku} найдены варианты бренда. Выберите подходящий или введите бренд вручную. "
+                            "Некоторые источники могут быть недоступны; отсутствие товара не доказано.")
+                if len(unique) > len(brand_shown):
+                    question += f" Показаны {len(brand_shown)} из {len(unique)} вариантов; другой бренд можно ввести вручную."
+                choice = {'kind': 'quick_brand', 'owner': user_id, 'offers': list(range(len(brand_shown))),
+                          'candidates': brand_shown, 'plan': plan, 'item': item, 'question': question, 'at': time.time()}
+                self._quick_choices[user_id] = choice
+                return PipelineResult(answer=question, choices=[choice])
+            return PipelineResult(answer=f"Не удалось подтвердить бренд артикула {sku}. Некоторые источники могут быть недоступны или поиск неполон — отсутствие товара не доказано. Введите бренд вручную или напишите «отмена». Цена и остальные позиции сохранены; запись не начата.")
+        self._quick_pending.pop(user_id, None)
+        try:
+            ids = quick_read.identity(self.tools)
+            # Явная «новая» не зависит от списка уже существующих сделок.
+            rows = [] if plan["new"] else quick_read.offers(self.tools, ids)
+            selected = plan.get("offer_id")
+            if selected and selected not in rows:
+                raise ValueError("Указанная сделка не подтверждена для системного контакта и статуса")
+            if plan["new"] or selected or not rows:
+                if not selected:
+                    reasons = status_reasons(self.tools, ids)
+                    if len(reasons) > 1 and not plan.get("reason_id"):
+                        choice = {"kind": "quick_reason", "owner": user_id, "ids": ids,
+                                  "offers": [r["id"] for r in reasons], "reasons": reasons,
+                                  "plan": plan, "question": "Выберите причину перехода в статус «Быстрые сделки»:"}
+                        self._quick_choices[user_id] = choice
+                        return PipelineResult(choices=[choice])
+                draft = prepare(self.tools, ids, selected, plan.get("work"), plan["articles"], plan.get("reason_id"))
+                self._part_batch[user_id] = {"token": draft["token"], "at": time.time()}
+                return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
+            shown = rows[:10]
+            descriptions = quick_read.details(self.tools, ids, shown)
+            question = "Выберите существующую сделку или создайте новую:\n\n" + "\n\n".join(descriptions)
+            if len(rows) > len(shown):
+                question += f"\n\nПоказаны {len(shown)} из {len(rows)}. Для другой укажите «быстрая сделка №ID ...»."
+            choice = {"kind": "quick_select", "owner": user_id, "ids": ids, "offers": shown,
+                      "snapshot": sorted(rows), "plan": plan, "question": question}
+            self._quick_choices[user_id] = choice
+            return PipelineResult(choices=[choice])
+        except Exception as exc:
+            return PipelineResult(answer=f"Не удалось подготовить быструю сделку: {exc}. Ничего не записано.")
+
+    def _quick_price_reply(self, text: str, user_id: int) -> PipelineResult | None:
+        pending = self._quick_pending.get(user_id)
+        if not pending:
+            return None
+        if time.time() - pending["at"] > 1800:
+            self._quick_pending.pop(user_id, None)
+            return PipelineResult(answer="Вопрос о цене или бренде устарел. Повторите запрос полностью; запись не начата.")
+        if re.fullmatch(r"\s*(?:отмена|отменить|нет)\s*", text, re.I):
+            self._quick_pending.pop(user_id, None)
+            return PipelineResult(answer="Отменено. Ничего не записано.")
+        if pending.get('stage') == 'brand':
+            if _looks_like_new_request(text.lower()):
+                self._quick_pending.pop(user_id, None)
+                return None
+            brand = parts.manual_brand(text)
+            if not brand:
+                return PipelineResult(answer="Введите название бренда вручную или напишите «отмена». Ничего не записано.")
+            pending['item']['brand'] = brand
+            return self._quick_continue(pending['plan'], user_id)
+        if not re.fullmatch(r"\s*(?:цена\s*)?[\d\s.,]+\s*(?:₽|руб(?:лей|ля|ль)?\.?)?\s*", text, re.I):
+            if _looks_like_new_request(text.lower()):
+                self._quick_pending.pop(user_id, None)
+                return None
+            return PipelineResult(answer="Назовите положительную цену в рублях или напишите «отмена». Ничего не записано.")
+        value = parse_price(re.sub(r"(?:цена|₽|руб(?:лей|ля|ль)?\.?)", "", text, flags=re.I).strip())
+        if value is None or value <= 0:
+            return PipelineResult(answer="Нужна положительная цена продажи. Ничего не записано.")
+        pending["item"]["price"] = value
+        return self._quick_continue(pending["plan"], user_id)
+
+    def quick_read_choice(self, choice: dict[str, Any], user_id: int, index: int) -> PipelineResult:
+        size = len(choice.get("offers") or []) + (1 if choice.get("kind") in ("quick_select", "quick_brand") else 0)
+        if (self._quick_choices.get(user_id) is not choice or choice.get("owner") != user_id or not 0 <= index < size
+                or (choice.get('kind') == 'quick_brand' and time.time() - choice['at'] > 1800)):
+            return PipelineResult(answer="Этот выбор устарел или принадлежит другому сотруднику. Повторите запрос.")
+        self._quick_choices.pop(user_id, None)
+        if choice.get('kind') == 'quick_brand':
+            pending = self._quick_pending.get(user_id)
+            if not pending or pending.get('item') is not choice.get('item') or time.time() - pending['at'] > 1800:
+                return PipelineResult(answer="Этот выбор устарел. Повторите запрос; запись не начата.")
+            if index == len(choice['offers']):
+                return PipelineResult(answer=f"Введите бренд артикула {choice['item']['sku']} вручную или напишите «отмена». Запись не начата.")
+            selected = choice['candidates'][index]
+            if not parts.known_brand(selected.get('brand')) or parts.sku_exact(selected.get('sku')) != parts.sku_exact(choice['item']['sku']):
+                return PipelineResult(answer="Бренд или артикул не подтверждён. Введите бренд вручную.")
+            choice['item']['brand'] = str(selected['brand'])
+            return self._quick_continue(choice['plan'], user_id)
+        try:
+            ids = quick_read.identity(self.tools)
+            if choice.get("kind") == "quick_reason":
+                from ..quick_deal import status_reasons
+                if ids != choice["ids"] or status_reasons(self.tools, ids) != choice["reasons"]:
+                    raise ValueError("Статус или причины изменились; повторите запрос")
+                plan = choice["plan"]
+                plan["reason_id"] = choice["offers"][index]
+                plan["new"] = True
+                return self._quick_continue(plan, user_id)
+            rows = quick_read.offers(self.tools, ids)
+            if ids != choice["ids"]:
+                raise ValueError("Контакт или статус изменились; повторите список")
+            if choice.get("kind") == "quick_select":
+                from ..quick_deal import prepare
+                if sorted(rows) != choice["snapshot"]:
+                    raise ValueError("Список быстрых сделок изменился; повторите выбор")
+                oid = choice["offers"][index] if index < len(choice["offers"]) else None
+                plan = choice["plan"]
+                if oid is None:
+                    plan["new"] = True
+                    return self._quick_continue(plan, user_id)
+                draft = prepare(self.tools, ids, oid, plan.get("work"), plan["articles"])
+                self._part_batch[user_id] = {"token": draft["token"], "at": time.time()}
+                return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
+            oid = choice["offers"][index]
+            if oid not in rows:
+                raise ValueError("Сделка больше не подтверждена; повторите список")
+            return PipelineResult(answer=quick_read.detail(self.tools, ids, oid), structured_offer_details=True)
+        except Exception as exc:
+            return PipelineResult(answer=f"Не удалось подтвердить сделку: {exc}. Ничего не записано.")
+
     async def handle_text(self, text: str, history: list[dict[str, Any]],
                           user_id: int | None = None) -> PipelineResult:
         ident = (asyncio.get_running_loop(), user_id or 0)
@@ -2633,6 +2830,13 @@ class BotPipeline:
     async def _handle_text(self, text: str, history: list[dict[str, Any]],
                            user_id: int | None = None) -> PipelineResult:
         text = _normalize_deal_slip(text)
+        if quick_read.is_quick_request(text):
+            self._quick_pending.pop(user_id or 0, None)
+            return await asyncio.to_thread(self._quick_read, text, user_id or 0)
+        self._quick_choices.pop(user_id or 0, None)
+        quick_price = await asyncio.to_thread(self._quick_price_reply, text, user_id or 0)
+        if quick_price is not None:
+            return quick_price
         if (_ADD_VERB.search(text) and re.search(r"(?<!не )\b(?:со|с|из)\s+склад[а-я]*\b", text, re.I)
                 and not re.search(r"\bне\s+(?:со|с|из)\s+склад[а-я]*\b", text, re.I)):
             return PipelineResult(answer="Со склада в сделку не добавляю и складскую позицию не привязываю. Могу найти её для справки или подготовить свободную позицию по вашему отдельному запросу.")

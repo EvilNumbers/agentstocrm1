@@ -708,6 +708,19 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             self._epoch += 1
             self._cache.clear()
 
+    def _invalidate_quick_identity_cache(self) -> None:
+        """Для точной проверки контакта/статуса обновляем справочники, не стирая поиск деталей.
+
+        Новое поколение не даст вернуть старый in-flight результат как свежий;
+        независимые завершённые кэши остаются действительными до их TTL или записи.
+        """
+        with self._cache_lock:
+            self._epoch += 1
+            prefixes = ("boards:", "statuses:", "wire:boards/get_all:", "wire:offer/all_statuses:")
+            for cache_key in list(self._cache):
+                if cache_key.startswith(prefixes):
+                    self._cache.pop(cache_key, None)
+
     def _read(self, tool: str, method: str, payload: dict[str, Any] | None = None) -> Any:
         # Динамические данные объединяются только пока HTTP в полёте (TTL=0).
         # Небольшой буфер завершённых ответов — лишь для справочников.
@@ -1380,8 +1393,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "Для source=supplier нужен supplier_id — сначала вызовите suppliers и выберите поставщика"
             )
         qty = max(1, int(qty or 1))
-        unknown_brand = not (brand or "").strip()
-        brand = (brand or "").strip() or "NONAME"
+        if not parts.known_brand(brand):
+            raise ValueError("Бренд товара не указан или неизвестен. Укажите бренд вручную; запись не начата")
+        brand = (brand or "").strip()
         sku = (sku or "").strip()
 
         steps: list[dict[str, Any]] = []
@@ -1431,8 +1445,6 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         self.drafts.assert_part_unblocked(check)
         extra: dict[str, Any] = {"check": check}
         messages = [duplicate_warning] if duplicate_warning else []
-        if unknown_brand:
-            messages.append("Бренд не указан: NONAME — техническое обозначение неизвестного бренда, не найденный производитель. Применяемость не проверена.")
         if messages:
             extra["warning"] = "; ".join(messages)
         return self.drafts.create(
@@ -1638,11 +1650,16 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "Этот черновик уже не найти — он истёк или был применён. "
                 "Повторите просьбу, и я подготовлю заново"
             ) from exc
+        if draft.get("tool") == "quick_deal":
+            from .quick_deal import drop_position
+            return drop_position(self, token, number=number, query=query)
         if draft.get("status") != "pending":
             raise ValueError(
                 "Черновик уже " + ("применён" if draft.get("status") == "applied" else "закрыт") +
                 " — убирать из него позиции поздно. Проверьте сделку в STOCRM"
             )
+        if (draft.get('check') or {}).get('kind') not in {'added_lines', 'added_line', 'added_work'}:
+            raise ValueError("Этот вид черновика нельзя редактировать по позициям")
         items = self._checks_of(draft)
         if not items:
             raise ValueError("В этом черновике нет позиций — отменять нечего")
@@ -1658,7 +1675,11 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "Скажите номер — например «убери 2»"
             )
         if len(items) == 1:
-            self.drafts.mark(token, "discarded", reason="человек убрал единственную позицию")
+            with self.drafts._locked():
+                current = self.drafts._verify_unlocked(token)
+                current['status'] = 'discarded'
+                current['reason'] = 'последняя позиция удалена человеком'
+                self.drafts._save()
             return {"status": "discarded", "token": token, "left": 0}
 
         span = None
@@ -1701,7 +1722,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         removed = self._short_position_title(
             (positions[index].get("title") if index < len(positions) else "")
             or items[index].get("name") or items[index].get("sku") or "позиция")
-        return {"status": "pending", "token": token, "left": len(left_items),
+        return {"status": "pending", "token": updated["token"], "left": len(left_items),
                 "summary": updated.get("summary"), "items": left_items,
                 "removed": removed, "draft": updated}
 
@@ -2362,6 +2383,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         errors: list[str] = []
 
         def add(item: dict[str, Any], source: str) -> None:
+            if raw_sku and not parts.known_brand(item.get("brand")):
+                return  # пустой бренд не прекращает перебор вариантов и источников
             if raw_sku and parts.sku_exact(item.get("sku")) != parts.sku_exact(raw_sku):
                 return
             if raw_sku and brand and not parts.exact_brand_match(brand, item.get("brand")):
@@ -2759,7 +2782,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # Остальные написания — параллельно, по три за раз: раньше они шли строго по
         # одному, и «W 914/2» → «W914/2» → «W-914-2» стоило трёх ожиданий панели.
         for start in range(0, len(rest), 3):
-            if found:
+            if any(parts.known_brand(row.get("brand")) for row in found):
                 break
             chunk = rest[start:start + 3]
             tasks: list[Callable[[], None]] = []
@@ -2901,9 +2924,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         found: list[dict[str, Any]] = []
         if sku:
             for variant in dict.fromkeys(parts.sku_variants(sku) + parts.sku_variants(parts.normalize_sku(sku))):
-                found = collect({"SKU": variant}, pages=2)
-                if found:
+                found.extend(collect({"SKU": variant}, pages=2))
+                if any(parts.known_brand(row.get("BRAND") or row.get("REQUIRE_BRAND")) for row in found):
                     break
+            found.sort(key=lambda row: not parts.known_brand(row.get("BRAND") or row.get("REQUIRE_BRAND")))
         if not found and brand:
             found = collect({"BRAND": brand}, pages=2)
         if not found and not sku and (term or brand):
@@ -4349,6 +4373,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if current.get("check", {}).get("kind") != "standalone_offer":
                 raise ValueError("Старый черновик сделки не содержит проверки клиента. Не применяйте его; если запись не отправлялась, отмените и подготовьте заново. Partial проверьте в CRM.")
             return self._apply_standalone_offer(token, current)
+        if current and current.get("tool") == "quick_deal":
+            from .quick_deal import apply as apply_quick_deal
+            return apply_quick_deal(self, token, current)
         if current and current.get("check", {}).get("kind") == "existing_booking":
             return self._apply_existing_booking(token, current)
         if current and current.get("check", {}).get("kind") == "booking":
@@ -4391,6 +4418,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if not review["can_resume"]:
                 raise ValueError("Позиция уже появилась в CRM; продолжение остановлено, чтобы не создать дубль. Откройте /drafts и проверьте результат")
         if current and current.get("status") == "pending" and current.get("tool") == "add_offer_part":
+            checks = self._checks_of(current)
+            writes = current.get('steps') or [{'method': current.get('method'), 'payload': current.get('payload')}]
+            if (any(not parts.known_brand(c.get("brand")) for c in checks) or
+                    any(not parts.known_brand((step.get('payload') or {}).get('BRAND')) for step in writes
+                        if step.get('method') in {'offer/require/add', 'offer/order/add_free_order'})):
+                raise ValueError("В старом черновике не указан бренд товара. Отмените его, если запись не отправлялась, и укажите бренд вручную. Запись не начата")
             def has_stock_reference(value: Any) -> bool:
                 if isinstance(value, list):
                     return any(has_stock_reference(v) for v in value)

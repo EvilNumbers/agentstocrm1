@@ -286,11 +286,7 @@ class DraftStore:
         Так из общего черновика можно выкинуть одну запчасть, не трогая остальные.
         """
         with self._locked():
-            draft = self._get_unlocked(token)
-            if draft["status"] != PENDING:
-                raise ValueError(
-                    f"Черновик {token} в статусе «{draft['status']}» — менять его нельзя"
-                )
+            draft = self._verify_unlocked(token)
             current = list(draft.get("steps") or [])
             drop = {int(i) for i in indices if 0 <= int(i) < len(current)}
             # шаги, которые ссылаются на удаляемые, уходят вместе с ними
@@ -308,19 +304,23 @@ class DraftStore:
             keep = [index for index in range(len(current)) if index not in drop]
             mapping = {old: new for new, old in enumerate(keep)}
             steps = [_shift_step_refs([current[index]], 0, mapping)[0] for index in keep]
-            draft["steps"] = steps
             if not steps:
                 raise ValueError("в черновике не осталось действий")
-            if not draft.get("method"):
-                draft["method"] = steps[0].get("method") or ""
-                draft["payload"] = steps[0].get("payload") or {}
-            if summary:
-                draft["summary"] = summary
-            if extra:
-                draft.update(extra)
-            draft["fingerprint"] = _fingerprint(draft["method"], draft["payload"], draft["steps"])
+            # Выпускаем новую версию: кнопка «Применить» на старом сообщении не
+            # должна подтверждать изменённый состав, которого человек не видел.
+            metadata = {k: v for k, v in draft.items() if k not in {
+                'token', 'tool', 'method', 'payload', 'steps', 'status', 'created_at',
+                'expires_at', 'fingerprint', 'summary', 'risk', 'merged_into', 'replacement_token'
+            }}
+            metadata.update(extra or {})
+            draft['status'] = DISCARDED
+            draft['reason'] = 'состав изменён человеком; старая кнопка недействительна'
+            result = self._create_unlocked(tool=draft['tool'], method=steps[0]['method'],
+                payload=steps[0].get('payload') or {}, summary=summary or draft['summary'],
+                risk=draft.get('risk') or 'normal', steps=steps, extra=metadata)
+            draft['replacement_token'] = result['token']
             self._save()
-            return dict(draft)
+            return dict(result)
 
     def get(self, token: str) -> dict[str, Any]:
         with self._locked():
@@ -344,7 +344,7 @@ class DraftStore:
         cutoff = time.time() - keep_days * 86400
         drop = [
             token for token, draft in self._data.items()
-            if draft.get("status") not in (PENDING, PARTIAL)
+            if draft.get("status") not in (PENDING, PARTIAL, APPLYING)
             and not draft.get("archived_partial")
             and not (draft.get("check_warning") and not (draft.get("review") or {}).get("verified"))
             and not (draft.get("status") == DISCARDED and draft.get("done_steps"))
@@ -472,6 +472,18 @@ class DraftStore:
             self._save()
             return dict(child)
 
+    def resolve_quick_manually(self, token: str, *, user_id: int) -> dict[str, Any]:
+        """После явной проверки человеком снять блокировку, не повторяя запись."""
+        with self._locked():
+            draft = self._get_unlocked(token)
+            if draft.get("tool") != "quick_deal" or not (draft.get("status") in (PARTIAL, APPLYING) or draft.get("archived_partial")):
+                raise ValueError("Этот черновик не является непроверенной быстрой сделкой")
+            if draft.get("status") == APPLYING and time.time() - float(draft.get("quick_touched_at") or draft.get("claimed_at") or time.time()) < 3600:
+                raise ValueError("Заявка может ещё выполняться. Дождитесь завершения; после часа без обновлений можно проверить CRM вручную")
+            draft.update(status=DISCARDED, archived_partial=False, manually_reviewed_at=time.time(), manually_reviewed_by=user_id)
+            self._save()
+            return dict(draft)
+
     def claim(self, token: str) -> dict[str, Any]:
         """Атомарно: проверить черновик И захватить его на применение.
 
@@ -493,6 +505,19 @@ class DraftStore:
                             and phone_key(other_check.get("phone")) == phone_key(check.get("phone"))
                             and (other.get("status") in (APPLYING, PARTIAL, APPLIED) or other.get("archived_partial"))):
                         raise ValueError("Создание контакта с этим телефоном уже выполнялось или требует проверки. Повтор запрещён.")
+            if draft.get("tool") == "quick_deal" or check.get("kind") == "standalone_offer":
+                from .contact_search import phone_key
+                target_phone = phone_key("81111111110" if draft.get("tool") == "quick_deal" else check.get("phone"))
+                for other in self._data.values():
+                    if other.get("token") == token:
+                        continue
+                    old_check = other.get("check") or {}
+                    other_quick = other.get("tool") == "quick_deal"
+                    other_phone = phone_key("81111111110" if other_quick else old_check.get("phone"))
+                    relevant = (other_quick or old_check.get("kind") == "standalone_offer") and target_phone and other_phone == target_phone
+                    if relevant and (other.get("status") in (APPLYING, PARTIAL) or other.get("archived_partial")
+                            or (other.get("status") == APPLIED and float(other.get("applied_at") or 0) >= float(draft.get("created_at") or 0))):
+                        raise ValueError("По системному контакту уже выполняется или требует проверки другая запись. Проверьте /drafts; повтор запрещён.")
             if check.get("kind") == "standalone_offer":
                 from .contact_search import phone_key
                 for other in self._data.values():

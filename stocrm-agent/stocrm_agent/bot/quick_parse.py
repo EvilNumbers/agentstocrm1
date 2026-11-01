@@ -1,0 +1,75 @@
+"""Консервативный разбор названных работы и артикулов без цен из соседней части."""
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from .. import parts
+
+
+def parse(text: str) -> dict[str, Any]:
+    # импорты находятся здесь: pipeline использует этот модуль
+    from .pipeline import work_in_request, parts_in_request, _single_part_in_request, parse_price
+    if re.search(r'\b(?:удал\w*|убер\w*|измен\w*|помен\w*|перевед\w*|спиш\w*|оплат\w*|предоплат\w*|со\s+склад\w*|поставщик\w*|закаж\w*)\b', text, re.I):
+        raise ValueError('Этот запрос не является добавлением работы или свободного артикула; ничего не меняю')
+    match = re.search(r'\bбыстр\w*\s+сделк\w*', text, re.I)
+    if not match:
+        raise ValueError('Не распознана быстрая сделка')
+    new = bool(re.search(r'\bнов(?:ая|ую|ой)\s+быстр', text[:match.end()], re.I))
+    tail = text[match.end():].strip(' ,:;—-')
+    number = re.match(r'^(?:№|#)\s*(\d+)\b', tail)
+    offer_id = int(number[1]) if number else None
+    if number:
+        tail = tail[number.end():].strip(' ,:;—-')
+    cut = re.search(r'\b(?:артикул\w*|запчаст\w*|детал\w*)\b', tail, re.I)
+    if cut:
+        work_text = tail[:cut.start()]
+        work_text = re.sub(r'\s*(?:,?\s*и\s*)?(?:добав\w*|внес\w*)\s*$', '', work_text, flags=re.I).strip(' ,:;—-')
+        part_text = tail[cut.start():]
+    else:
+        work_text, part_text = tail, ''
+    work = None
+    if work_text:
+        if re.search(r'\b(?:и\s+)?(?:добав\w*|внес\w*)\b', work_text, re.I) and not re.match(r'^добав\w*\s+', work_text, re.I):
+            raise ValueError('Несколько действий в работе не разобраны; укажите одну работу')
+        work_text = re.sub(r'^(?:добав\w*\s+)?(?:работ\w*|услуг\w*)\s*', '', work_text, flags=re.I).strip()
+        parsed = work_in_request('добавь услугу ' + work_text)
+        if not parsed:
+            raise ValueError('Не удалось однозначно разобрать название работы и цену')
+        work = {'title': parsed['title'], 'price': parsed['price']}
+    articles = []
+    if part_text:
+        if re.search(r'\b(?:добав\w*|внес\w*|работ\w*|услуг\w*)\b', part_text, re.I):
+            raise ValueError('Не удалось однозначно разобрать дополнительные действия после артикула')
+        found = parts_in_request(part_text)
+        if not found:
+            single = _single_part_in_request(part_text)
+            found = [single] if single else []
+        if not found:
+            raise ValueError('Не удалось распознать артикул; укажите его точно')
+        spans = parts.sku_spans(part_text)
+        if len(found) != len(spans):
+            raise ValueError('Не удалось однозначно разделить артикулы')
+        for index, item in enumerate(found):
+            start = 0 if len(spans) == 1 else spans[index][2]
+            end = spans[index + 1][2] if index + 1 < len(spans) else len(part_text)
+            context = part_text[start:end]
+            brand_context = context
+            if len(spans) == 1:
+                sku_start, sku_end = spans[0][2], spans[0][3]
+                brand_context = part_text[:sku_start] + ' ' + part_text[sku_end:]
+            brand = parts.explicit_brand_in_text(context) or (parts.find_brand_in_text(brand_context) if len(spans) == 1 else None) or None
+            price = item.get('price')
+            if price is None:
+                # В общем разборе отсекаются суммы меньше 10; здесь сохраняем
+                # явно названную цену, не принимая за неё количество или номер SKU.
+                after = part_text[spans[index][3]:end]
+                explicit = re.search(r'\b(?:цена|ценой|стоимость|за)\s*[:—-]?\s*(\d+(?:[.,]\d{1,2})?)(?![\d.,])', after, re.I)
+                if explicit and not re.match(r'\s*(?:шт\.?|штук\w*)\b', after[explicit.end(1):], re.I):
+                    price = parse_price(explicit.group(1))
+            articles.append({'sku': item['sku'], 'brand': brand, 'qty': item.get('qty') or 1, 'price': price})
+    if not work and not articles:
+        raise ValueError('Назовите работу с ценой или артикул с ценой')
+    if new and offer_id:
+        raise ValueError('Уточните: создать новую или выбрать указанную сделку')
+    return {'new': new, 'offer_id': offer_id, 'work': work, 'articles': articles}

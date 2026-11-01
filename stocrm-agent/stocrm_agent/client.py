@@ -402,8 +402,13 @@ class StocrmClient:
                 rate_limited = exc.code == 429 or "слишком част" in str(exc).lower() or "too many requests" in str(exc).lower()
                 if not idempotent or not rate_limited or rate_attempt >= min(self.retries, 2):
                     raise
-                # Повторяем ТОЛЬКО чтение, ограниченно. Изменения не повторяются.
-                time.sleep(1.0 + rate_attempt)
+                # Повторяем только чтение и не выходим за общий бюджет/остановку.
+                delay = 1.0 + rate_attempt
+                deadline = _READ_DEADLINE.get()
+                if deadline is not None:
+                    delay = min(delay, max(0.0, deadline - time.monotonic()))
+                self._stopping.wait(delay)
+                self._check_running()
                 try:
                     raw = do(1).json()
                 except (requests.RequestException, ValueError) as failure:
