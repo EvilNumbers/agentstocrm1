@@ -27,6 +27,7 @@ import requests
 from .netproxy import detect_proxy
 
 _READ_DEADLINE: ContextVar[float | None] = ContextVar("crm_read_deadline", default=None)
+_CRM_CALL_ID: ContextVar[str] = ContextVar("crm_call_id", default="")
 
 
 @contextmanager
@@ -163,6 +164,7 @@ class StocrmClient:
         session: requests.Session | None = None,
         base_url: str | None = None,
     ) -> None:
+        self.diagnostic = None  # включается ботом; никогда не меняет семантику запроса
         self.base_url = base_url or self._normalize_domain(domain)
         self._sid = sid
         self.timeout = timeout
@@ -272,14 +274,17 @@ class StocrmClient:
         if deadline is not None and isinstance(kwargs.get("timeout"), (int, float)):
             kwargs["timeout"] = max(0.01, min(kwargs["timeout"], deadline - time.monotonic()))
         verb = "get" if "params" in kwargs and "json" not in kwargs else "post"
+        self._diagnostic_emit('crm.http.request', method=method, verb=verb, idempotent=allow_route_retry,
+                              request=kwargs.get('params') if verb == 'get' else kwargs.get('json'))
         if not self._own_session:            # Session передали снаружи — он общий
             with self._session_lock:
                 return getattr(self.session, verb)(url, **kwargs)
         return self._request_locked(verb, url,
-                                    route_retry=allow_route_retry,
+                                    route_retry=allow_route_retry, diagnostic_method=method,
                                     **kwargs)
 
-    def _request_locked(self, verb: str, url: str, *, route_retry: bool = True, **kwargs: Any) -> Any:
+    def _request_locked(self, verb: str, url: str, *, route_retry: bool = True,
+                        diagnostic_method: str = '', **kwargs: Any) -> Any:
         if not self._own_session:
             return getattr(self.session, verb)(url, **kwargs)
         session = self._thread_session()
@@ -296,6 +301,8 @@ class StocrmClient:
             self._direct = not self._direct
             log.info("STOCRM: переключаюсь на %s", "прямое соединение" if self._direct else "прокси")
             proxies = {} if self._direct else {"http": self._proxy, "https": self._proxy}
+            self._diagnostic_emit('crm.http.request', method=diagnostic_method, verb=verb, idempotent=True,
+                                  request=kwargs.get('params') if verb == 'get' else kwargs.get('json'))
             return getattr(session, verb)(url, proxies=proxies, **kwargs)
         finally:
             self._release_session(session)
@@ -344,8 +351,51 @@ class StocrmClient:
             raise StocrmError(message, code=code_int, method=method)
         return raw.get("RESPONSE")
 
+    def _diagnostic_emit(self, event: str, **fields: Any) -> None:
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic.emit(event, call_id=_CRM_CALL_ID.get(), **fields)
+            except Exception:
+                pass  # отключение диагностики не должно менять бизнес-операцию
+
+    def _instrument_call(self, operation: Any, method: str, data: Any, idempotent: bool, verb: str) -> Any:
+        if self.diagnostic is None:
+            return operation(method, data, idempotent=idempotent)
+        from .diagnostic_journal import error_kind
+        try:
+            self.diagnostic.add_secret(self._sid)
+        except Exception:
+            pass
+        call_token = _CRM_CALL_ID.set('call_' + secrets.token_hex(6))
+        start = time.monotonic()
+        try:
+            self._diagnostic_emit('crm.call.start', method=method, request=data, idempotent=idempotent, verb=verb)
+            try:
+                result = operation(method, data, idempotent=idempotent)
+            except BaseException as exc:
+                try:
+                    self._diagnostic_emit('crm.call.error', method=method, idempotent=idempotent, verb=verb,
+                                          ms=round((time.monotonic() - start) * 1000),
+                                          error_class=type(exc).__name__,
+                                          cause_class=type(exc.__cause__).__name__ if exc.__cause__ else '',
+                                          error_kind=error_kind(exc), code=getattr(exc, 'code', None))
+                except Exception:
+                    pass
+                raise
+            self._diagnostic_emit('crm.call.finish', method=method, idempotent=idempotent, verb=verb,
+                                  ms=round((time.monotonic() - start) * 1000), response=result)
+            return result
+        finally:
+            _CRM_CALL_ID.reset(call_token)
+
+    def call(self, method: str, payload: dict[str, Any] | None = None, *, idempotent: bool = False) -> Any:
+        return self._instrument_call(self._call, method, payload, idempotent, 'post')
+
+    def call_get(self, method: str, params: dict[str, Any] | None = None, *, idempotent: bool = False) -> Any:
+        return self._instrument_call(self._call_get, method, params, idempotent, 'get')
+
     # ------------------------------------------------------------------- calls
-    def call(self, method: str, payload: dict[str, Any] | None = None, *,
+    def _call(self, method: str, payload: dict[str, Any] | None = None, *,
              idempotent: bool = False) -> Any:
         """POST-запрос к методу API, возвращает RESPONSE.
 
@@ -367,6 +417,9 @@ class StocrmClient:
             # зависания давали ответ на 125 секунд). Со второй попытки — полный таймаут.
             timeout = self.timeout if attempt else min(self.timeout, self.read_timeout)
             resp = self._request(method, url, json=body, timeout=timeout, allow_route_retry=idempotent)
+            self._diagnostic_emit('crm.http', method=method, http_status=resp.status_code, attempt=attempt, verb='post', idempotent=idempotent)
+            if resp.status_code != 200:
+                self._diagnostic_error_response(resp, method, 'post')
             if resp.status_code == 429 and idempotent:
                 raise requests.HTTPError("CRM ограничила частоту запросов", response=resp)
             if resp.status_code >= 500:
@@ -393,6 +446,7 @@ class StocrmClient:
         from .diagnostics import TRACE_ID
         log.info("CRM_HTTP_EVENT %s", json.dumps({"trace_id": TRACE_ID.get(), "method": method, "http_status": resp.status_code, "ms": round((time.monotonic()-started)*1000), "response_bytes": len(str(getattr(resp, "text", "") or "").encode("utf-8", errors="replace")), "idempotent": idempotent, "request_shape": _diagnostic_shape(payload)}, ensure_ascii=False))
         raw = self._response_json(resp, method, payload)
+        self._diagnostic_emit('crm.http', method=method, response=raw, http_status=resp.status_code, verb='post')
 
         for rate_attempt in range(min(self.retries, 2) + 1):
             try:
@@ -411,13 +465,28 @@ class StocrmClient:
                 self._check_running()
                 try:
                     raw = do(1).json()
+                    self._diagnostic_emit('crm.http', method=method, response=raw, verb='post', attempt=rate_attempt + 1)
                 except (requests.RequestException, ValueError) as failure:
                     raise StocrmError("Не удалось повторить чтение после ограничения запросов", method=method) from failure
         log.debug("%s OK за %.0f мс", method, (time.monotonic() - started) * 1000)
         return result
 
+    def _diagnostic_error_response(self, response: Any, method: str, verb: str) -> None:
+        if self.diagnostic is None:
+            return
+        try:
+            text = str(getattr(response, 'text', '') or '')
+            try:
+                data = json.loads(text) if len(text) <= 2 * 1024 * 1024 else text
+            except (ValueError, RecursionError):
+                data = text
+            self._diagnostic_emit('crm.http.error_body', method=method, verb=verb,
+                                  http_status=getattr(response, 'status_code', None), response=data)
+        except Exception:
+            pass
+
     def _response_json(self, response: Any, method: str, payload: Any = None) -> Any:
-        """Не повторяет запрос при потере ответа; диагностирует без публикации тела."""
+        """Не повторяет запрос при потере ответа; записывает отфильтрованную диагностику."""
         try:
             return response.json()
         except ValueError as exc:
@@ -442,6 +511,11 @@ class StocrmClient:
             if content_type not in {"application/json", "text/html", "text/plain", "application/problem+json"}:
                 content_type = "не указан/другой"
             data = text.encode("utf-8", errors="replace")
+            safe_kind = ('empty' if not text.strip() else 'server_error' if 'fatal error' in low or 'uncaught' in low
+                         else 'html' if '<html' in low or '<!doctype html' in low or '<form' in low else 'unstructured')
+            self._diagnostic_emit('crm.response.invalid', method=method,
+                                  http_status=getattr(response, 'status_code', None),
+                                  response_bytes=len(data), kind=safe_kind, response=text)
             detail = (f"Ответ не JSON для {method}: HTTP {getattr(response, 'status_code', '?')}, "
                       f"тип {content_type}, {kind}, размер {len(data)} байт, "
                       f"отпечаток {hashlib.sha256(data).hexdigest()[:12]}. "
@@ -466,7 +540,7 @@ class StocrmClient:
             log.warning("%s", detail)
             raise StocrmError(detail, method=method) from exc
 
-    def call_get(self, method: str, params: dict[str, Any] | None = None, *, idempotent: bool = False) -> Any:
+    def _call_get(self, method: str, params: dict[str, Any] | None = None, *, idempotent: bool = False) -> Any:
         """Документированный GET-вариант; записи не повторяются."""
         if _forbidden_supplier_order({"method": method, "payload": params or {}}):
             raise ValueError("Заказ поставщику или небезопасная позиция запрещены; запрос не отправлен")
@@ -479,6 +553,9 @@ class StocrmClient:
         def do(attempt: int = 0):
             timeout = self.timeout if attempt else min(self.timeout, self.read_timeout)
             resp = self._request(method, url, params=query, timeout=timeout, allow_route_retry=idempotent)
+            self._diagnostic_emit('crm.http', method=method, http_status=resp.status_code, attempt=attempt, verb='get', idempotent=idempotent)
+            if resp.status_code != 200:
+                self._diagnostic_error_response(resp, method, 'get')
             resp.raise_for_status()
             return resp
 
@@ -488,7 +565,9 @@ class StocrmClient:
             raise StocrmError(f"Не завершён GET {method}: {type(exc).__name__}", method=method) from exc
         from .diagnostics import TRACE_ID
         log.info("CRM_HTTP_EVENT %s", json.dumps({"trace_id": TRACE_ID.get(), "method": method, "verb": "GET", "http_status": resp.status_code, "ms": round((time.monotonic()-started)*1000), "response_bytes": len(str(getattr(resp, "text", "") or "").encode("utf-8", errors="replace")), "idempotent": idempotent, "request_shape": _diagnostic_shape(params)}, ensure_ascii=False))
-        return self._unwrap(self._response_json(resp, method, params), method, tolerate_empty=idempotent)
+        raw = self._response_json(resp, method, params)
+        self._diagnostic_emit('crm.http', method=method, response=raw, http_status=resp.status_code, verb='get')
+        return self._unwrap(raw, method, tolerate_empty=idempotent)
 
     # -------------------------------------------------------------- list-хелпы
     def filtered(

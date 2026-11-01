@@ -1,2 +1,14 @@
 rossko_local_reports/
 profit_liga_local_reports/
+
+# Local configuration and diagnostics must not be committed.
+.env
+.env.*
+!.env.example
+.state/
+.venv/
+__pycache__/
+.pytest_cache/
+support_log.zip
+support_log.txt
+support_report.txt

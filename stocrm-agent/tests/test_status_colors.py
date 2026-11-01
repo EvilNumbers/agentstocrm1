@@ -50,9 +50,9 @@ def test_list_and_followup_through_bot_handler(setup):
     session, _, pipeline = setup
     history = []
     answer = run(pipeline, 'покажи последние сделки', history)
-    assert '1. №1654 🟩' in answer.answer
-    assert '2. №1712 🟨' in answer.answer
-    assert '3. №1730 🟦' in answer.answer
+    assert '🟩 1. №1654' in answer.answer
+    assert '🟨 2. №1712' in answer.answer
+    assert '🟦 3. №1730' in answer.answer
     assert pipeline._lists[19] == [1654, 1712, 1730]
     detail = run(pipeline, '2 подробнее', history)
     assert 'Сделка №1712' in detail.answer and '🟨' in detail.answer
@@ -171,3 +171,17 @@ def test_native_quantity_mismatch_stops_and_blocks_repeat(setup):
     with pytest.raises(ValueError, match='частично'):
         tools.apply_draft(draft['token'])
     assert sum(c['method'] == 'offer/order/add_free_order' for c in session.calls) == 1
+
+
+def test_status_color_first_and_short_deal_numbers_still_support_followup(setup):
+    session, _, pipeline = setup
+    session.data['offers/get_from_filter'].append({
+        'OFFER_ID': 97, 'BOARD_ID': 2, 'BOARD_NAME': 'Автосервис',
+        'STATUS_ID': 41, 'STATUS_NAME': 'Запись', 'CONTACT_TITLE': 'Клиент', 'OFFER_SUM': '1000',
+    })
+    answer = run(pipeline, 'Покажи сделки в записи', [])
+    assert '🟦 1. №1730' in answer.answer and '🟦 2. №97' in answer.answer
+    assert pipeline._lists[19] == [1730, 97]
+    detail = run(pipeline, '2 подробнее', [])
+    assert 'Сделка №97' in detail.answer
+    assert not answer.drafts and not detail.drafts

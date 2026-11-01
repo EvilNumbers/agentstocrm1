@@ -1526,7 +1526,7 @@ class BotPipeline:
         # Список запоминаем по СТРОКАМ: №1311 — такой же ID, как #1311.
         # Номера работ/заметок внутри карточки не должны становиться списком сделок.
         numbered = re.findall(
-            r"(?m)^\s*(?:[-•]\s*)?(\d{1,2})[.)]\s*(?:\*\*)?(?:[Сс]делк[аи]\s*)?[#№]\s*(\d{3,7})\b",
+            r"(?m)^\s*(?:[🟥🟧🟨🟩🟦🟪🟫⬜⬛]\ufe0f?\s*)?(?:[-•]\s*)?(\d{1,2})[.)]\s*(?:\*\*)?(?:[Сс]делк[аи]\s*)?[#№]\s*(\d{1,7})\b",
             text)
         if numbered:
             # Нельзя сдвигать номера при пропущенном/дублированном пункте.
@@ -2830,10 +2830,24 @@ class BotPipeline:
                 trace_token = TRACE_ID.set("req_" + secrets.token_hex(6))
                 token = self.router.begin_request()
                 started = time.monotonic()
-                self.tools.audit.write("bot.request.start", input_chars=len(text))
+                # В журнале только категория, длина и результат — не текст пользователя.
+                try:
+                    category = ('quick' if quick_read.is_quick_request(text) or 'быстр' in text.casefold()
+                                else 'status_list' if is_status_offers_request(text) else 'other')
+                except Exception:
+                    category = 'other'  # классификация журнала не должна менять обработку
+                self.tools.audit.write("bot.request.start", input_chars=len(text), category=category)
                 try:
                     result = await self._handle_text(text, history, user_id)
-                    self.tools.audit.write("bot.request.finish", ms=round((time.monotonic()-started)*1000), draft_count=len(result.drafts), choice_count=len(result.choices), applied_count=len(result.applied), outcome="error" if result.error else "reply")
+                    self.tools.audit.write("bot.request.finish", ms=round((time.monotonic()-started)*1000), draft_count=len(result.drafts), choice_count=len(result.choices), applied_count=len(result.applied), outcome="error" if result.error else "reply", category=category)
+                    for draft in result.drafts:
+                        if isinstance(draft, dict) and draft.get('token'):
+                            diagnostic = getattr(self.tools.audit, 'diagnostic', None)
+                            if diagnostic is not None:
+                                try:
+                                    diagnostic.audit('bot.draft', {'token': draft['token'], 'tool': draft.get('tool', '')})
+                                except Exception:
+                                    pass
                     return result
                 except asyncio.CancelledError:
                     self.tools.audit.write("bot.request.cancelled", ms=round((time.monotonic()-started)*1000))

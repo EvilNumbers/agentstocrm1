@@ -340,9 +340,15 @@ def test_two_system_contacts_are_ambiguous_even_when_one_has_extra_number(env):
 def test_unverified_work_stops_chain_before_article(env, monkeypatch):
     session, tools, pipe = env
     draft = send(pipe, 'новая быстрая сделка диагностика 1000 рублей и добавь артикул NGK CR9E цена 300').drafts[0]
-    monkeypatch.setattr(tools, '_verify_work_sum', lambda check: 'сумма не подтверждена')
+    original = tools.client.call
+    def wrong_sum(method, payload=None, **kwargs):
+        result = original(method, payload, **kwargs)
+        if method == 'work/add':
+            session.data['work/get_filtered']['DATA'][-1]['SUM'] = 1
+        return result
+    monkeypatch.setattr(tools.client, 'call', wrong_sum)
     outcome = tools.apply_draft(draft['token'])
-    assert outcome['status'] == 'partial' and 'WORK_ID' in outcome['result']
+    assert outcome['status'] == 'partial' and 'сумма' in outcome['warning']
     assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add']
 
 
