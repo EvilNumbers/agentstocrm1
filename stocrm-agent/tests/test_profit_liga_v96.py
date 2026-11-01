@@ -38,7 +38,8 @@ class Response:
     def iter_content(self, size): yield self.content
 
 @pytest.fixture
-def fake_api(monkeypatch):
+def fake_api(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     calls = []
     monkeypatch.delenv('STOCRM_MOCK', raising=False)
     monkeypatch.setenv('PROFIT_LIGA_ENABLED', '1')

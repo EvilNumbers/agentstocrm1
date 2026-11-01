@@ -1,7 +1,8 @@
 """Профит Лига: один фиксированный поиск брендов, никаких заказов.
 
 Ключ API должен передаваться поставщику в параметре secret по его документации.
-Никогда не печатаем URL с параметрами, тело ответа или сетевые исключения.
+URL с параметрами, тело ответа и сетевые исключения не выводятся в чат.
+При ошибке подробности сохраняются только локально и могут содержать личные данные.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from typing import Any
 
 import requests
 
-from . import parts
+from . import parts, profit_liga_report
 
 _SEARCH_URL = "https://api.pr-lg.ru/search/products"
 _MAX_RESPONSE = 2_000_000
@@ -64,6 +65,21 @@ def _parse(content: bytes, sku: str, secret: str) -> tuple[list[dict[str, str]],
     return found, incomplete
 
 
+class _SearchFailure(Exception):
+    """Безопасная для показа краткая ошибка поиска."""
+
+
+def _failed(trace: profit_liga_report.SearchTrace, key: str, error: str, *,
+            status: str = "unavailable", brands: list[dict[str, str]] | None = None) -> dict[str, Any]:
+    try:
+        profit_liga_report.write_report(trace, error, key)
+        note = ("Подробный ответ сохранён только на компьютере в папке profit_liga_local_reports рядом с .env "
+                "(если .env нет — в рабочей папке). Файл может содержать личные данные и секреты.")
+    except (OSError, UnicodeError, ValueError):
+        note = "Не удалось сохранить подробный локальный отчёт; проверьте права записи."
+    return {"status": status, "brands": brands or [], "error": error + " " + note}
+
+
 def search_brands(sku: str) -> dict[str, Any]:
     global _last_request
     if os.getenv("STOCRM_MOCK", "").strip() == "1" or os.getenv("PROFIT_LIGA_ENABLED", "").strip() != "1":
@@ -73,6 +89,7 @@ def search_brands(sku: str) -> dict[str, Any]:
         return {"status": "unavailable", "brands": [], "error": "Локально не задан API-ключ Профит Лиги."}
     if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 ./_-]{3,64}", sku) or not parts.sku_exact(sku):
         return {"status": "skipped", "brands": []}
+    trace = profit_liga_report.SearchTrace(article=sku)
     try:
         with _lock:
             delay = 0.25 - (time.monotonic() - _last_request)
@@ -85,24 +102,40 @@ def search_brands(sku: str) -> dict[str, Any]:
             with session.get(_SEARCH_URL, params={"secret": key, "article": sku},
                              headers={"Accept": "application/json"}, timeout=(2, 3),
                              allow_redirects=False, stream=True, verify=True) as response:
-                if response.status_code != 200:
-                    return {"status": "unavailable", "brands": [], "error": f"Сервер Профит Лиги вернул HTTP {response.status_code}."}
-                content = bytearray()
+                trace.status = response.status_code
+                trace.content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
                 for chunk in response.iter_content(16384):
-                    content.extend(chunk)
+                    remaining = _MAX_RESPONSE - len(trace.body)
+                    trace.body.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        trace.truncated = True
+                        raise _SearchFailure("Ответ Профит Лиги слишком большой.")
                     if time.monotonic() > deadline:
-                        return {"status": "unavailable", "brands": [], "error": "Истёк тайм-аут ответа Профит Лиги."}
-                    if len(content) > _MAX_RESPONSE:
-                        return {"status": "unavailable", "brands": [], "error": "Ответ Профит Лиги слишком большой."}
-        rows, incomplete = _parse(bytes(content), sku, key)
-    except requests.exceptions.SSLError:
-        return {"status": "unavailable", "brands": [], "error": "Ошибка защищённого соединения TLS с Профит Лигой."}
-    except requests.exceptions.Timeout:
-        return {"status": "unavailable", "brands": [], "error": "Истёк тайм-аут Профит Лиги."}
-    except (requests.RequestException, OSError):
-        return {"status": "unavailable", "brands": [], "error": "Не удалось выполнить сетевой запрос к Профит Лиге."}
-    except (UnicodeError, ValueError, RecursionError):
-        return {"status": "unavailable", "brands": [], "error": "Ответ Профит Лиги имеет неожиданный формат; поиск не подтверждён."}
+                        trace.truncated = True
+                        raise _SearchFailure("Истёк тайм-аут ответа Профит Лиги.")
+                trace.body_complete = True
+                if response.status_code != 200:
+                    raise _SearchFailure(f"Сервер Профит Лиги вернул HTTP {response.status_code}.")
+        rows, incomplete = _parse(bytes(trace.body), sku, key)
+    except _SearchFailure as exc:
+        if trace.status is not None and trace.status != 200 and "HTTP " not in str(exc):
+            return _failed(trace, key, f"Сервер Профит Лиги вернул HTTP {trace.status}; ответ прочитан не полностью.")
+        return _failed(trace, key, str(exc))
+    except (requests.RequestException, OSError) as exc:
+        trace.exception(exc)
+        if trace.status is not None and trace.status != 200:
+            error = f"Сервер Профит Лиги вернул HTTP {trace.status}; ответ прочитан не полностью."
+        elif isinstance(exc, requests.exceptions.SSLError):
+            error = "Ошибка защищённого соединения TLS с Профит Лигой."
+        elif isinstance(exc, requests.exceptions.Timeout):
+            error = "Истёк тайм-аут Профит Лиги."
+        else:
+            error = "Не удалось выполнить сетевой запрос к Профит Лиге."
+        return _failed(trace, key, error)
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        trace.exception(exc)
+        return _failed(trace, key, "Ответ Профит Лиги имеет неожиданный формат; поиск не подтверждён.")
     if incomplete:
-        return {"status": "partial", "brands": rows, "error": "Некоторые строки ответа не удалось проверить; список может быть неполным."}
+        return _failed(trace, key, "Некоторые строки ответа не удалось проверить; список может быть неполным.",
+                       status="partial", brands=rows)
     return {"status": "ok" if rows else "empty", "brands": rows}
