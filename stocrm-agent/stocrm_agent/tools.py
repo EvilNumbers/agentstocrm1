@@ -953,12 +953,40 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if isinstance(value, bool) or not re.fullmatch(r'[1-9][0-9]{0,19}', str(value)):
                 return None
             return int(value)
+        value = row.get('STATUS_ID')
+        if 'STATUS_ID' not in row:
+            status_shape = 'поле отсутствует'
+        elif value is None:
+            status_shape = 'null'
+        elif isinstance(value, bool):
+            status_shape = 'логическое значение'
+        elif isinstance(value, str):
+            status_shape = ('пустая строка' if not value.strip() else
+                            'числовая строка с пробелами' if value.strip().isdigit() and value != value.strip() else
+                            'числовая строка' if value.isdigit() else 'другая строка')
+        elif isinstance(value, int):
+            status_shape = 'целое число'
+        elif isinstance(value, float):
+            status_shape = 'число с десятичной точкой'
+        else:
+            status_shape = 'другой тип'
+        reference: dict[str, Any] = {'status': 'unavailable'}
+        try:
+            from .bot import quick_read
+            from .booking import key
+            bid, sid = quick_read.status_identity(self)
+            name = row.get('STATUS_NAME')
+            name_matches = key(name) == 'быстрые сделки' if isinstance(name, str) and name.strip() else None
+            reference = {'status': 'ok', 'board_id': bid, 'status_id': sid, 'name_matches': name_matches}
+        except Exception:  # noqa: BLE001 — не публикуем текст CRM/ключи
+            pass
         return {'status': 'ok',
                 'offer_id_matches': number(row.get('OFFER_ID')) == offer_id,
                 'contact_id_present': number(row.get('CONTACT_ID')) is not None,
                 'board_id': number(row.get('BOARD_ID')),
-                'status_id': number(row.get('STATUS_ID')),
-                'status_name_present': isinstance(row.get('STATUS_NAME'), str) and bool(row.get('STATUS_NAME', '').strip())}
+                'status_id': number(value), 'status_id_shape': status_shape,
+                'status_name_present': isinstance(row.get('STATUS_NAME'), str) and bool(row.get('STATUS_NAME', '').strip()),
+                'quick_reference': reference}
 
     def balance_diagnostic(self, offer_id: int) -> dict[str, Any]:
         """Только структура ответа и флаги проверки; суммы и данные клиента не возвращаем."""
