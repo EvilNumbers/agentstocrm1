@@ -2833,6 +2833,17 @@ class BotPipeline:
         if quick_read.is_quick_request(text):
             self._quick_pending.pop(user_id or 0, None)
             return await asyncio.to_thread(self._quick_read, text, user_id or 0)
+        # Статусный список никогда не отдаём предыдущим незавершённым сценариям
+        # или модели: они могут подменить его общей выборкой активных сделок.
+        if is_status_offers_request(text):
+            self._lists.pop(user_id or 0, None)
+            self._contact_lookups.pop(user_id or 0, None)
+            answer = await asyncio.to_thread(try_answer, text, self.tools)
+            body = answer[0] if answer else 'Не удалось проверить статус. Общий список сделок не подменяю.'
+            self._remember_list(user_id, body)
+            history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': body}])
+            del history[:max(0, len(history) - self.s.max_history_messages)]
+            return PipelineResult(answer=body)
         self._quick_choices.pop(user_id or 0, None)
         quick_price = await asyncio.to_thread(self._quick_price_reply, text, user_id or 0)
         if quick_price is not None:
