@@ -2508,8 +2508,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 tried.append("Профит Лига: точных брендов в ответе нет; отсутствие детали не доказано")
             elif pstatus in {"unavailable", "partial"}:
                 warning = "Профит Лига: поиск недоступен или неполон; отсутствие детали не доказано"
-                tried.append(warning)
-                errors.append(warning + ": " + str(profit_result.get("error") or "недоступно"))
+                detail = warning + ": " + str(profit_result.get("error") or "недоступно")
+                tried.append(detail)
+                errors.append(detail)
 
         # 5b) интернет: артикула нет в панели — узнаём бренды по реальным сайтам.
         #     Бренд не выдумываем: только упоминания в выдаче, со ссылкой.
