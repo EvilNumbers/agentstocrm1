@@ -15,6 +15,7 @@ from typing import Any
 
 #: Как называть методы панели по-русски (для строки «Применено: …»).
 METHOD_TITLES = {
+    "quick_deal": "быстрая сделка проверена",
     "calendar/card/new": "создание записи календаря",
     "calendar/card/edit": "изменение записи календаря",
     "calendar/card/get": "просмотр календаря",
@@ -187,7 +188,7 @@ def format_apply_result(method: str, result: Any, *, summary: str = "", warning:
     if supplier:
         lines.append(f"• поставщик: {supplier}")
 
-    if method in ("booking", "existing_booking"):
+    if method in ("booking", "existing_booking", "quick_deal"):
         if warning and not any(it.get("CONTACT_ID") or it.get("OFFER_ID") or it.get("CARD_ID") for it in items):
             lines.append("Номера созданных объектов неизвестны — проверьте панель перед повтором.")
         for item in items:

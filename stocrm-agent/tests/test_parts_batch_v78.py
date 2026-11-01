@@ -37,8 +37,8 @@ def writes(session):
 
 def dialog(pipe):
     first = send(pipe, 'Добавь товары Ch88011 за 1200\nCh88014e за 4200')
-    second = send(pipe, 'добавь как указано')
-    final = send(pipe, 'добавь как указано')
+    second = send(pipe, 'TESTBRAND')
+    final = send(pipe, 'TESTBRAND')
     return first, second, final
 
 
@@ -86,9 +86,9 @@ def test_auto_waits_for_all_choices_then_queue(env):
     session, _, pipe = env
     pipe.router.policy.set_confirm_all(False)
     first = send(pipe, 'Добавь товары Ch88011 за 1200\nCh88014e за 4200')
-    second = send(pipe, 'добавь как указано')
+    second = send(pipe, 'TESTBRAND')
     assert first.choices and second.choices and not writes(session)
-    final = send(pipe, 'добавь как указано')
+    final = send(pipe, 'TESTBRAND')
     assert final.applied and len(writes(session)) == 4 and not final.drafts
 
 
@@ -96,8 +96,8 @@ def test_missing_price_and_cancel_and_skip(env):
     session, _, pipe = env
     first = send(pipe, 'Добавь товары Ch88011 за 1200\nCh88014e')
     assert first.choices
-    assert send(pipe, 'добавь как указано').choices[0]['args']['sku'] == 'CH88014E'
-    price = send(pipe, 'добавь как указано')
+    assert send(pipe, 'TESTBRAND').choices[0]['args']['sku'] == 'CH88014E'
+    price = send(pipe, 'TESTBRAND')
     assert price.choices[0]['_group_step'] == 'price' and not writes(session)
     labels = [b.text for row in part_keyboard('x', [], text_only=True).inline_keyboard for b in row]
     assert labels == ['❌ Отмена']
@@ -108,7 +108,7 @@ def test_missing_price_and_cancel_and_skip(env):
     assert 'отменена' in send(pipe, 'отмена').answer.lower() and not writes(session)
     send(pipe, 'Добавь товары Ch99011 за 1000\nCh99014 за 2000')
     send(pipe, 'пропусти')
-    only = send(pipe, 'добавь как указано')
+    only = send(pipe, 'TESTBRAND')
     assert len(only.drafts) == 1 and only.drafts[0]['check']['sku'] == 'CH99014'
 
 
@@ -151,7 +151,7 @@ def test_preparing_draft_cannot_be_applied(env):
     session, tools, _ = env
     t = BATCH_PREPARING.set(True)
     try:
-        d = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', price=1200)
+        d = tools.draft_add_offer_part(offer_id=1654, name='CH88011', sku='CH88011', brand='TESTBRAND', price=1200)
     finally:
         BATCH_PREPARING.reset(t)
     with pytest.raises(ValueError, match='собирается'):
@@ -193,7 +193,7 @@ def test_search_one_provider_cached_and_respects_429(monkeypatch):
 
 def test_no_order_id_or_no_deal_in_readback_is_not_success(env):
     session, tools, _ = env
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH12345', sku='CH12345', price=1234)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH12345', sku='CH12345', brand='TESTBRAND', price=1234)
     original = session._add_order
     def no_id(method, payload):
         original(method, payload)
@@ -254,11 +254,11 @@ def test_telegram_callbacks_no_early_confirmation(env, monkeypatch, tmp_path):
             'message':{'message_id':101,'date':1,'chat':chat,'text':first.text}}}))
         assert not writes(session)
         assert not any(b.callback_data.startswith('ap:') for m in messages() if m.reply_markup for r in m.reply_markup.inline_keyboard for b in r)
-        question_msgs = [m for m in messages() if m.reply_markup and any(b.callback_data.endswith(':manual') for r in m.reply_markup.inline_keyboard for b in r)]
-        second = question_msgs[-1]
-        assert 'CH88014E' in second.text
-        await dp.feed_update(bot, update({'update_id':3,'callback_query':{'id':'q2','from':user,'chat_instance':'x', 'data':button(second, ':manual'),
-            'message':{'message_id':102,'date':1,'chat':chat,'text':second.text}}}))
+        # Кнопка ручного добавления без бренда не создаёт черновик: нужен ввод.
+        assert any('бренд' in str(getattr(m, 'text', '')).lower() for m in fake.methods)
+        await dp.feed_update(bot, update({'update_id':3,'message':{'message_id':3,'date':1,'chat':chat,'from':user,'text':'TESTBRAND'}}))
+        assert not writes(session)
+        await dp.feed_update(bot, update({'update_id':4,'message':{'message_id':4,'date':1,'chat':chat,'from':user,'text':'TESTBRAND'}}))
         ready = next(m for m in messages() if m.reply_markup and any(b.callback_data.startswith('ap:') for r in m.reply_markup.inline_keyboard for b in r))
         assert 'CH88011' in ready.text and 'CH88014E' in ready.text
         assert not writes(session)
@@ -290,16 +290,16 @@ def test_more_than_four_split_and_keep_each_sku(env, monkeypatch):
     assert calls == [['AB11001', 'AB11002', 'AB11003', 'AB11004'], ['AB11005']]
     assert first.choices and not first.drafts
     for _ in range(4):
-        result = send(pipe, 'добавь как указано')
+        result = send(pipe, 'TESTBRAND')
         assert result.choices and not result.drafts
-    final = send(pipe, 'добавь как указано')
+    final = send(pipe, 'TESTBRAND')
     assert [x['price'] for x in final.drafts[0]['check']['items']] == [1000,2000,3000,4000,5000]
 
 
 def test_single_with_wrong_quantity_is_partial_without_correction(env):
     session, tools, _ = env
     tools.price_methods = ['offer/order/change']
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH12345', sku='CH12345', price=1234, qty=2)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH12345', sku='CH12345', brand='TESTBRAND', price=1234, qty=2)
     original = session._add_order
     def wrong(method, payload):
         result = original(method, payload)
@@ -315,7 +315,7 @@ def test_single_with_wrong_quantity_is_partial_without_correction(env):
 
 def test_missing_offer_in_readback_is_partial(env):
     session, tools, _ = env
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH22345', sku='CH22345', price=1234)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH22345', sku='CH22345', brand='TESTBRAND', price=1234)
     original = session._add_order
     def no_offer(method, payload):
         result = original(method, payload)
@@ -342,8 +342,8 @@ def test_quantity_price_retained_per_position(env):
     session, _, pipe = env
     first = send(pipe, 'Добавь в сделку 1654 2 шт CH88011 за 1200 и 3 шт CH88014E за 4200')
     assert first.choices
-    send(pipe, 'добавь как указано')
-    result = send(pipe, 'добавь как указано')
+    send(pipe, 'TESTBRAND')
+    result = send(pipe, 'TESTBRAND')
     assert [(x['sku'],x['price'],x['qty']) for x in result.drafts[0]['check']['items']] == [('CH88011',1200,2),('CH88014E',4200,3)]
     assert not writes(session)
 
@@ -387,7 +387,7 @@ def test_review_cannot_confirm_unstarted_or_old_match(env):
     d = result.drafts[0]
     with pytest.raises(StocrmError):
         tools.apply_draft(d['token'])
-    session._order_rows().append({'ORDER_ID':999999,'OFFER_ID':1654,'SKU':'CH88014E','BRAND':'NONAME',
+    session._order_rows().append({'ORDER_ID':999999,'OFFER_ID':1654,'SKU':'CH88014E','BRAND':'TESTBRAND',
         'NAME':'CH88014E','QUANTITY':1,'PRICE':4200,'ACTIVE':'Y'})
     review = tools.review_draft(d['token'])
     assert not review['verified']
@@ -402,9 +402,9 @@ def test_batch_safety_does_not_depend_on_fastpath_setting(env):
     pipe.fastpath = False
     first = send(pipe, 'Добавь в сделку 1654 CH88011 за 1200 и CH88014E за 4200')
     assert first.choices and not first.drafts and not writes(session)
-    second = send(pipe, 'добавь как указано')
+    second = send(pipe, 'TESTBRAND')
     assert second.choices and not second.drafts and not writes(session)
-    final = send(pipe, 'добавь как указано')
+    final = send(pipe, 'TESTBRAND')
     assert len(final.drafts) == 1 and len(final.drafts[0]['check']['items']) == 2
 
 
@@ -447,7 +447,7 @@ def test_prepared_before_partial_is_blocked_at_claim(env):
 
 def test_archived_partial_can_only_be_cleared_after_proven_readback(env):
     session, tools, _ = env
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH22345', sku='CH22345', price=1234)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH22345', sku='CH22345', brand='TESTBRAND', price=1234)
     original = session._add_order
     def wrong(method, payload):
         response = original(method, payload)
@@ -462,12 +462,12 @@ def test_archived_partial_can_only_be_cleared_after_proven_readback(env):
     session._order_rows()[-1]['QUANTITY'] = 1
     confirmed = tools.confirm_draft_result(draft['token'])
     assert confirmed['status'] == 'applied' and not confirmed['archived_partial']
-    tools.draft_add_offer_part(offer_id=1654, name='CH22345', sku='CH22345', price=1234)
+    tools.draft_add_offer_part(offer_id=1654, name='CH22345', sku='CH22345', brand='TESTBRAND', price=1234)
 
 
 def test_legacy_applied_warning_is_blocked_and_reviewable(env):
     session, tools, _ = env
-    draft = tools.draft_add_offer_part(offer_id=1654, name='CH32345', sku='CH32345', price=1234)
+    draft = tools.draft_add_offer_part(offer_id=1654, name='CH32345', sku='CH32345', brand='TESTBRAND', price=1234)
     original = session._add_order
     def wrong(method, payload):
         response = original(method, payload)
@@ -477,6 +477,6 @@ def test_legacy_applied_warning_is_blocked_and_reviewable(env):
     tools.apply_draft(draft['token'])
     tools.drafts.mark(draft['token'], 'applied', check_warning='неверное количество')
     with pytest.raises(ValueError, match='непроверенная попытка'):
-        tools.draft_add_offer_part(offer_id=1654, name='CH32345', sku='CH32345', price=1234)
+        tools.draft_add_offer_part(offer_id=1654, name='CH32345', sku='CH32345', brand='TESTBRAND', price=1234)
     session._order_rows()[-1]['QUANTITY'] = 1
     assert tools.confirm_draft_result(draft['token'])['review']['verified']

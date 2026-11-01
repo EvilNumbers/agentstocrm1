@@ -281,6 +281,26 @@ def brand_key(value: str | None) -> str:
     return re.sub(r"[^0-9a-zа-я]+", "", text)
 
 
+def known_brand(value: Any) -> bool:
+    """Не подменять неизвестного производителя технической заглушкой."""
+    normalized = brand_key(str(value or ""))
+    return bool(normalized and normalized not in {brand_key(x) for x in (
+        "NONAME", "UNKNOWN", "UNKNOWN BRAND", "без бренда", "неизвестно", "неизвестен", "неизвестный", "не знаю", "не указан", "не указано", "нет", "NO BRAND"
+    )})
+
+
+def manual_brand(text: str) -> str | None:
+    """Название, явно введённое человеком при вопросе о производителе."""
+    value = re.sub(r"^\s*(?:бренд|производитель)\s*[:—-]?\s*", "", str(text or ""), flags=re.I).strip().strip(".,:;«»")
+    if re.match(r"^(?:цена|ценой|стоимость|количество|артикул|добавь|удали|измени)\b", value, re.I):
+        return None
+    if not 2 <= len(value) <= 60 or not re.fullmatch(r"[\wА-Яа-яЁё&+.' /-]+", value, re.UNICODE):
+        return None
+    if not known_brand(value) or normalize_text(value) in {"не знаю", "неизвестно", "неизвестен", "добавь как указано", "добавить как указано", "отмена", "пропусти", "пропустить", "повтори поиск", "manual", "retry", "skip"}:
+        return None
+    return value
+
+
 # Индекс алиасов: ключ считается той же функцией brand_key, поэтому «трв»/«trw»/«TRW»
 # и «ВОSСН»/«BOSCH» сходятся автоматически.
 _BRAND_INDEX: dict[str, str] | None = None

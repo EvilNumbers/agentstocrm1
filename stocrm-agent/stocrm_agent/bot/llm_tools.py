@@ -1271,14 +1271,12 @@ class ToolRouter:
                 sku=sku or None,
                 offer_id=args.get("offer_id"),
             )
-        except Exception as exc:  # нет прав/сеть/API — не роняем диалог
-            return ToolOutcome(payload=json.dumps({
-                "error": f"не удалось подобрать запчасть: {exc}",
-                "hint": "проверьте права ключа на склад и номенклатуру",
-            }, ensure_ascii=False))
+        except Exception:  # ошибка источника не означает отсутствия детали
+            return self._part_choice(tool=PART_TOOL, args=args, candidates=[], query=name or sku,
+                                     status="not_found", tried=["источники недоступны, поиск не завершён"])
 
         status = found.get("status")
-        if status == "matched" and found.get("best"):
+        if status == "matched" and found.get("best") and parts.known_brand(found['best'].get('brand') or brand):
             self._apply_part(args, found["best"])
             return None
 
@@ -1354,6 +1352,7 @@ class ToolRouter:
             hinted_qty = self._hint_qty(args) or self.qty_hint
             if hinted_qty:
                 args["qty"] = hinted_qty
+        candidates = [c for c in candidates if parts.known_brand(c.get("brand"))]
         shortlist = [
             {
                 "index": number,
@@ -1379,7 +1378,7 @@ class ToolRouter:
                 question = (f"Точное совпадение «{article}» в проверенных источниках не подтвердил. "
                             "Другие артикулы вместо него не предлагаю. "
                             + ("Бренд и артикул сохранены; можно уточнить название детали для поиска." if args.get("brand") else
-                               "Артикул и указанные цена/количество сохранены; уточните бренд, если известен, или название детали для поиска."))
+                               "Артикул и указанные цена/количество сохранены; введите бренд вручную."))
             else:
                 question = (f"В панели не нашёл «{query}». Продиктуйте точнее: бренд и артикул — "
                             "или уточните название детали для поиска.")
@@ -1397,7 +1396,7 @@ class ToolRouter:
                 question += " Интернет-поиск был недоступен или не завершился; это не означает, что товара нет."
             elif any("интернет" in item.lower() for item in (tried or [])):
                 question += " В полученной выдаче не удалось подтвердить производителя для этого артикула."
-            question += " Можно добавить свободную позицию ровно по вашим данным, без проверки применяемости: напишите «добавь как указано». Неуказанные бренд/артикул останутся неизвестными. Также доступны «повтори поиск», «пропусти», «отмена»."
+            question += (" Можно добавить свободную позицию по вашим данным без проверки применяемости: «добавь как указано»." if parts.known_brand(args.get("brand")) else " Введите бренд вручную: автоматически неизвестный бренд не подставляю. Некоторые источники могут быть недоступны; отсутствие товара не доказано.") + " Также доступны «повтори поиск», «пропусти», «отмена»."
         payload = json.dumps({
             "status": "нужно уточнить запчасть",
             "question": question,
