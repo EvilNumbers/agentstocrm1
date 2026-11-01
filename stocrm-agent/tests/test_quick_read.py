@@ -52,7 +52,7 @@ def test_selection_revalidates_status_and_contact(env):
     target = choice['offers'][0]
     for row in session.data['offers/get_from_filter']:
         if row['OFFER_ID'] == target:
-            row['STATUS_ID'] = 15
+            row.update(STATUS_ID=15, STATUS_NAME='В работе')
     assert 'не удалось подтвердить' in pipe.quick_read_choice(choice, 1, 0).answer.lower()
 
 

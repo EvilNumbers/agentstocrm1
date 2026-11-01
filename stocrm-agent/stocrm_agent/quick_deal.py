@@ -35,12 +35,12 @@ def _status_reason(tools: Any, ids: tuple[int, int, int], selected: int | None =
     return matches[0]
 
 
-def _all_offer_ids(tools: Any, contact_id: int) -> set[int]:
+def _all_offer_ids(tools: Any) -> set[int]:
     seen: set[int] = set()
     for page in range(1, 21):
-        raw = tools._read('quick_prior_offers', 'offers/get_from_filter', {'FILTER': {'CONTACT_ID': contact_id}, 'SORT': {'DATE_CREATE': 'DESC'}, 'PAGE': page, 'LIMIT': 500})
+        raw = tools._read('quick_prior_offers', 'offers/get_from_filter', {'FILTER': {}, 'SORT': {'DATE_CREATE': 'DESC'}, 'PAGE': page, 'LIMIT': 500})
         if raw is None or isinstance(raw, bool) or not isinstance(raw, (list, dict)):
-            raise ValueError('Не удалось проверить прежние сделки контакта')
+            raise ValueError('Не удалось проверить прежние сделки')
         rows = _rows(raw)
         if isinstance(raw, dict) and raw and not rows and not any(isinstance(raw.get(k), list) and not raw[k] for k in ('DATA', 'ITEMS', 'LIST', 'ROWS')):
             raise ValueError('Неизвестный формат списка прежних сделок; запись не начата')
@@ -54,47 +54,27 @@ def _all_offer_ids(tools: Any, contact_id: int) -> set[int]:
     raise ValueError('Список прежних сделок неполный')
 
 
-def _assert_offer(tools: Any, ids: tuple[int, int, int], oid: int, *, after_status_change: bool = False) -> None:
-    # Некоторые системы возвращают прежнее состояние сразу после записи. Только
-    # здесь допускаем несколько свежих ЧТЕНИЙ; никаких повторов записи. В любой
-    # другой момент несоответствие сразу останавливает операцию.
+def _assert_offer(tools: Any, ids: tuple[int, int, int], oid: int, *,
+                  after_status_change: bool = False, number_only: bool = False) -> None:
+    """Проверяет номер; при выборе и переводе дополнительно — название статуса."""
     delays = (0.0, 0.5, 1.0, 2.0) if after_status_change else (0.0,)
-    fields = ('CONTACT_ID', 'BOARD_ID', 'STATUS_ID')
     problem = ''
     for delay in delays:
         if delay:
             time.sleep(delay)
         tools._invalidate_cache()
-        if quick_read.identity(tools) != ids:
-            raise ValueError('Системный контакт или статус изменились')
+        if not number_only and quick_read.status_identity(tools)[0] != ids[1]:
+            raise ValueError('Воронка статуса в справочнике изменилась')
         row, _ = tools._search_offer_row(oid)
-        if row and str(row.get('OFFER_ID')) == str(oid) and tuple(str(row.get(k)) for k in fields) == tuple(map(str, ids)):
+        if not row or str(row.get('OFFER_ID')) != str(oid):
+            problem = 'сделка не найдена или номер не совпал'
+        elif number_only:
             return
-        # При отсутствующем ключе пробуем только чтение в формате волны 81 —
-        # без REQUIRED_FIELDS. Название не подменяет ID; все идентификаторы
-        # должны совпасть в каждой из двух строк, повторов записи здесь нет.
-        if (row and 'STATUS_ID' not in row and str(row.get('OFFER_ID')) == str(oid)
-                and str(row.get('CONTACT_ID')) == str(ids[0]) and str(row.get('BOARD_ID')) == str(ids[1])):
-            try:
-                legacy = tools._search_offer_row_without_required_fields(oid)
-            except Exception:  # noqa: BLE001 — ошибка чтения не подтверждает статус
-                legacy = None
-            if (legacy and str(legacy.get('OFFER_ID')) == str(oid)
-                    and tuple(str(legacy.get(k)) for k in fields) == tuple(map(str, ids))):
-                return
-        if not row:
-            problem = 'сделка не найдена в ответе CRM'
+        elif quick_read.quick_status_name(tools, row.get('BOARD_ID'), row.get('STATUS_NAME'), ids[1:]) == 'name':
+            return
         else:
-            # Не копируем произвольное содержимое CRM в предупреждение или лог.
-            differences = []
-            for field, expected in zip(fields, ids):
-                value = row.get(field)
-                if str(value) != str(expected):
-                    actual = str(value).strip()
-                    actual = actual if actual.isascii() and actual.isdigit() and len(actual) <= 20 else 'не получен'
-                    differences.append(f'{field}: ожидался {expected}, получен {actual}')
-            problem = '; '.join(differences)
-    raise ValueError(f'Сделка №{oid}: контакт, воронка или статус не подтверждены при чтении CRM ({problem})')
+            problem = 'воронка или название статуса «Быстрые сделки» не подтверждены'
+    raise ValueError(f'Сделка №{oid}: {problem}')
 
 
 def positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -107,7 +87,7 @@ def positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def summary_for(payload: dict[str, Any]) -> str:
     oid, reason = payload.get('offer_id'), payload.get('reason')
     summary = (f'Создать новую быструю сделку для {quick_read.NAME} ({quick_read.PHONE})' if not oid
-               else f'Добавить в быструю сделку №{oid} контакта {quick_read.NAME} ({quick_read.PHONE})')
+               else f'Добавить в быструю сделку №{oid}')
     summary += f'; воронка №{payload["board_id"]}, статус «Быстрые сделки»'
     if reason:
         summary += f'; причина перехода «{reason["title"]}»'
@@ -117,7 +97,11 @@ def summary_for(payload: dict[str, Any]) -> str:
             rows.append(f'{i}. Работа «{item["title"]}» — {item["price"]:g} ₽')
         else:
             rows.append(f'{i}. Артикул {item["title"]}, бренд {item["brand"]} — {item["price"]:g} ₽ × {item["qty"]}')
-    return summary + '\n' + '\n'.join(rows) + '\nСвободные позиции без заказа поставщику.'
+    if not rows:
+        rows.append('Без услуг и товаров.')
+    policy = ('Системный контакт передаётся при создании; фактический контакт сделки не сверяется. После перевода статус проверяется по названию; затем позиции добавляются по номеру сделки, даже если статус или контакт изменится.'
+              if not oid else 'Статус выбранной сделки проверяется по названию; затем позиции добавляются по её номеру, даже если статус или контакт изменится.')
+    return summary + '\n' + '\n'.join(rows) + '\n' + policy + '\nСвободные позиции без заказа поставщику.'
 
 
 def drop_position(tools: Any, token: str, *, number: int | None, query: str | None) -> dict[str, Any]:
@@ -156,9 +140,9 @@ def drop_position(tools: Any, token: str, *, number: int | None, query: str | No
 
 def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
             work: dict[str, Any] | None, articles: list[dict[str, Any]], reason_id: int | None = None) -> dict[str, Any]:
-    if quick_read.identity(tools) != ids:
-        raise ValueError('Контакт или статус изменились')
-    if not work and not articles:
+    if (quick_read.identity(tools) != ids if not offer_id else quick_read.status_identity(tools)[0] != ids[1]):
+        raise ValueError('Контакт создания или воронка статуса изменились')
+    if not work and not articles and offer_id:
         raise ValueError('Назовите работу или артикул')
     if work and not str(work.get('title') or '').strip():
         raise ValueError('Название работы не указано')
@@ -173,7 +157,8 @@ def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
             raise ValueError('Артикул, бренд и количество не подтверждены')
     reason = _status_reason(tools, ids, reason_id) if not offer_id else None
     payload = {'contact_id': ids[0], 'board_id': ids[1], 'status_id': ids[2],
-               'offer_id': offer_id, 'work': work, 'articles': articles, 'reason': reason}
+               'offer_id': offer_id, 'work': work, 'articles': articles, 'reason': reason,
+               'confirmation_policy': 'status_name_offer_number_v110'}
     summary = summary_for(payload)
     # Атомарный запрет на параллельные / непроверенные составные операции.
     store = tools.drafts
@@ -193,12 +178,15 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
     # validate fingerprint before consulting any payload or doing I/O
     current = tools.drafts.verify(token)
     p = current['payload']
+    if p.get('confirmation_policy') != 'status_name_offer_number_v110':
+        raise ValueError('Старый черновик не содержит новых условий проверки. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторяйте')
     if any(not parts.known_brand(item.get('brand')) for item in p.get('articles') or []):
         raise ValueError('В старом черновике не указан бренд. Отмените его, если запись не отправлялась, и укажите бренд вручную; CRM не изменена')
     ids = (int(p['contact_id']), int(p['board_id']), int(p['status_id']))
-    if current.get('method') != 'quick_deal' or current.get('steps') or quick_read.identity(tools) != ids:
-        raise ValueError('Контакт, статус или состав черновика изменились; запись не начата')
     oid = p.get('offer_id')
+    identity_changed = (quick_read.identity(tools) != ids if not oid else quick_read.status_identity(tools)[0] != ids[1])
+    if current.get('method') != 'quick_deal' or current.get('steps') or identity_changed:
+        raise ValueError('Контакт создания, воронка или состав черновика изменились; запись не начата')
     prior = set()
     if oid:
         _assert_offer(tools, ids, int(oid))
@@ -207,12 +195,14 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
         if _status_reason(tools, ids, (p.get('reason') or {}).get('id')) != p.get('reason'):
             raise ValueError('Причина перехода изменилась; подготовьте черновик заново')
         tools._booking_uncertain_client(quick_read.PHONE, ids[0])
-        prior = _all_offer_ids(tools, ids[0])
+        prior = _all_offer_ids(tools)
     claimed = tools.drafts.claim(token)
     if claimed.get('payload') != p or claimed.get('method') != 'quick_deal' or claimed.get('steps'):
         tools.drafts.release(token, reason='Черновик изменился во время проверки')
         raise ValueError('Черновик изменился во время проверки; запись не начата')
-    result: dict[str, Any] = {'CONTACT_ID': ids[0], 'OFFER_ID': oid, 'completed': []}
+    result: dict[str, Any] = {'OFFER_ID': oid, 'completed': []}
+    if not oid:
+        result['REQUESTED_CONTACT_ID'] = ids[0]
     stage = 'подготовка'
     try:
         def mark(message: str) -> None:
@@ -229,10 +219,10 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError('CRM вернула ID существовавшей сделки')
             tools._invalidate_cache()
             row, _ = tools._search_offer_row(oid)
-            if not row or str(row.get('CONTACT_ID')) != str(ids[0]) or str(row.get('BOARD_ID')) != str(ids[1]):
-                raise ValueError('Новая сделка и контакт не подтверждены')
-            if quick_read.identity(tools) != ids:
-                raise ValueError('Системный контакт или статус изменились')
+            if not row or str(row.get('OFFER_ID')) != str(oid) or str(row.get('BOARD_ID')) != str(ids[1]):
+                raise ValueError('Номер или воронка новой сделки не подтверждены')
+            if quick_read.status_identity(tools) != ids[1:]:
+                raise ValueError('Статус в справочнике изменился')
             result['completed'].append('создание сделки')
             status = {'OFFER_ID': oid, 'BOARD_ID': ids[1], 'STATUS_ID': ids[2]}
             if p.get('reason'):
@@ -246,7 +236,7 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             mark('статус подтверждён')
         oid = int(oid)
         if p.get('work'):
-            _assert_offer(tools, ids, oid)
+            _assert_offer(tools, ids, oid, number_only=True)
             work = p['work']
             before = tools.offer_works(oid, limit=200)
             if len(before) >= 200:
@@ -260,7 +250,7 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             mark('проверка работы')
             if str(wid) in known:
                 raise ValueError('CRM вернула номер существовавшей работы')
-            _assert_offer(tools, ids, oid)
+            # _find_work / _verify_work_sum сами сверяют работу с номером сделки.
             check = {'offer_id': oid, 'work_id': wid, 'title': work['title'], 'sum': work['price']}
             row = tools._find_work(check)
             if not row or key(row.get('title')) != key(work['title']):
@@ -273,7 +263,7 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             result['completed'].append(f'работа «{work["title"]}»')
             mark('работа подтверждена')
         for item in p.get('articles') or []:
-            _assert_offer(tools, ids, oid)
+            _assert_offer(tools, ids, oid, number_only=True)
             tools.drafts.assert_part_unblocked({'offer_id': oid, 'sku': item['sku'], 'brand': item['brand']})
             before, problem = tools._offer_parts_details(oid)
             if problem:
@@ -288,7 +278,7 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             if _id_from(response, 'OFFER_ID') != oid:
                 raise ValueError('CRM не подтвердила, что искомый артикул принадлежит этой сделке')
             mark(f'артикул {item["sku"]}: искомая позиция подтверждена ответом CRM')
-            _assert_offer(tools, ids, oid)
+            _assert_offer(tools, ids, oid, number_only=True)
             mark(f'свободная позиция {item["sku"]}: запрос отправляется')
             response = tools.client.call('offer/order/add_free_order', {'REQUIRE_ID': rid, 'NAME': item['sku'], 'BRAND': item['brand'], 'SKU': item['sku'], 'PRICE': float(item['price']), 'NEED_MARKUP': False, 'AMOUNT': item['qty'], 'CURRENT_VOLUME': item['qty'], 'MIN_VOLUME': 1})
             order_id = _id_from(response, 'ORDER_ID')
@@ -296,7 +286,7 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
             mark(f'проверка позиции {item["sku"]}')
             if str(order_id) in known:
                 raise ValueError('CRM вернула номер существовавшей позиции')
-            _assert_offer(tools, ids, oid)
+            # Проверка добавленной строки ниже сверяет её принадлежность сделке.
             check = {'offer_id': oid, 'sku': item['sku'], 'name': item['sku'], 'brand': item['brand'], 'price': item['price'], 'qty': item['qty'], 'order_id': order_id}
             info = tools._check_added_line(check)
             if info.get('error') or info.get('problems'):

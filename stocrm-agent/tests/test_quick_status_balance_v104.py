@@ -35,20 +35,21 @@ def test_status_includes_other_contacts_but_each_card_is_its_own(env):
                                    'offer/require/add', 'offer/order/add_free_order'} for c in session.calls)
 
 
-def test_wrong_contact_or_status_after_list_cannot_be_selected(env):
+def test_contact_change_after_list_shows_current_card(env):
     session, pipe = env
     choice = send(pipe, 'Покажи быстрые сделки').choices[0]
     oid = choice['offers'][0]
     for row in session.data['offers/get_from_filter']:
         if row['OFFER_ID'] == oid:
             row['CONTACT_ID'] = 9999
-    assert 'не удалось подтвердить' in pipe.quick_read_choice(choice, 1, 0).answer.lower()
+    answer = pipe.quick_read_choice(choice, 1, 0).answer.lower()
+    assert '№1900' in answer and 'контакт №9999' in answer
 
 
 def test_unknown_status_cannot_be_reported_as_empty(env):
     session, pipe = env
     for row in session.data['offers/get_from_filter']:
-        row['STATUS_ID'] = None
+        row['STATUS_NAME'] = None
     response = send(pipe, 'Покажи быстрые сделки')
     assert not response.choices and 'неполон' in response.answer
     assert not any('не найдено' in response.answer for _ in [0])

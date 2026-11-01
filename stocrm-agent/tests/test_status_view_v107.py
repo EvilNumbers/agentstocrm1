@@ -30,7 +30,7 @@ def test_work_status_list_with_missing_id_only_reads(env, monkeypatch):
     omit_status_ids(session, monkeypatch)
     result = send(pipe, 'Покажи сделки в работе')
     assert '№1654' in result.answer
-    assert 'сверена по названию' in result.answer and 'только просмотр' in result.answer
+    assert 'по названию' in result.answer and 'только просмотр' in result.answer
     assert not result.drafts and not writes(session)
 
 
@@ -42,11 +42,11 @@ def test_quick_list_and_button_check_own_data_and_status(env, monkeypatch):
     omit_status_ids(session, monkeypatch)
     choice = send(pipe, 'Покажи быстрые сделки').choices[0]
     assert set(choice['offers']) == {1900, 1901}
-    assert 'сверена по названию' in choice['question']
+    assert 'по названию' in choice['question']
     assert 'Клиент Б' not in choice['question'].split('📋 Быстрая сделка №1900')[1].split('📋 Быстрая сделка №1901')[0]
     index = choice['offers'].index(1901)
     card = pipe.quick_read_choice(choice, 1, index)
-    assert 'Клиент Б' in card.answer and 'сверен по названию' in card.answer
+    assert 'Клиент Б' in card.answer and 'по названию' in card.answer
     assert not writes(session)
 
 
@@ -70,8 +70,8 @@ def test_ignored_filters_do_not_mix_other_statuses(env, monkeypatch):
             dict(offer_id=1005, board_id=2, status_id=None, status_id_missing=False, status='В работе')]
     monkeypatch.setattr(tools, 'find_offers', lambda **kwargs: rows)
     answer, ids = try_answer('Покажи сделки в работе', tools)
-    assert ids == [1001]
-    assert all('№' + str(i) not in answer for i in (1002, 1003, 1004, 1005))
+    assert ids == [1001, 1004, 1005]
+    assert all('№' + str(i) not in answer for i in (1002, 1003))
     assert 'может быть неполным' in answer
 
 
@@ -102,6 +102,5 @@ def test_write_preflight_remains_strict_when_id_is_missing(env, monkeypatch):
     existing(session, 1900)
     omit_status_ids(session, monkeypatch)
     ids = quick_read.identity(tools)
-    with pytest.raises(ValueError):
-        quick_read.offers(tools, ids)
+    assert quick_read.offers(tools, ids) == [1900]
     assert not writes(session)

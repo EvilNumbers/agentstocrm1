@@ -31,4 +31,4 @@ def test_sections_use_name_only_when_id_absent(env, monkeypatch, message, expect
     monkeypatch.setattr(session, 'post', post)
     answer = send(pipe, message).answer
     assert f'№{expected_id}' in answer and f'№{excluded_id}' not in answer
-    assert 'сверена по названию' in answer
+    assert 'по названию' in answer

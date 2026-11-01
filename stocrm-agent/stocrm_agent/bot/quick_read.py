@@ -10,7 +10,7 @@ from ..booking import key
 from ..calendar import _positive, _rows
 from ..contact_search import phone_key, detail_phones
 from .fastpath import format_offer_items
-from .status_view import match as match_view_status
+from .status_view import match_name as match_view_status_name
 
 PHONE = "81111111110"
 NAME = "1111 быстрые сделки"
@@ -30,7 +30,7 @@ def _inactive(value: Any) -> bool:
     return value is False or value == 0 or (isinstance(value, str) and value.strip().upper() in {'N', 'NO', 'FALSE', '0'})
 
 
-def identity(tools: Any) -> tuple[int, int, int]:
+def contact_identity(tools: Any) -> int:
     tools._invalidate_quick_identity_cache()
     # Ищем только контакт с ТОЧНЫМ именем. Чужие контакты не требуют чтения
     # дополнительных телефонов и не делают обычную большую базу неполной.
@@ -66,8 +66,11 @@ def identity(tools: Any) -> tuple[int, int, int]:
         raise ValueError("Поиск системного контакта неполон")
     if len(matches) != 1:
         raise ValueError("Системный контакт не подтверждён однозначно по имени и телефону. Проверьте контакт в STOCRM; другой контакт не выбираю")
-    cid = matches[0]
-    return cid, *status_identity(tools)
+    return matches[0]
+
+
+def identity(tools: Any) -> tuple[int, int, int]:
+    return contact_identity(tools), *status_identity(tools)
 
 
 def status_identity(tools: Any) -> tuple[int, int]:
@@ -90,12 +93,18 @@ def status_identity(tools: Any) -> tuple[int, int]:
     return candidates[0]
 
 
+def quick_status_name(tools: Any, board: Any, name: Any, status_ids: tuple[int, int]) -> str:
+    """Проверка по названию, ID статуса из строки сделки не используется."""
+    return match_view_status_name(tools, board=board, status_name=name,
+                                  expected_board=status_ids[0], expected_name='Быстрые сделки')
+
+
 def offers(tools: Any, ids: tuple[int, int, int]) -> list[int]:
-    cid, bid, sid = ids
+    _, bid, sid = ids
     found: list[int] = []
     seen: set[int] = set()
     for page in range(1, 21):
-        raw = tools._read("quick_offers", "offers/get_from_filter", {"FILTER": {"CONTACT_ID": cid, "BOARD_ID": bid, "STATUS_ID": sid}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": page, "LIMIT": 500})
+        raw = tools._read("quick_offers", "offers/get_from_filter", {"FILTER": {"BOARD_ID": bid}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": page, "LIMIT": 500})
         if raw is None or isinstance(raw, bool) or not isinstance(raw, (dict, list)):
             raise ValueError("CRM не подтвердила список быстрых сделок")
         rows = _rows(raw)
@@ -106,10 +115,10 @@ def offers(tools: Any, ids: tuple[int, int, int]) -> list[int]:
             if oid in seen:
                 raise ValueError("CRM повторяет страницы сделок; список не подтверждён")
             seen.add(oid)
-            owner = _positive(row.get("CONTACT_ID"), "Контакт сделки")
-            board = _positive(row.get("BOARD_ID"), "Воронка сделки")
-            status = _positive(row.get("STATUS_ID"), "Статус сделки")
-            if (owner, board, status) == ids:
+            status = quick_status_name(tools, row.get('BOARD_ID'), row.get('STATUS_NAME'), (bid, sid))
+            if status == 'unknown':
+                raise ValueError('Не удалось проверить название статуса сделки; список неполон')
+            if status == 'name':
                 found.append(oid)
         # Даже короткая страница не доказывает конец: CRM может ограничить LIMIT.
         if not rows:
@@ -117,19 +126,19 @@ def offers(tools: Any, ids: tuple[int, int, int]) -> list[int]:
     raise ValueError("Список сделок неполный; повторите чтение в STOCRM")
 
 
-def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, int], bool, bool]:
+def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, int | None], bool, bool]:
     """Сделки всех контактов, с локальной проверкой каждой строки.
 
     Не полагаемся на серверные фильтры: в некоторых панелях они игнорируются.
     Непроверяемая строка или обрыв означает неполный список, а не отсутствие.
     """
-    found: dict[int, int] = {}
+    found: dict[int, int | None] = {}
     seen: set[int] = set()
     incomplete = False
     by_name = False
     for page in range(1, 21):
         raw = tools._read('quick_status_offers', 'offers/get_from_filter',
-                          {'FILTER': {}, 'SORT': {'DATE_CREATE': 'DESC'}, 'PAGE': page, 'LIMIT': 500})
+                          {'FILTER': {'BOARD_ID': status_ids[0]}, 'SORT': {'DATE_CREATE': 'DESC'}, 'PAGE': page, 'LIMIT': 500})
         if raw is None or isinstance(raw, bool) or not isinstance(raw, (list, dict)):
             raise ValueError('CRM не подтвердила список сделок статуса')
         rows = _rows(raw)
@@ -146,40 +155,37 @@ def status_offers(tools: Any, status_ids: tuple[int, int]) -> tuple[dict[int, in
             if oid in seen:
                 raise ValueError('CRM повторяет строки или страницы сделок; список не подтверждён')
             seen.add(oid)
-            matched = match_view_status(tools, board=row.get('BOARD_ID'), status_id=row.get('STATUS_ID'),
-                status_id_missing='STATUS_ID' not in row, status_name=row.get('STATUS_NAME'),
-                expected_board=status_ids[0], expected_status=status_ids[1], expected_name='Быстрые сделки')
+            matched = quick_status_name(tools, row.get('BOARD_ID'), row.get('STATUS_NAME'), status_ids)
             if matched == 'unknown':
                 incomplete = True
-            elif matched in ('id', 'name'):
+            elif matched == 'name':
                 try:
                     found[oid] = _positive(row.get('CONTACT_ID'), 'Контакт сделки')
-                    by_name |= matched == 'name'
                 except ValueError:
-                    incomplete = True
+                    found[oid] = None
+                by_name = True
     return found, True, by_name
 
 
-def status_detail(tools: Any, status_ids: tuple[int, int], oid: int, contact_id: int) -> str:
+def status_detail(tools: Any, status_ids: tuple[int, int], oid: int, contact_id: int | None = None) -> str:
     card = tools.offer_card(oid, with_items=True)
-    actual = (card.get('offer_id'), card.get('contact_id'))
-    matched = match_view_status(tools, board=card.get('board_id'), status_id=card.get('status_id'),
-        status_id_missing=card.get('status_id_missing') is True, status_name=card.get('status'),
-        expected_board=status_ids[0], expected_status=status_ids[1], expected_name='Быстрые сделки')
-    if card.get('error') or tuple(map(str, actual)) != tuple(map(str, (oid, contact_id))) or matched not in ('id', 'name'):
-        raise ValueError(f'Сделка №{oid}: контакт или статус изменились либо не подтверждены')
+    matched = quick_status_name(tools, card.get('board_id'), card.get('status'), status_ids)
+    if card.get('error') or str(card.get('offer_id')) != str(oid) or matched != 'name':
+        raise ValueError(f'Сделка №{oid}: номер или статус изменились либо не подтверждены')
     contact = str(card.get('contact') or 'имя не получено')
-    note = '\nℹ️ Статус сверен по названию: CRM не вернула ID. Только просмотр.' if matched == 'name' else ''
-    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact} · контакт №{contact_id}\n' + format_offer_items(card) + note
+    current_contact = card.get('contact_id')
+    contact_note = f' · контакт №{current_contact}' if str(current_contact or '').isdigit() else ''
+    note = '\nℹ️ Статус сверен по названию, а не по ID. Только просмотр.'
+    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + format_offer_items(card) + note
 
 
-def status_details(tools: Any, status_ids: tuple[int, int], offers: dict[int, int]) -> list[str]:
-    def one(item: tuple[int, int]) -> str:
+def status_details(tools: Any, status_ids: tuple[int, int], offers: dict[int, int | None]) -> list[str]:
+    def one(item: tuple[int, int | None]) -> str:
         oid, contact_id = item
         try:
             return status_detail(tools, status_ids, oid, contact_id)
         except Exception:  # noqa: BLE001 — чужие детали не показываем
-            return f'Сделка №{oid}: контакт и подробности не удалось подтвердить; долг неизвестен.'
+            return f'Сделка №{oid}: статус или подробности не удалось подтвердить; долг неизвестен.'
     items = list(offers.items())
     if len(items) <= 1:
         return [one(item) for item in items]

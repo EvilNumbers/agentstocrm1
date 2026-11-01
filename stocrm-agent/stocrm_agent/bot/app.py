@@ -215,7 +215,7 @@ def quick_choice_keyboard(token: str, choice: dict[str, Any]) -> InlineKeyboardM
         labels = [f"📋 Сделка №{oid}" for oid in choice['offers']]
     rows = [[InlineKeyboardButton(text=label[:100], callback_data=f"quick:{token}:{index}")]
             for index, label in enumerate(labels)]
-    if kind in ('quick_select', 'quick_brand'):
+    if kind == 'quick_brand' or (kind == 'quick_select' and choice.get('allow_new', True)):
         label = '➕ Создать новую' if kind == 'quick_select' else '✍️ Ввести бренд вручную'
         rows.append([InlineKeyboardButton(text=label, callback_data=f"quick:{token}:{len(labels)}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1198,7 +1198,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 or pipeline._quick_choices.get(user_id) is not choice):
             await callback.answer("Выбор устарел или принадлежит другому сотруднику.", show_alert=True)
             return
-        size = len(choice.get("offers") or []) + (1 if choice.get("kind") in ("quick_select", "quick_brand") else 0)
+        size = len(choice.get("offers") or []) + (1 if choice.get("kind") == "quick_brand" or (choice.get("kind") == "quick_select" and choice.get("allow_new", True)) else 0)
         if not parts[2].isdigit() or int(parts[2]) >= size:
             await callback.answer("Некорректная кнопка", show_alert=True)
             return

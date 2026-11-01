@@ -25,7 +25,7 @@ def test_waiting_payment_is_exact_status_not_generic_unpaid(env, message):
     assert '№2000' in result.answer and '№2001' not in result.answer
     assert 'ОЖИДАЕТ ОПЛАТЫ' in result.answer and not result.drafts and not result.applied
     call = next(c for c in session.calls if c['method'] == 'offers/get_from_filter')
-    assert call['payload']['FILTER'] == {'BOARD_ID': 2, 'STATUS_ID': 55}
+    assert call['payload']['FILTER'] == {'BOARD_ID': 2}
     assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
 
 

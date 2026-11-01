@@ -517,7 +517,7 @@ class DraftStore:
                     relevant = (other_quick or old_check.get("kind") == "standalone_offer") and target_phone and other_phone == target_phone
                     if relevant and (other.get("status") in (APPLYING, PARTIAL) or other.get("archived_partial")
                             or (other.get("status") == APPLIED and float(other.get("applied_at") or 0) >= float(draft.get("created_at") or 0))):
-                        raise ValueError("По системному контакту уже выполняется или требует проверки другая запись. Проверьте /drafts; повтор запрещён.")
+                        raise ValueError("Другая быстрая сделка или создание сделки с системным контактом уже выполняется или требует проверки. Проверьте /drafts; повтор запрещён.")
             if check.get("kind") == "standalone_offer":
                 from .contact_search import phone_key
                 for other in self._data.values():

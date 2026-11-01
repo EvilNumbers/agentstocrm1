@@ -49,7 +49,7 @@ def test_plain_work_list_returns_only_confirmed_status(env, message):
     assert '№1328' not in result.answer and '№1327' not in result.answer and '№1712' not in result.answer
     assert 'воронка «Автосервис»' in result.answer and not result.drafts and not result.applied
     reads = [c for c in session.calls if c['method'] == 'offers/get_from_filter']
-    assert reads and reads[-1]['payload']['FILTER'] == {'BOARD_ID': 2, 'STATUS_ID': 15}
+    assert reads and reads[-1]['payload']['FILTER'] == {'BOARD_ID': 2}
     assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
 
 
@@ -60,7 +60,7 @@ def test_full_service_status_has_priority_over_generic_name(env):
     answer = send(pipe, 'Покажи сделки в работе').answer
     assert '№1401' in answer and '№1654' not in answer
     assert 'В работе на сервисе' in answer
-    assert next(c for c in session.calls if c['method'] == 'offers/get_from_filter')['payload']['FILTER']['STATUS_ID'] == 70
+    assert next(c for c in session.calls if c['method'] == 'offers/get_from_filter')['payload']['FILTER'] == {'BOARD_ID': 2}
 
 
 def test_local_verification_discards_foreign_or_unconfirmed_rows(env, monkeypatch):
@@ -75,8 +75,8 @@ def test_local_verification_discards_foreign_or_unconfirmed_rows(env, monkeypatc
         return rows
     monkeypatch.setattr(tools, 'find_offers', search)
     answer, ids = try_answer('Покажи сделки в работе', tools)
-    assert ids == [1001] and '№1001' in answer
-    assert all('№' + str(n) not in answer for n in (1002, 1003, 1004))
+    assert ids == [1002] and '№1002' in answer
+    assert all('№' + str(n) not in answer for n in (1001, 1003, 1004))
     assert 'может быть неполным' in answer and calls[0]['fresh'] is True
     assert 'В работе' in answer and 'Запись' not in answer
 
@@ -117,11 +117,11 @@ def test_missing_id_in_status_is_not_guessed(env):
 
 def test_repeated_page_and_truncated_list_are_explicit(env, monkeypatch):
     _, tools, _ = env
-    rows = [dict(offer_id=1000 + i, board_id=2, status_id=14) for i in range(100)]
+    rows = [dict(offer_id=1000 + i, board_id=2, status_id=14, status='Просчёт') for i in range(100)]
     monkeypatch.setattr(tools, 'find_offers', lambda **kw: rows)
     answer, ids = try_answer('Покажи сделки в работе', tools)
     assert not ids and 'не найдено подтверждённых' in answer and 'может быть неполным' in answer
-    matches = [dict(offer_id=2000 + i, board_id=2, status_id=15) for i in range(30)]
+    matches = [dict(offer_id=2000 + i, board_id=2, status_id=15, status='В работе') for i in range(30)]
     monkeypatch.setattr(tools, 'find_offers', lambda **kw: matches)
     answer, ids = try_answer('Покажи сделки в работе', tools)
     assert len(ids) == 25 and 'может быть неполным' in answer and '№2029' not in answer
@@ -129,8 +129,8 @@ def test_repeated_page_and_truncated_list_are_explicit(env, monkeypatch):
 
 def test_failed_later_page_preserves_confirmed_and_warns(env, monkeypatch):
     _, tools, _ = env
-    rows = [dict(offer_id=2000 + i, board_id=2, status_id=14) for i in range(99)]
-    rows.append(dict(offer_id=1654, board_id=2, status_id=15))
+    rows = [dict(offer_id=2000 + i, board_id=2, status_id=14, status='Просчёт') for i in range(99)]
+    rows.append(dict(offer_id=1654, board_id=2, status_id=15, status='В работе'))
     def search(**kw):
         if kw['page'] == 1: return rows
         raise RuntimeError('failed')
@@ -146,7 +146,7 @@ def test_fresh_status_lookup_not_cached_after_external_change(env):
     session.data['offers/get_from_filter'][0]['STATUS_NAME'] = 'Просчёт'
     answer = send(pipe, 'Покажи сделки в работе').answer
     assert '№1654' not in answer and 'не найдено подтверждённых' in answer
-    assert len([c for c in session.calls if c['method'] == 'offers/get_from_filter']) == 2
+    assert len([c for c in session.calls if c['method'] == 'offers/get_from_filter']) == 4
 
 
 def test_model_disabled_fastpath_still_applies_exact_status(env):
@@ -168,6 +168,7 @@ def test_old_list_cleared_on_no_matches_and_new_list_remembers_selection(env):
     detail = send(pipe, '1 подробнее', history)
     assert 'Сделка №1654' in detail.answer
     session.data['offers/get_from_filter'][0]['STATUS_ID'] = 14
+    session.data['offers/get_from_filter'][0]['STATUS_NAME'] = 'Просчёт'
     result = send(pipe, 'Покажи сделки в работе', history)
     assert 'не найдено подтверждённых' in result.answer and 19 not in pipe._lists
 

@@ -18,6 +18,7 @@ def env(tmp_path):
     session = MockSession()
     statuses = session.data['offer/all_statuses']
     statuses['14']['TITLE'] = 'Просчёт запчастей'
+    session.data['offers/get_from_filter'][1]['STATUS_NAME'] = 'Просчёт запчастей'
     for sid, title in [(41, 'Запись'), (42, 'Заказ'), (43, 'Заказ собран'), (44, 'Просчёт двигателя')]:
         statuses[str(sid)] = {'STATUS_ID': sid, 'BOARD_ID': 2, 'TITLE': title, 'ACTIVE': 'Y'}
     for oid, status, name in [(1328, 41, 'Запись'), (1327, 42, 'Заказ'), (1326, 43, 'Заказ собран'), (1325, 44, 'Просчёт двигателя')]:
@@ -54,7 +55,7 @@ def test_status_lists_are_not_interchangeable(env, message, expected, status_id,
     for oid in other:
         assert f'№{oid}' not in result.answer
     call = next(c for c in session.calls if c['method'] == 'offers/get_from_filter')
-    assert call['payload']['FILTER'] == {'BOARD_ID': 2, 'STATUS_ID': status_id}
+    assert call['payload']['FILTER'] == {'BOARD_ID': 2}
     assert not result.drafts and not result.applied
     assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
 
@@ -144,8 +145,8 @@ def test_fresh_page_filters_results_and_exposes_incomplete_reads(env, monkeypatc
     seen = []
     def search(**kw):
         seen.append(kw)
-        return [dict(offer_id=1001, board_id=2, status_id=42), dict(offer_id=1002, board_id=2, status_id=43),
-                dict(offer_id=1003, board_id=3, status_id=42), dict(offer_id=1004, board_id=None, status_id=42)]
+        return [dict(offer_id=1001, board_id=2, status_id=42, status='Заказ'), dict(offer_id=1002, board_id=2, status_id=43, status='Заказ собран'),
+                dict(offer_id=1003, board_id=3, status_id=42, status='Заказ'), dict(offer_id=1004, board_id=None, status_id=42, status='Заказ')]
     monkeypatch.setattr(tools, 'find_offers', search)
     answer, ids = try_answer('Покажи сделки в заказе', tools)
     assert ids == [1001] and '№1001' in answer

@@ -60,7 +60,7 @@ def test_unrecognised_prior_offers_do_not_prove_no_duplicates(env, monkeypatch):
     session, tools, _ = env
     monkeypatch.setattr(tools, '_read', lambda *a, **kw: {'UNEXPECTED': []})
     with pytest.raises(ValueError, match='Неизвестный формат'):
-        _all_offer_ids(tools, 5555)
+        _all_offer_ids(tools)
     assert not writes(session)
 
 
