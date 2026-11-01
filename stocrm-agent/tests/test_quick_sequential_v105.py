@@ -26,6 +26,7 @@ def test_missing_status_after_change_stops_before_any_items_and_archived_remains
             row.pop('STATUS_ID', None)
         return row, count
     monkeypatch.setattr(tools, '_search_offer_row', missing)
+    monkeypatch.setattr(tools, '_search_offer_row_without_required_fields', lambda _: None)
     monkeypatch.setattr(quick_deal.time, 'sleep', lambda _: None)
     result = tools.apply_draft(draft['token'])
     assert result['status'] == 'partial' and 'STATUS_ID' in result['warning']
@@ -44,7 +45,8 @@ def test_offer_diagnostic_does_not_expose_contact_or_raw_status(env, monkeypatch
     assert result == {'status': 'ok', 'offer_id_matches': True, 'contact_id_present': True,
                       'board_id': 2, 'status_id': None, 'status_id_shape': 'null',
                       'status_name_present': True,
-                      'quick_reference': {'status': 'ok', 'board_id': 2, 'status_id': 51, 'name_matches': True}}
+                      'quick_reference': {'status': 'ok', 'board_id': 2, 'status_id': 51, 'name_matches': True},
+                      'without_required_fields': {'status': 'unavailable'}}
     assert '5555' not in str(result) and 'private' not in str(result)
 
 

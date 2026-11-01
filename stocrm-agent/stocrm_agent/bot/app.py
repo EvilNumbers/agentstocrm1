@@ -770,6 +770,12 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                           'Название статуса сделки совпадает со справочником: ' + match])
         else:
             lines.append('Статус «Быстрые сделки» в справочнике однозначно не подтверждён.')
+        legacy = diag['without_required_fields']
+        if legacy['status'] == 'ok':
+            alt_id = legacy['status_id'] if legacy['status_id'] is not None else 'не распознан'
+            lines.append(f'Без дополнительного списка полей: ID статуса {alt_id}; сделка, контакт и воронка совпадают: ' + ('да' if legacy['identity_matches'] else 'нет'))
+        else:
+            lines.append('Сравнение без дополнительного списка полей недоступно.')
         lines.append('Это диагностика, не подтверждение результата записи. Личные данные и ключи не выводятся; блокировка сохранена.')
         await message.answer('\n'.join(lines))
 

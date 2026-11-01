@@ -939,6 +939,14 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 break
         return None, seen
 
+    def _search_offer_row_without_required_fields(self, offer_id: int) -> dict[str, Any] | None:
+        """Дополнительное свежее чтение в формате v81; только точный уникальный номер."""
+        raw = self._read_uncached('offer_status_legacy_read', 'offers/get_from_filter',
+                                  {'FILTER': {'OFFER_ID': int(offer_id)}, 'PAGE': 1, 'LIMIT': 5})
+        rows = _as_items(raw)
+        matches = [r for r in rows if isinstance(r, dict) and _same_id(r.get('OFFER_ID'), offer_id)]
+        return matches[0] if len(matches) == 1 else None
+
     def offer_identity_diagnostic(self, offer_id: int) -> dict[str, Any]:
         """Только свежая проверка полей сделки, без вывода содержимого CRM."""
         offer_id = int(offer_id)
@@ -981,13 +989,23 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             reference = {'status': 'ok', 'board_id': bid, 'status_id': sid, 'name_matches': name_matches}
         except Exception:  # noqa: BLE001 — не публикуем текст CRM/ключи
             pass
+        legacy: dict[str, Any] = {'status': 'unavailable'}
+        try:
+            other = self._search_offer_row_without_required_fields(offer_id)
+            if other:
+                own = tuple(number(row.get(k)) for k in ('OFFER_ID', 'CONTACT_ID', 'BOARD_ID'))
+                theirs = tuple(number(other.get(k)) for k in ('OFFER_ID', 'CONTACT_ID', 'BOARD_ID'))
+                legacy = {'status': 'ok', 'status_id': number(other.get('STATUS_ID')),
+                          'identity_matches': all(v is not None for v in own) and own == theirs}
+        except Exception:  # noqa: BLE001 — не раскрываем ошибку и сырые данные CRM
+            pass
         return {'status': 'ok',
                 'offer_id_matches': number(row.get('OFFER_ID')) == offer_id,
                 'contact_id_present': number(row.get('CONTACT_ID')) is not None,
                 'board_id': number(row.get('BOARD_ID')),
                 'status_id': number(value), 'status_id_shape': status_shape,
                 'status_name_present': isinstance(row.get('STATUS_NAME'), str) and bool(row.get('STATUS_NAME', '').strip()),
-                'quick_reference': reference}
+                'quick_reference': reference, 'without_required_fields': legacy}
 
     def balance_diagnostic(self, offer_id: int) -> dict[str, Any]:
         """Только структура ответа и флаги проверки; суммы и данные клиента не возвращаем."""

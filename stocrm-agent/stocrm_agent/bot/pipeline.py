@@ -335,6 +335,13 @@ def parts_in_request(text: str) -> list[dict[str, Any]]:
 
 
 _WORK_WORD = re.compile(r"\b(услуг[ауыеой]*|работ[ауыеой]*)\b", re.IGNORECASE)
+_MIXED_WORK_HINT = re.compile(r"\b(?:услуг\w*|работ\w*|диагностик\w*|замен\w*|ремонт\w*|установк\w*|обслуживан\w*)\b", re.IGNORECASE)
+_MIXED_PART_HINT = re.compile(r"\b(?:артикул\w*|запчаст\w*|детал\w*|товар\w*)\b", re.IGNORECASE)
+
+
+def _mixed_work_and_part(text: str) -> bool:
+    """Не превращаем составную просьбу в одиночную позицию без предупреждения."""
+    return bool(_ADD_VERB.search(text) and _MIXED_WORK_HINT.search(text) and _MIXED_PART_HINT.search(text))
 #: «за 1000», «на 1 000 ₽», «стоимостью 500» — где заканчивается название услуги.
 _WORK_PRICE_CUT = re.compile(
     r"\b(?:за|по|стоимостью|цена|ценой|итого)\b", re.IGNORECASE)
@@ -2863,6 +2870,8 @@ class BotPipeline:
             history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': body}])
             del history[:max(0, len(history) - self.s.max_history_messages)]
             return PipelineResult(answer=body)
+        if _mixed_work_and_part(text):
+            return PipelineResult(answer='В запросе вижу и услугу, и товар. Для обычной сделки пока не могу безопасно обработать их вместе: ничего не подготовлено и не записано. Сначала проверьте позиции в CRM, чтобы не создать дубль; затем попросите отдельно добавить услугу и отдельно товар, указав номер сделки и цену каждой позиции.')
         self._quick_choices.pop(user_id or 0, None)
         quick_price = await asyncio.to_thread(self._quick_price_reply, text, user_id or 0)
         if quick_price is not None:
