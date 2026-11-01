@@ -63,8 +63,7 @@ _ADVICE: list[tuple[tuple[str, ...], str]] = [
     (("сетевая ошибка", "connection aborted", "connectionreseterror", "оборвалась",
       "remote end closed", "remotedisconnected"),
      ("Связь с STOCRM оборвалась, ответ от панели не дошёл. Если это была запись — "
-      "сначала откройте сделку и посмотрите, появилось ли изменение; если изменения "
-      "нет, нажмите «Применить» ещё раз. Это не блокировка карточки.")),
+      "сначала проверьте сделку в STOCRM и /drafts; не повторяйте запись, пока результат неизвестен.")),
     (("заблокирован", "blocked", "locked"),
      ("Карточку прямо сейчас держит открытой другой сотрудник — попросите закрыть её "
      "(или закройте свою вкладку в браузере) и повторите.")),
@@ -235,13 +234,13 @@ def clean_html(text: str) -> str:
     return result.strip()
 
 
-def polish(text: str, *, limit: int = 3800) -> str:
+def polish(text: str, *, limit: int = 3800, preserve_numbered: bool = False) -> str:
     """Финальная причёска любого ответа человеку.
 
     * имена методов панели → человеческие фразы;
     * трейсбеки и «сырой» JSON вырезаются;
     * убираются пустые строки-дубли и лишние пробелы;
-    * длина укладывается в лимит одного сообщения Телеграма.
+    * длина ограничивается аргументом limit; отправитель разбивает длинные ответы.
     """
     if not text:
         return ""
@@ -251,7 +250,7 @@ def polish(text: str, *, limit: int = 3800) -> str:
         # целиком дамп JSON — человеку показывать нечего
         human = _payload_text(result)
         if human:
-            return polish(human, limit=limit)
+            return polish(human, limit=limit, preserve_numbered=preserve_numbered)
     result = _METHOD_TOKEN.sub(lambda m: METHOD_TITLES.get(m.group(1), m.group(1)), result)
     result = _MARKDOWN.sub("", result)
     lines = []
@@ -261,7 +260,8 @@ def polish(text: str, *, limit: int = 3800) -> str:
         if (_JSON_START.match(stripped) and ("{" in stripped or "[" in stripped)
                 and (stripped.endswith(("}", "]", "}…", "]…")) or ":" in stripped)):
             continue
-        if _TECH_WORDS.search(stripped) and "Что сделать" not in stripped:
+        if (_TECH_WORDS.search(stripped) and "Что сделать" not in stripped
+                and not (preserve_numbered and re.match(r"^\d+\.\s", stripped))):
             continue
         lines.append(line.rstrip())
     cleaned = "\n".join(lines)

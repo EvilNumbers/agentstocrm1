@@ -76,12 +76,20 @@ def _money(value: Any) -> str:
 
 def _qty_line(item: dict[str, Any]) -> str:
     """«1 шт. × 6 000 ₽ = 6 000 ₽» — без выдуманных чисел."""
-    qty = item.get("qty") or 1
+    qty = item.get("qty")
     price = item.get("price")
+    if qty is None or qty == "":
+        return "количество не получено" + (f" · цена {_money(price)} ₽" if price else "")
+    try:
+        number = float(qty)
+        if not (number >= 0 and number < 1e9):
+            raise ValueError("invalid quantity")
+    except (ValueError, TypeError, OverflowError):
+        return "количество не получено" + (f" · цена {_money(price)} ₽" if price else "")
     line = f"{qty} шт."
     if price:
         line += f" × {_money(price)} ₽"
-        line += f" = {_money(float(price) * float(qty))} ₽"
+        line += f" = {_money(float(price) * number)} ₽"
     return line
 
 
@@ -93,14 +101,14 @@ def format_offer_items(card: dict[str, Any]) -> str:
 
     if parts:
         lines.append(f"🧩 Товары ({len(parts)}):")
-        for number, item in enumerate(parts[:20], 1):
+        for number, item in enumerate(parts, 1):
             head = f"{number}. {item.get('name') or 'без названия'}"
             tail = " · ".join(str(x) for x in (item.get("brand"), item.get("sku")) if x)
             if tail:
                 head += f" ({tail})"
             lines.append(f"{head} — {_qty_line(item)}")
-        if len(parts) > 20:
-            lines.append(f"… и ещё {len(parts) - 20}")
+    elif card.get("parts_error"):
+        lines.append("🧩 Товары: не удалось проверить")
     else:
         lines.append("🧩 Товары: нет")
 
@@ -115,6 +123,8 @@ def format_offer_items(card: dict[str, Any]) -> str:
             lines.append(line)
         if len(works) > 20:
             lines.append(f"… и ещё {len(works) - 20}")
+    elif card.get("works_error"):
+        lines.append("🔧 Услуги: не удалось проверить")
     else:
         lines.append("🔧 Услуги: нет")
 
