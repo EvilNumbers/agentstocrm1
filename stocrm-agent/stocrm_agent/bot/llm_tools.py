@@ -302,7 +302,7 @@ EXECUTOR_QUESTION = {
 }
 PART_TOOL = "draft_add_offer_part"
 PART_QUESTION = "Какую именно запчасть добавить?"
-MAX_PART_CHOICES = 8
+MAX_PART_CHOICES = 100
 MAX_CHOICES = 12
 
 READ_TOOLS = {
@@ -1385,6 +1385,9 @@ class ToolRouter:
                             "или уточните название детали для поиска.")
         else:
             question = f"Уточните запчасть «{query}» — какой вариант нужен?"
+        for item in tried or []:
+            if "Профит Лига:" in item and any(word in item.lower() for word in ("обрезан", "недоступен", "неполон")):
+                question += " " + item + "."
         if any("склад" in item.lower() and "не полностью" in item.lower() for item in (tried or [])):
             question += " Проверка склада не завершена полностью; отсутствие позиции не доказано."
         if status == "not_found" and tried and not args.get("sku"):

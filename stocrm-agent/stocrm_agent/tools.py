@@ -29,7 +29,7 @@ from typing import Any
 from contextvars import copy_context
 
 from .client import read_budget
-from . import parts, rossko
+from . import parts, profit_liga, rossko
 from .booking import BookingMixin
 from .calendar import CalendarMixin
 from .audit import AuditLog
@@ -923,30 +923,50 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # Карточку в одном сценарии спрашивают по 2–3 раза подряд; 15 секунд кэша
         # экономят поход в панель, а любая запись кэш сразу сбрасывает.
         key = f"card:{int(offer_id)}" + (":full" if with_items else "")
-        ttl = 15.0 if with_items else None
-        if ttl is None:
+        if not with_items:
             return self._cached(key, lambda: self._offer_card(int(offer_id)), ttl=15.0)
-        return self._cached(key, lambda: self._offer_card(int(offer_id), with_items=True), ttl=ttl)
+        # CRM может измениться вне бота; подробности всегда перечитываем. Параллельные
+        # одинаковые запросы всё равно объединяются в один (single-flight).
+        return self._cached(key, lambda: self._offer_card(int(offer_id), with_items=True), ttl=0.0)
 
     def _offer_card(self, offer_id: int, with_items: bool = False) -> dict[str, Any]:
         offer_id = int(offer_id)
 
-        # Баланс и сама карточка друг от друга не зависят — читаем одновременно:
-        # вместо «поиск сделки + запрос баланса» по очереди выходит один заход.
+        # Баланс и карточка независимы. Как только найдена сделка, начинаем
+        # чтение товаров/работ, не дожидаясь баланса: без дополнительных запросов.
         balance: Any = None
         balance_error: str | None = None
+        items: dict[str, Any] = {"parts": [], "works": []}
+        errors: list[str] = []
+
+        def read_parts() -> None:
+            try:
+                items["parts"], problem = self._offer_parts_details(offer_id)
+                if problem:
+                    items["parts_error"] = problem
+                    errors.append(f"товары: {problem}")
+            except Exception as exc:  # noqa: BLE001 — ошибка не означает отсутствие товаров
+                items["parts_error"] = str(exc) or type(exc).__name__
+                errors.append(f"товары: {items['parts_error']}")
+
+        def read_works() -> None:
+            try:
+                items["works"] = self.offer_works(offer_id, limit=200)
+            except Exception as exc:  # noqa: BLE001 — ошибка не означает отсутствие услуг
+                items["works_error"] = str(exc) or type(exc).__name__
+                errors.append(f"услуги: {items['works_error']}")
+
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stocrm-balance") as pool:
-            future = pool.submit(
-                self._read, "offer_balance", "payment/get_balance",
-                {"ENTITY_ID": offer_id, "ENTITY_TYPE": "OFFER"},
-            )
-            row, seen = self._find_offer_row(offer_id)
+            future = pool.submit(copy_context().run, self._read, "offer_balance", "payment/get_balance",
+                                 {"ENTITY_ID": offer_id, "ENTITY_TYPE": "OFFER"})
+            # Полная карточка должна отражать и изменения, сделанные вне бота.
+            row, seen = self._search_offer_row(offer_id) if with_items else self._find_offer_row(offer_id)
+            if with_items and row is not None and _same_id(row.get("OFFER_ID"), offer_id):
+                self._run_parallel([read_parts, read_works])
             try:
                 balance = future.result()
-            except StocrmError as exc:
-                balance_error = str(exc)
-            except Exception as exc:          # noqa: BLE001 — баланс не критичен
-                log.warning("offer_card: баланс не прочитан: %s", exc)
+            except Exception as exc:  # noqa: BLE001 — баланс не критичен
+                balance_error = str(exc) or type(exc).__name__
 
         if row is None:
             return {
@@ -984,26 +1004,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if not with_items:
             return offer
 
-        # Товары и услуги читаем параллельно: два независимых запроса вместо двух
-        # ожиданий подряд.
-        items: dict[str, Any] = {"parts": [], "works": []}
-        errors: list[str] = []
-
-        def read_parts() -> None:
-            try:
-                items["parts"] = self.offer_parts(offer_id, limit=200)
-            except (StocrmError, ValueError) as exc:
-                errors.append(f"товары: {exc}")
-
-        def read_works() -> None:
-            try:
-                items["works"] = self.offer_works(offer_id, limit=200)
-            except (StocrmError, ValueError) as exc:
-                errors.append(f"услуги: {exc}")
-
-        self._run_parallel([read_parts, read_works])
         offer["parts"] = items["parts"]
         offer["works"] = items["works"]
+        if items.get("parts_error"):
+            offer["parts_error"] = items["parts_error"]
+        if items.get("works_error"):
+            offer["works_error"] = items["works_error"]
         if errors:
             offer["items_error"] = "; ".join(errors)
         offer["payments"] = _payments_total({k: _money(v.get("CURRENCY_VALUE")) for k, v in rub.items()}) if balance_known else {}
@@ -1052,25 +1058,65 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
     # ------------------------------------------------------------------ запчасти
     def offer_parts(self, offer_id: int, limit: int = 100) -> list[dict[str, Any]]:
-        """Запчасти (товарные позиции) в сделке — с ценами поставщика и наценкой."""
-        raw = self._read(
-            "offer_parts", "products/get_filtered_orders",
-            {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": 1, "LIMIT": limit},
-        )
+        """Первые строки товаров сделки. Для подробной карточки см. ограниченный обход."""
+        raw = self._read("offer_parts", "products/get_filtered_orders",
+            {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": 1, "LIMIT": limit})
         rows = _as_items(raw.get("DATA") if isinstance(raw, dict) and "DATA" in raw else raw)
+        return self._normalize_offer_parts(offer_id, rows[:limit])
+
+    def _offer_parts_details(self, offer_id: int) -> tuple[list[dict[str, Any]], str | None]:
+        """Ограниченный обход страниц; неполный список не выдаётся за полный."""
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        page_size, page_limit, result_limit = 200, 5, 200
+        for page in range(1, page_limit + 1):
+            try:
+                raw = self._read("offer_parts", "products/get_filtered_orders",
+                    {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": page, "LIMIT": page_size})
+                if raw is None or isinstance(raw, bool):
+                    raise ValueError("CRM не подтвердила список товаров")
+                rows = _as_items(raw.get("DATA") if isinstance(raw, dict) and "DATA" in raw else raw)
+                if any(not isinstance(r, dict) for r in rows):
+                    raise ValueError("CRM вернула неизвестный формат строк товара")
+                if any(r.get("OFFER_ID") in (None, False, "") for r in rows):
+                    raise ValueError("CRM вернула товары без номера сделки; принадлежность не подтверждена")
+                fresh = []
+                for row in rows:
+                    order_id = row.get("ORDER_ID")
+                    fingerprint = str(order_id) if order_id not in (None, False, "") else json.dumps(row, sort_keys=True, default=str, ensure_ascii=False)
+                    if fingerprint in seen:
+                        return items, "CRM повторила строки или страницу; список товаров может быть неполным"
+                    seen.add(fingerprint)
+                    fresh.append(row)
+                items.extend(self._normalize_offer_parts(offer_id, fresh))
+            except (StocrmError, ValueError, TypeError) as exc:
+                return items, f"Не удалось полностью прочитать товары: {exc}"
+            if len(items) > result_limit:
+                return items[:result_limit], f"Показаны первые {result_limit} товаров; список ограничен"
+            if len(rows) < page_size:
+                return items, None
+            if len(items) == result_limit:
+                return items, f"Показаны первые {result_limit} товаров; возможно, есть ещё"
+        return items, f"Проверены первые {page_limit} страниц; список товаров может быть неполным"
+
+    @staticmethod
+    def _normalize_offer_parts(offer_id: int, rows: list[Any]) -> list[dict[str, Any]]:
         out = []
-        for r in rows[:limit]:
+        for r in rows:
+            if not isinstance(r, dict):
+                raise ValueError("CRM вернула строку товара неизвестного формата")
             row_offer = r.get("OFFER_ID")
             if row_offer not in (None, False, "") and int(row_offer) != int(offer_id):
                 continue
+            stock: dict[str, Any] = r["FORMATTED_STOCK"] if isinstance(r.get("FORMATTED_STOCK"), dict) else {}
             out.append({
                 "order_id": r.get("ORDER_ID"),
                 "offer_id": r.get("OFFER_ID"),
                 "require_id": r.get("REQUIRE_ID"),
-                "uid": r.get("UID") or (r.get("FORMATTED_STOCK") or {}).get("UID"),
-                "brand": r.get("BRAND"),
-                "sku": r.get("SKU"),
-                "name": r.get("NAME"),
+                "uid": r.get("UID") or stock.get("UID"),
+                "brand": r.get("BRAND") or stock.get("BRAND"),
+                "sku": r.get("SKU") or stock.get("SKU"),
+                "name": r.get("NAME") or stock.get("NAME"),
                 "qty": r.get("QUANTITY_CURRENT") if r.get("QUANTITY_CURRENT") is not None else r.get("QUANTITY"),
                 "qty_source": "QUANTITY_CURRENT" if r.get("QUANTITY_CURRENT") is not None else "QUANTITY",
                 "price": _money(r.get("PRICE")),
@@ -2279,7 +2325,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         cache_key = f"resolve|{query}|{brand}|{raw_sku}|{offer_id}|{limit}|{allow_web}"
         with self._cache_lock:
             hit = self._cache.get(cache_key)
-            if hit and (hit[1].get("status") == "not_found" or (hit[1].get("rossko") or {}).get("status") == "unavailable") and time.monotonic() - hit[0] >= 5:
+            if hit and (hit[1].get("status") == "not_found" or (hit[1].get("rossko") or {}).get("status") == "unavailable" or (hit[1].get("profit_liga") or {}).get("status") in {"unavailable", "partial"}) and time.monotonic() - hit[0] >= 5:
                 self._cache.pop(cache_key, None)
         def bounded() -> dict[str, Any]:
             with read_budget(8.0):
@@ -2449,6 +2495,22 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 tried.append("Росско: поиск недоступен; отсутствие бренда не доказано")
                 errors.append("Росско: " + str(rossko_result.get("error") or "недоступно"))
 
+        # Профит Лига — только подтверждённый метод поиска; заказов и цен нет.
+        profit_result: dict[str, Any] = {"status": "skipped", "brands": []}
+        if raw_sku and not parts.is_viscosity(raw_sku):
+            profit_result = profit_liga.search_brands(raw_sku)
+            for row in profit_result.get("brands") or []:
+                add(row, "Профит Лига")
+            pstatus = profit_result.get("status")
+            if pstatus == "ok":
+                tried.append(f"Профит Лига (только поиск): {len(profit_result['brands'])} брендов")
+            elif pstatus == "empty":
+                tried.append("Профит Лига: точных брендов в ответе нет; отсутствие детали не доказано")
+            elif pstatus in {"unavailable", "partial"}:
+                warning = "Профит Лига: поиск недоступен или неполон; отсутствие детали не доказано"
+                tried.append(warning)
+                errors.append(warning + ": " + str(profit_result.get("error") or "недоступно"))
+
         # 5b) интернет: артикула нет в панели — узнаём бренды по реальным сайтам.
         #     Бренд не выдумываем: только упоминания в выдаче, со ссылкой.
         # Только осмысленный артикул: «5/30», «2020», «масло» — не повод перебирать
@@ -2499,7 +2561,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # убираем дубли по (артикул или название, бренд)
         unique: dict[tuple[str, str], dict[str, Any]] = {}
         for item in collected:
-            key = (parts.normalize_sku(item.get("sku")) or str(item.get("name") or "").lower(),
+            key = (parts.sku_exact(item.get("sku")) or str(item.get("name") or "").lower(),
                    parts.exact_brand_identity(item.get("brand")))
             if not any(key):
                 continue
@@ -2511,12 +2573,22 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             elif current.get("source") == "склад":
                 unique[key] = {**item, "stock_records": current.get("stock_records") or []}
 
-        ranked = parts.rank_candidates(query, list(unique.values()), sku=sku, brand=brand, limit=limit)
+        # Для Профит Лиги список может содержать десятки брендов; клавиатура постраничная.
+        # Сначала посчитать реально подходящие позиции, затем честно сообщить об обрезании.
+        expanded = bool(profit_result.get("brands"))
+        rank_limit = 100 if expanded else limit
+        ranked = parts.rank_candidates(query, list(unique.values()), sku=sku, brand=brand,
+                                       limit=max(rank_limit, len(unique)))
+        if len(ranked) > rank_limit and expanded:
+            warning = f"Профит Лига: список вариантов обрезан до {rank_limit} из {len(ranked)}; уточните бренд для полного поиска"
+            tried.append(warning)
+            errors.append(warning)
+        ranked = ranked[:rank_limit]
         # при равном балле сначала то, что реально есть в CRM, потом интернет
         ranked.sort(key=lambda item: (item.get("source") == "интернет", -item.get("score", 0)))
         status = parts.decide(ranked)
         if ranked and (all(i.get("source") == "склад" for i in ranked) or
-                       (not brand and all(i.get("source") in {"интернет", "Росско"} for i in ranked))):
+                       (not brand and all(i.get("source") in {"интернет", "Росско", "Профит Лига"} for i in ranked))):
             status = "ambiguous"  # найденный бренд — выбор человека, не доказательство уникальности
         result: dict[str, Any] = {
             "status": status,
@@ -2527,6 +2599,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "stock_lookup": stock_lookup,
             "rossko": {"status": rossko_result.get("status"), "count": len(rossko_result.get("brands") or []),
                        **({"error": rossko_result["error"]} if rossko_result.get("error") else {})},
+            "profit_liga": {"status": profit_result.get("status"), "count": len(profit_result.get("brands") or []),
+                            "brands": [row["brand"] for row in (profit_result.get("brands") or [])[:100]],
+                            **({"error": profit_result["error"]} if profit_result.get("error") else {})},
             "candidates": ranked,
             "best": ranked[0] if status == "matched" and ranked else None,
         }
@@ -4856,7 +4931,11 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                         time.sleep(remaining)
                 self.audit.write("write.step.start", token=token, method=step["method"], step_index=index)
                 step_started = time.monotonic()
-                results.append(self._call_step(step, payload, results))
+                try:
+                    results.append(self._call_step(step, payload, results))
+                finally:
+                    # Even a timeout may have changed CRM; no stale read can survive it.
+                    self._invalidate_cache()
                 if part_write:
                     last_part_write = time.monotonic()
                 self.audit.write("write.step.finish", token=token, method=self._last_step_method or step["method"], step_index=index, ms=round((time.monotonic()-step_started)*1000))

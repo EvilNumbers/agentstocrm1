@@ -321,7 +321,7 @@ def seconds_until_retry() -> float:
     return max(0.0, _DOWN_UNTIL - time.monotonic())
 
 
-def _get(url: str, *, timeout: float) -> str:
+def _get(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> str:
     """GET с маршрутом «напрямую → через прокси» и понятной ошибкой."""
     import httpx
 
@@ -342,7 +342,7 @@ def _get(url: str, *, timeout: float) -> str:
             timeout=httpx.Timeout(timeout, connect=min(6.0, timeout)),
             trust_env=False,
             proxy=route.proxy or None,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"},
+            headers={"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8", **(headers or {})},
             follow_redirects=True,
         ) as client:
             response = client.get(url)
@@ -429,7 +429,10 @@ def search(
 ) -> list[Hit]:
     """Одновременные одинаковые запросы используют один поиск и общий кэш."""
     deadline = deadline if deadline is not None else time.monotonic() + budget()
-    key = ((query or "").strip(), provider(), tuple(required or []), limit)
+    limit = max(0, min(int(limit), MAX_HITS))
+    if not limit:
+        return []
+    key = ((query or "").strip(), provider(), tuple(required or []))
     with _CACHE_LOCK:
         future = _FLIGHTS.get(key)
         leader = future is None
@@ -438,13 +441,13 @@ def search(
             _FLIGHTS[key] = future
     if not leader:
         try:
-            return list(future.result(timeout=max(0, deadline - time.monotonic())))
+            return list(future.result(timeout=max(0, deadline - time.monotonic())))[:limit]
         except TimeoutError as exc:
             raise WebSearchError("истекло время ожидания общего поиска") from exc
     try:
-        result = _search(query, limit=limit, timeout=timeout, required=required, deadline=deadline)
+        result = _search(query, limit=MAX_HITS, timeout=timeout, required=required, deadline=deadline)
         future.set_result(result)
-        return list(result)
+        return list(result)[:limit]
     except Exception as exc:
         future.set_exception(exc)
         raise
@@ -504,7 +507,9 @@ def _search(
                 content=json.dumps({"q": query, "num": limit}),
             )
             response.raise_for_status()
-            return parse_serper(response.json())[:limit]
+            hits = parse_serper(response.json())[:limit]
+            _remember(cache_key, hits)
+            return hits
     if kind == "brave":
         key = _env("WEBSEARCH_API_KEY")
         if not key:
@@ -514,10 +519,10 @@ def _search(
         page = _get(
             "https://api.search.brave.com/res/v1/web/search?"
             + _urlencode({"q": query, "count": limit}),
-            timeout=timeout,
+            timeout=timeout, headers={"X-Subscription-Token": key, "Accept": "application/json"},
         )
         payload = json.loads(page)
-        return [
+        hits = [
             Hit(
                 title=str(item.get("title") or ""),
                 url=str(item.get("url") or ""),
@@ -525,6 +530,8 @@ def _search(
             )
             for item in ((payload.get("web") or {}).get("results") or [])[:limit]
         ]
+        _remember(cache_key, hits)
+        return hits
     # Общий ограниченный пул: разные артикулы и поисковики не ждут друг друга.
     order = list(dict.fromkeys([kind] + engines()))[:MAX_ENGINES]
     required_terms = list(required or []) + [query]
@@ -694,6 +701,9 @@ def search_batch(articles: list[str], *, limit: int = 10) -> list[Hit]:
     отвечаем паузой, без переключения движков или обхода защиты.
     """
     from . import parts
+    limit = max(0, min(int(limit), MAX_HITS))
+    if not limit:
+        return []
     values = list(dict.fromkeys(str(x).strip() for x in articles if parts.sku_exact(str(x))))
     if not values or len(values) > 4:
         raise ValueError("В одном поисковом запросе допускается от одного до четырёх артикулов")
@@ -718,14 +728,14 @@ def search_batch(articles: list[str], *, limit: int = 10) -> list[Hit]:
     deadline = time.monotonic() + budget()
     if not leader:
         try:
-            return list(future.result(timeout=budget()))
+            return list(future.result(timeout=budget()))[:limit]
         except TimeoutError as exc:
             raise WebSearchError("Истекло время ожидания общего поиска") from exc
     try:
-        hits = _polite_engine(kind, query, limit=limit, timeout=DEFAULT_TIMEOUT, deadline=deadline, single_request=True)
+        hits = _polite_engine(kind, query, limit=MAX_HITS, timeout=DEFAULT_TIMEOUT, deadline=deadline, single_request=True)
         _remember(key, hits)
         future.set_result(hits)
-        return list(hits)
+        return list(hits)[:limit]
     except Exception as exc:
         future.set_exception(exc)
         raise

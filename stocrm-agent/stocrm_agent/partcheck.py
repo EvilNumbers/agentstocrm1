@@ -99,6 +99,24 @@ def run_partcheck(tools: Toolset, query: str) -> list[Check]:
         checks.append(Check(INFO, "Росско: поиск отключён", "Для подключения нужны локальные настройки, не отправляйте ключи в чат."))
     else:
         checks.append(Check(INFO, "Росско: поиск пропущен", "Нужен корректный артикул."))
+    profit = result.get("profit_liga") or {}
+    state = profit.get("status")
+    brands = profit.get("brands") or []
+    if state in ("ok", "partial"):
+        checks.append(Check(OK if state == "ok" else WARN, f"Профит Лига: брендов точного артикула: {profit.get('count', 0)}",
+                            str(profit.get("error") or "Только поиск; цена, наличие и заказ не используются.")))
+        for start in range(0, len(brands), 8):
+            checks.append(Check(INFO, "  бренды: " + ", ".join(brands[start:start + 8])))
+        if profit.get("count", 0) > len(brands):
+            checks.append(Check(WARN, f"Показаны первые {len(brands)} брендов; список обрезан", "Уточните бренд для проверки."))
+    elif state == "empty":
+        checks.append(Check(INFO, "Профит Лига: точных брендов в полученном ответе нет", "Отсутствие детали не доказано."))
+    elif state == "unavailable":
+        checks.append(Check(WARN, "Профит Лига: поиск не выполнен", str(profit.get("error") or "Проверьте настройки и сеть; отсутствие детали не доказано.")))
+    elif state == "disabled":
+        checks.append(Check(INFO, "Профит Лига: поиск отключён", "Настройте локально, не отправляйте ключ в чат."))
+    else:
+        checks.append(Check(INFO, "Профит Лига: поиск пропущен", "Нужен корректный артикул."))
     online = result.get("internet")
     if online is not None:
         state = online.get("status")

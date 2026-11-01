@@ -320,6 +320,8 @@ def render_part_choice(choice: dict[str, Any]) -> str:
         sources = {str(c.get("source") or "") for c in candidates}
         if any(c.get("source") == "склад" or c.get("stock_records") for c in candidates):
             lines.append("Склад — только справочный поиск; позиция со склада в сделку не привязывается.")
+        if "Профит Лига" in sources:
+            lines.append("Профит Лига — только бренды по точному артикулу; цена и наличие не проверялись, заказ поставщику не оформляется.")
         if "Росско" in sources:
             lines.append("Росско — только бренды по артикулу; заказ поставщику не оформляется.")
         if "интернет" in sources:
@@ -667,9 +669,14 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             if warnings:
                 parts.append("⚠️ " + "\n⚠️ ".join(warnings))
 
-        text_out = polish("\n\n".join(parts).strip() or "Готово.")
-        await message.answer(chunk(text_out)[0], reply_markup=drafts_keyboard(result.drafts))
-        for extra in chunk(text_out)[1:]:
+        raw_out = "\n\n".join(parts).strip() or "Готово."
+        # Ограничение Telegram применяется к каждой части, а не ко всему ответу.
+        # Имена и артикулы нумерованных товаров не являются техническим дампом.
+        text_out = polish(raw_out, limit=max(3800, len(raw_out) + 1),
+                          preserve_numbered=result.structured_offer_details)
+        pieces = chunk(text_out)
+        await message.answer(pieces[0], reply_markup=drafts_keyboard(result.drafts))
+        for extra in pieces[1:]:
             await message.answer(extra)
 
     def is_admin(user: User | None) -> bool:

@@ -907,6 +907,7 @@ class PipelineResult:
     tool_calls: list[str] = field(default_factory=list)
     part_notes: list[str] = field(default_factory=list)   # что из просьбы не удалось добавить
     error: str | None = None
+    structured_offer_details: bool = False
 
 
 class BotPipeline:
@@ -2771,7 +2772,8 @@ class BotPipeline:
                 history.append({"role": "user", "content": text})
                 history.append({"role": "assistant", "content": answer})
                 del history[: max(0, len(history) - self.s.max_history_messages)]
-                return PipelineResult(answer=answer)
+                return PipelineResult(answer=answer, structured_offer_details=(
+                    answer.startswith("📋 Сделка №") and "🧩 Товары" in answer))
 
         # Пока модель читает просьбу и «думает», карточка названной сделки уже
         # загружается в фоне: когда модель её попросит, ответ придёт из кэша.
