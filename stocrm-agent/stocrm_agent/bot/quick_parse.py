@@ -23,15 +23,23 @@ def parse(text: str) -> dict[str, Any]:
     new = bool(re.search(r'\bнов(?:ая|ую|ой)\s+быстр', text[:match.end()], re.I)) or create
     tail = text[match.end():].strip(' ,:;—-')
     number = re.match(r'^(?:№|#)\s*(\d+)\b', tail)
+    if number is None and existing_only:
+        # Номер сразу после «добавь в быструю сделку», в том числе голосом без знака №.
+        # Сумму с валютой нельзя принимать за номер сделки.
+        number = re.match(r'^(\d{1,6})(?!\d)(?!\s*(?:₽|руб\b|рубл|р\.))(?:\s+|[,;:]|$)', tail, re.I)
     offer_id = int(number[1]) if number else None
+    if number and not offer_id:
+        raise ValueError('Номер сделки должен быть положительным')
     if number:
         tail = tail[number.end():].strip(' ,:;—-')
-    cut = re.search(r'\b(?:артикул\w*|запчаст\w*|детал\w*)\b', tail, re.I)
+    cut = re.search(r'\b(?:артикул\w*|запчаст\w*|детал\w*|товар\w*)\b', tail, re.I)
     if cut:
         work_text = tail[:cut.start()]
         work_text = re.sub(r'\s*(?:,?\s*и\s*)?(?:добав\w*|внес\w*)\s*$', '', work_text, flags=re.I).strip(' ,:;—-')
         if re.fullmatch(r'(?:и|с)', work_text, re.I):
             work_text = ''
+        else:
+            work_text = re.sub(r'\s+(?:и|с)\s*$', '', work_text, flags=re.I).strip(' ,:;—-')
         part_text = tail[cut.start():]
     else:
         work_text, part_text = tail, ''
@@ -80,3 +88,51 @@ def parse(text: str) -> dict[str, Any]:
     if new and offer_id:
         raise ValueError('Уточните: создать новую или выбрать указанную сделку')
     return {'new': new, 'existing_only': existing_only and not new, 'offer_id': offer_id, 'work': work, 'articles': articles}
+
+
+_DEAL_REF = re.compile(r'\b(?:в\s+)?сделк(?:а|у|е|и|ой|ою)\s*(?:(?:№|#|номер(?:ом|а)?)\s*)?(\d+)\b', re.I)
+_PART_WORD = re.compile(r'\b(?:артикул\w*|запчаст\w*|детал\w*|товар\w*)\b', re.I)
+_WORK_WORD = re.compile(r'\b(?:услуг[ауыеой]*|работ[ауыеой]*)\b', re.I)
+
+
+def parse_existing_mixed(text: str) -> dict[str, Any]:
+    """Одна работа и товары в существующую сделку. Не угадывать номер и действия."""
+    if re.search(r'\b(?:не\s+(?:(?:надо|нужно|следует)\s+)?(?:добав\w*|внос\w*|внес\w*|услуг\w*|работ\w*|товар\w*|артикул\w*|запчаст\w*)|удал\w*|убер\w*|исключ\w*|измен\w*|помен\w*|перевед\w*|спиш\w*|оплат\w*|предоплат\w*|со\s+склад\w*|с\s+склад\w*|из\s+склад\w*|поставщик\w*|закаж\w*|заказат\w*|заказ\s+поставщик\w*|заметк\w*|задач\w*|резерв\w*|скидк\w*|запиши\w*|сделай\w*|позвон\w*|звонок|напиш\w*|создай\w*)\b', text, re.I):
+        raise ValueError('Есть другое действие или запрет; разделите просьбы')
+    if not re.search(r'\b(?:добав\w*|внес\w*)\b', text, re.I):
+        raise ValueError('Укажите именно добавление услуги и товара')
+    refs = list(_DEAL_REF.finditer(text))
+    if len(refs) > 1:
+        raise ValueError('Назовите только один номер сделки')
+    oid = int(refs[0].group(1)) if refs else None
+    if refs and not oid:
+        raise ValueError('Номер сделки должен быть положительным')
+    tail = _DEAL_REF.sub(' ', text)
+    # Незавершённая ссылка на сделку допустима только для вопроса о её номере.
+    tail = re.sub(r'\b(?:в\s+)?сделк(?:а|у|е|и|ой|ою)\b', ' ', tail, flags=re.I)
+    tail = re.sub(r'^\s*(?:пожалуйста\s+)?(?:добавь(?:те)?|добавить|внеси(?:те)?|внести)\b', '', tail, flags=re.I).strip(' ,:;—-')
+    # В начале после номера тоже может стоять глагол: «сделка 123 добавь ...».
+    tail = re.sub(r'^\s*(?:добавь(?:те)?|добавить|внеси(?:те)?|внести)\b', '', tail, flags=re.I).strip(' ,:;—-')
+    part = _PART_WORD.search(tail)
+    if not part:
+        raise ValueError('Укажите товар с точным артикулом')
+    works = list(_WORK_WORD.finditer(tail))
+    if len(works) > 1:
+        raise ValueError('Укажите одну услугу; несколько услуг в одной просьбе пока не разобраны')
+    if works and works[0].start() > part.start():
+        # Также принимаем сначала товар, затем явно названную услугу.
+        split = works[0].start()
+        before = re.sub(r'\s*(?:,?\s*и\s*)?(?:добав\w*|внес\w*)?\s*$', '', tail[:split], flags=re.I).strip(' ,:;—-')
+        after = tail[split:]
+        tail = after + ' и ' + before
+    part_tail = tail[_PART_WORD.search(tail).start():]
+    if re.search(r'(?:\bи\b|,)\s*(?!(?:товар|артикул|запчаст|детал)\w*\b)[а-яё]+(?:\s+[а-яё]+){0,3}\s+\d', part_tail, re.I):
+        raise ValueError('Возможно указаны дополнительные позиции; разделите или уточните запрос')
+    plan = parse('быстрая сделка ' + tail)
+    if not plan.get('work') or not plan.get('articles'):
+        raise ValueError('Не удалось однозначно разобрать и услугу, и товар')
+    # Не считать несколько услуг одной строкой с неожиданным названием и суммой.
+    if re.search(r'\d\s*(?:руб(?:лей|ля|ль)?\.?|₽)?\s*(?:,|;|\bи\b)\s*[^\d,;]+\s+\d', tail[:_PART_WORD.search(tail).start()], re.I):
+        raise ValueError('Несколько услуг в одной просьбе пока не разобраны; укажите одну')
+    plan.update(new=False, existing_only=True, offer_id=oid, ordinary_mixed=True)
+    return plan

@@ -71,11 +71,17 @@ def test_article_and_price_normalization_limited_scope():
     assert _normalize_deal_slip('Цена 2.500, масло 5.30') == 'Цена 2.500, масло 5.30'
 
 
-def test_explicit_mixed_service_and_goods_not_interpreted_as_one(env):
-    _, _, pipe = env
+def test_explicit_mixed_service_and_goods_not_interpreted_as_one(env, monkeypatch):
+    session, tools, pipe = env
+    monkeypatch.setattr(tools, 'resolve_part', lambda **kw: {'status': 'not_found', 'candidates': []})
     result = send(pipe, 'в сделку 13.25 добавь услугу замена масла за 300 и товар FC2139 за 2500')
-    assert not result.drafts and not result.applied and not result.choices
-    assert 'отдельн' in result.answer
+    assert not result.drafts and not result.applied and 'бренд' in result.answer.lower()
+    result = send(pipe, 'SUFIX')
+    assert len(result.drafts) == 1 and not result.applied
+    payload = result.drafts[0]['payload']
+    assert payload['offer_id'] == 1325 and payload['work'] == {'title': 'замена масла', 'price': 300}
+    assert payload['articles'][0]['sku'] == 'FC2139' and payload['articles'][0]['price'] == 2500
+    assert not any(c['method'] in ('work/add', 'offer/require/add', 'offer/order/add_free_order') for c in session.calls)
 
 
 def test_brand_lookup_separators_and_strict_article():

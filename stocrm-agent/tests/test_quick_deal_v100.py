@@ -131,19 +131,18 @@ def test_no_existing_implicitly_new(env):
     assert not writes(session)
 
 
-def test_stale_choice_and_changed_status_before_apply(env):
+def test_selected_number_follows_status_changes_before_confirmation_and_apply(env):
     session, tools, pipe = env
     existing(session, 1900); existing(session, 1901)
     choice = send(pipe, 'быстрая сделка диагностика 1000 рублей').choices[0]
-    session.data['offers/get_from_filter'][-2].update(STATUS_ID=15, STATUS_NAME='В работе')
-    assert not pipe.quick_read_choice(choice, 1, 0).drafts
-    session.data['offers/get_from_filter'][-2].update(STATUS_ID=51, STATUS_NAME='Быстрые сделки')
-    choice = send(pipe, 'быстрая сделка диагностика 1000 рублей').choices[0]
-    draft = pipe.quick_read_choice(choice, 1, 0).drafts[0]
-    session.data['offers/get_from_filter'][-2].update(STATUS_ID=15, STATUS_NAME='В работе')
-    with pytest.raises(ValueError):
-        tools.apply_draft(draft['token'])
-    assert not writes(session)
+    session.data['offers/get_from_filter'][-2].update(STATUS_ID=15, STATUS_NAME='В работе', CONTACT_ID=9999)
+    result = pipe.quick_read_choice(choice, 1, 0)
+    assert result.drafts and not writes(session)
+    assert '№1900' in result.drafts[0]['summary'] and 'без проверки' in result.drafts[0]['summary']
+    session.data['offers/get_from_filter'][-2].update(STATUS_ID=13, STATUS_NAME='Запись', BOARD_ID=9)
+    assert tools.apply_draft(result.drafts[0]['token'])['status'] == 'applied'
+    assert [c['method'] for c in writes(session)] == ['work/add']
+    assert writes(session)[0]['payload']['DATA']['OFFER_ID'] == 1900
 
 
 @pytest.mark.parametrize('method', ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order'])

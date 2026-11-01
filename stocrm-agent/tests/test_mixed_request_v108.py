@@ -1,19 +1,23 @@
-"""Не выполняем только товар, молча отбрасывая услугу из одной просьбы."""
+"""Смешанная просьба: обе позиции или ничего, без живой CRM."""
 import pytest
-from test_quick_deal_v100 import env, send, writes  # noqa: F401
+from test_quick_deal_v100 import env, existing, send, writes  # noqa: F401
 
 
 @pytest.mark.parametrize('text', [
-    'сделка 1337 диагностика 1000 рублей и добавь артикул NGK CR9E цена 300',
-    'Сделка 1337 добавь диагностика 1000 рублей и добавь артикул NGK CR9E цена 300',
-    'добавь услугу диагностика за 1000 и запчасть NGK CR9E за 300 в сделку 1337',
-    'добавь работу замена масла 1000 и товар артикул W914/2 цена 300 в сделку 1337',
+    'сделка 1900 диагностика 1000 рублей и добавь артикул NGK CR9E цена 300',
+    'Сделка 1900 добавь диагностика 1000 рублей и добавь артикул NGK CR9E цена 300',
+    'добавь услугу диагностика за 1000 и запчасть NGK CR9E за 300 в сделку 1900',
+    'добавь в сделку №1900 услугу диагностика 1000 и товар артикул NGK CR9E цена 300',
+    'добавь товар артикул NGK CR9E за 300 и услугу диагностика 1000 в сделку 1900',
 ])
 @pytest.mark.parametrize('fastpath', [True, False])
-def test_mixed_ordinary_deal_never_silently_omits_work(env, text, fastpath):
+def test_mixed_ordinary_deal_prepares_both_without_writing(env, text, fastpath):
     session, _, pipe = env
     pipe.fastpath = fastpath
+    existing(session, 1900)
     result = send(pipe, text)
-    assert 'услугу' in result.answer and 'товар' in result.answer
-    assert 'отдельно' in result.answer and 'не записано' in result.answer
-    assert not result.drafts and not result.applied and not writes(session)
+    assert len(result.drafts) == 1 and not result.applied and not writes(session), result.answer
+    p = result.drafts[0]['payload']
+    assert p['offer_id'] == 1900
+    assert p['work'] == {'title': 'диагностика', 'price': 1000}
+    assert p['articles'] == [{'sku': 'CR9E', 'brand': 'NGK', 'qty': 1, 'price': 300}]

@@ -477,12 +477,49 @@ class DraftStore:
         with self._locked():
             draft = self._get_unlocked(token)
             if draft.get("tool") != "quick_deal" or not (draft.get("status") in (PARTIAL, APPLYING) or draft.get("archived_partial")):
-                raise ValueError("Этот черновик не является непроверенной быстрой сделкой")
+                raise ValueError("Этот черновик не является непроверенной составной операцией")
             if draft.get("status") == APPLYING and time.time() - float(draft.get("quick_touched_at") or draft.get("claimed_at") or time.time()) < 3600:
                 raise ValueError("Заявка может ещё выполняться. Дождитесь завершения; после часа без обновлений можно проверить CRM вручную")
             draft.update(status=DISCARDED, archived_partial=False, manually_reviewed_at=time.time(), manually_reviewed_by=user_id)
             self._save()
             return dict(draft)
+
+    @staticmethod
+    def _position_offer_ids(draft: dict[str, Any]) -> set[str]:
+        """Номера сделки для составной или отдельной операции добавления позиции."""
+        check = draft.get('check') or {}
+        payload = draft.get('payload') or {}
+        result = draft.get('result') or {}
+        values = [check.get('offer_id')]
+        values.extend(item.get('offer_id') for item in (check.get('items') or []) if isinstance(item, dict))
+        if draft.get('tool') == 'quick_deal':
+            values.extend([payload.get('offer_id'), result.get('OFFER_ID') if isinstance(result, dict) else None])
+        return {str(v) for v in values if v is not None and str(v).isdigit() and int(v) > 0}
+
+    def _assert_composite_offer_unblocked_unlocked(self, draft: dict[str, Any]) -> None:
+        """Не повторять сомнительную составную запись через отдельные позиции и наоборот."""
+        tool = draft.get('tool')
+        if tool not in {'quick_deal', 'add_offer_part', 'add_offer_work'}:
+            return
+        offer_ids = self._position_offer_ids(draft)
+        if not offer_ids:
+            return
+        for other in self._data.values():
+            other_tool = other.get('tool')
+            if other.get('token') == draft.get('token'):
+                continue
+            if tool == 'quick_deal':
+                relevant = other_tool in {'add_offer_part', 'add_offer_work'}
+            else:
+                relevant = other_tool == 'quick_deal'
+            if not relevant or not offer_ids.intersection(self._position_offer_ids(other)):
+                continue
+            status = other.get('status')
+            uncertain = (status in (APPLYING, PARTIAL) or other.get('archived_partial') or
+                         (status == APPLIED and other.get('check_warning') and
+                          not (other.get('review') or {}).get('verified')))
+            if uncertain:
+                raise ValueError('По этой сделке есть выполняемая или непроверенная запись позиций. Проверьте CRM и /drafts; повтор запрещён.')
 
     def claim(self, token: str) -> dict[str, Any]:
         """Атомарно: проверить черновик И захватить его на применение.
@@ -496,6 +533,7 @@ class DraftStore:
             if draft.get("batch_preparing"):
                 raise ValueError("Заявка ещё собирается; применять отдельные позиции нельзя.")
             self._assert_part_unblocked_unlocked(draft)
+            self._assert_composite_offer_unblocked_unlocked(draft)
             check = draft.get("check") or {}
             if check.get("kind") == "added_contact":
                 from .contact_search import phone_key
@@ -517,7 +555,7 @@ class DraftStore:
                     relevant = (other_quick or old_check.get("kind") == "standalone_offer") and target_phone and other_phone == target_phone
                     if relevant and (other.get("status") in (APPLYING, PARTIAL) or other.get("archived_partial")
                             or (other.get("status") == APPLIED and float(other.get("applied_at") or 0) >= float(draft.get("created_at") or 0))):
-                        raise ValueError("Другая быстрая сделка или создание сделки с системным контактом уже выполняется или требует проверки. Проверьте /drafts; повтор запрещён.")
+                        raise ValueError("Другая составная операция или создание сделки с системным контактом уже выполняется или требует проверки. Проверьте /drafts; повтор запрещён.")
             if check.get("kind") == "standalone_offer":
                 from .contact_search import phone_key
                 for other in self._data.values():

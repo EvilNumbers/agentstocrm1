@@ -12,10 +12,10 @@ def test_work_and_goods_are_separate_sequential_calls(env):
     assert [c['method'] for c in writes(session)] == [
         'offer/new/with_contact', 'offer/status/change', 'work/add',
         'offer/require/add', 'offer/order/add_free_order']
-    assert outcome['result']['completed'] == ['создание сделки', 'статус «Быстрые сделки»', 'работа «диагностика»', 'артикул CR9E']
+    assert outcome['result']['completed'] == ['создание сделки', 'запрос перевода в «Быстрые сделки» отправлен, ответ получен; текущий статус не проверялся', 'работа «диагностика»', 'артикул CR9E']
 
 
-def test_missing_status_after_change_stops_before_any_items_and_archived_remains_blocked(env, monkeypatch):
+def test_missing_status_after_change_does_not_block_items(env, monkeypatch):
     session, tools, pipe = env
     draft = send(pipe, 'новая быстрая сделка диагностика 1000 рублей и добавь артикул NGK CR9E цена 300').drafts[0]
     original = tools._search_offer_row
@@ -26,15 +26,9 @@ def test_missing_status_after_change_stops_before_any_items_and_archived_remains
             row.pop('STATUS_NAME', None)
         return row, count
     monkeypatch.setattr(tools, '_search_offer_row', missing)
-    monkeypatch.setattr(tools, '_search_offer_row_without_required_fields', lambda _: None)
-    monkeypatch.setattr(quick_deal.time, 'sleep', lambda _: None)
     result = tools.apply_draft(draft['token'])
-    assert result['status'] == 'partial' and 'название статуса' in result['warning']
-    assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change']
-    tools.drafts.archive(draft['token'])
-    assert tools.drafts.get(draft['token'])['archived_partial']
-    again = send(pipe, 'новая быстрая сделка диагностика 1000 рублей')
-    assert not again.drafts and len(writes(session)) == 2
+    assert result['status'] == 'applied' and result['result']['status_not_read_back']
+    assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order']
 
 
 def test_offer_diagnostic_does_not_expose_contact_or_raw_status(env, monkeypatch):

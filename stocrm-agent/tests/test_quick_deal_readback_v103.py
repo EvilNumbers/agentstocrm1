@@ -26,28 +26,38 @@ def test_stale_status_reads_settle_without_repeating_writes(env, monkeypatch):
     monkeypatch.setattr(quick_deal.time, 'sleep', delays.append)
     result = tools.apply_draft(draft['token'])
     assert result['status'] == 'applied' and result['verified']
-    assert len(checks) == 2 and delays == [0.5, 1.0]
+    assert len(checks) == 2 and delays == []
     assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order']
 
 
-@pytest.mark.parametrize('field, value', [('BOARD_ID', 9), ('STATUS_NAME', 'Запись'), ('STATUS_NAME', None), ('missing_row', None)])
-def test_unconfirmed_readback_stays_partial_and_blocks_writes(env, monkeypatch, field, value):
+@pytest.mark.parametrize('field, value', [('BOARD_ID', 9), ('STATUS_NAME', 'Запись'), ('STATUS_NAME', None), ('CONTACT_ID', 9999)])
+def test_status_contact_or_board_readback_does_not_block_numbered_items(env, monkeypatch, field, value):
     session, tools, pipe = env
     draft = draft_for(pipe)
     original = tools._search_offer_row
-    def mismatch(oid):
+    def changed(oid):
         row, count = original(oid)
         if any(c['method'] == 'offer/status/change' for c in writes(session)):
-            return (None, count) if field == 'missing_row' else ({**row, field: value}, count)
+            return {**row, field: value}, count
         return row, count
-    monkeypatch.setattr(tools, '_search_offer_row', mismatch)
-    delays = []
-    monkeypatch.setattr(quick_deal.time, 'sleep', delays.append)
+    monkeypatch.setattr(tools, '_search_offer_row', changed)
+    result = tools.apply_draft(draft['token'])
+    assert result['status'] == 'applied'
+    assert result['result']['status_not_read_back'] is True
+    assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order']
+
+
+def test_missing_deal_number_after_status_stays_partial_and_blocks_writes(env, monkeypatch):
+    session, tools, pipe = env
+    draft = draft_for(pipe)
+    original = tools._search_offer_row
+    def missing(oid):
+        row, count = original(oid)
+        return (None, count) if any(c['method'] == 'offer/status/change' for c in writes(session)) else (row, count)
+    monkeypatch.setattr(tools, '_search_offer_row', missing)
     result = tools.apply_draft(draft['token'])
     assert result['status'] == 'partial' and not result['verified']
-    assert result['result']['completed'] == ['создание сделки']
-    assert delays == [0.5, 1.0, 2.0]
-    assert ('сделка не найдена' if field == 'missing_row' else 'контакт' if field == 'CONTACT_ID' else 'воронка или название статуса') in result['warning']
+    assert 'сделка не найдена' in result['warning']
     assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change']
     with pytest.raises(ValueError):
         tools.apply_draft(draft['token'])
