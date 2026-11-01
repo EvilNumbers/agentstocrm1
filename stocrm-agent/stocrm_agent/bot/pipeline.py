@@ -929,6 +929,7 @@ class BotPipeline:
         self._bookings: dict[int, dict[str, Any]] = {}
         self._contact_lookups: dict[int, dict[str, Any]] = {}
         self._contact_create_pending: dict[int, dict[str, Any]] = {}
+        self._offer_create_pending: dict[int, dict[str, Any]] = {}
         self._last_work_request: dict[int, dict[str, Any]] = {}
         self._turn_locks: dict[tuple[Any, int], list[Any]] = {}
         #: Сделка, которую бот только что показал. Нужна, когда человек говорит
@@ -975,6 +976,7 @@ class BotPipeline:
         self._bookings.pop(key, None)
         self._contact_lookups.pop(key, None)
         self._contact_create_pending.pop(key, None)
+        self._offer_create_pending.pop(key, None)
         self._last_work_request.pop(key, None)
 
     # ------------------------------------------------------- один черновик на всё
@@ -2253,6 +2255,107 @@ class BotPipeline:
         except RuntimeError:              # нет работающего цикла — просто пропускаем
             pass
 
+    def _direct_create_offer(self, text: str, user_id: int | None) -> PipelineResult | None:
+        """Явный запрос только на сделку: телефон → клиент → воронка → подтверждение."""
+        from ..contact_search import phone_key
+        ident, source = user_id or 0, text.strip()
+        pending = self._offer_create_pending.get(ident)
+        if pending and time.time() - pending["at"] > self.to_pending_ttl:
+            self._offer_create_pending.pop(ident, None)
+            pending = None
+        request = re.match(r"^(?:создай(?:те)?|создать|открой(?:те)?|оформи(?:те)?)\s+(?:новую\s+)?сделк[ау]\b", source, re.I)
+        if request and re.search(r"запи[сш]|календар|\bпост\b|добавь|запчаст|работ[уы]", source, re.I):
+            return None  # составные заявки обрабатывает другой сценарий
+        if request:
+            self._offer_create_pending.pop(ident, None)
+            tail = source[request.end():].strip()
+            if re.search(r"\b(?:и|а также)\b", tail, re.I):
+                return PipelineResult(answer="Пожалуйста, разделите создание сделки и другие действия на отдельные запросы. Ничего не записано.")
+            pending = {"at": time.time(), "field": "phone"}
+            self._offer_create_pending[ident] = pending
+            phones = list(re.finditer(r"(?<!\d)\+?\d[\d ()-]{8,}\d(?!\d)", tail))
+            if len(phones) > 1:
+                return PipelineResult(answer="Укажите один полный номер телефона клиента.")
+            rest = tail
+            if phones:
+                pending["phone"] = phones[0].group().strip()
+                rest = tail[:phones[0].start()] + " " + tail[phones[0].end():]
+            rest = re.sub(r"\b(?:клиенту|клиента|для|по|телефону|телефон|номеру|номер|с)\b", " ", rest, flags=re.I).strip(" ,.:;!?—–")
+            if rest:
+                self._offer_create_pending.pop(ident, None)
+                return PipelineResult(answer="Не удалось надёжно разобрать дополнительные условия. Попросите отдельно создать сделку по номеру клиента; воронку я уточню. Ничего не записано.")
+        elif pending:
+            low = source.lower().strip(" .!?")
+            if low in {"отмена", "отмени", "стоп", "не надо"}:
+                self._offer_create_pending.pop(ident, None)
+                return PipelineResult(answer="Создание сделки отменено. В CRM ничего не записано.")
+            if _looks_like_new_request(low):
+                self._offer_create_pending.pop(ident, None)
+                return None
+            field = pending.get("field")
+            if field == "phone":
+                if not re.fullmatch(r"[+\d ()-]{10,}", source):
+                    return PipelineResult(answer="Укажите один полный номер телефона клиента.")
+                pending["phone"] = source
+            elif field in {"contact", "board"}:
+                options = pending.get("options") or []
+                if not source.isdigit() or not 1 <= int(source) <= len(options):
+                    return PipelineResult(answer="Ответьте номером варианта из списка или напишите «отмена».")
+                selected = options[int(source) - 1]
+                if field == "contact":
+                    pending["contact_id"] = selected["contact_id"]
+                    pending["contact_snapshot"] = pending["snapshot"]
+                else:
+                    pending["board_id"] = selected["board_id"]
+                pending["field"] = "continue"
+            elif field == "name":
+                if not re.fullmatch(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё' -]{0,99}", source) or source.casefold() in {"новая сделка", "сделка", "клиент", "новый клиент"}:
+                    return PipelineResult(answer="Напишите настоящее имя нового клиента. Ничего не записано.")
+                pending["title"] = source
+                pending["field"] = "continue"
+        else:
+            return None
+        pending["at"] = time.time()
+        phone = str(pending.get("phone") or "")
+        if not 10 <= len(phone_key(phone)) <= 15:
+            pending["field"] = "phone"
+            return PipelineResult(answer="Укажите полный номер телефона клиента.")
+        try:
+            self.tools._invalidate_cache()
+            matches = self.tools._booking_contacts(phone)
+            ids = sorted(int(c["contact_id"]) for c in matches)
+            if pending.get("contact_snapshot") is not None and ids != pending["contact_snapshot"]:
+                pending.pop("contact_id", None)
+                pending.pop("contact_snapshot", None)
+            if (len(matches) > 1 or any(c.get("search_incomplete") for c in matches)) and pending.get("contact_snapshot") != ids:
+                pending.update(field="contact", options=matches, snapshot=ids)
+                options = "\n".join(f"{i}. {c.get('title') or 'Без имени'} · контакт №{c['contact_id']}" for i, c in enumerate(matches, 1))
+                return PipelineResult(answer="Выберите клиента по номеру из списка (поиск дополнительных телефонов может быть неполным):\n" + options)
+            if not matches and not pending.get("title"):
+                pending["field"] = "name"
+                return PipelineResult(answer="Клиент с этим номером не найден. Как зовут нового клиента? Напишите имя; до подтверждения ничего не создаю.")
+            if matches:
+                pending.pop("title", None)
+            boards = [b for b in self.tools.boards() if b.get("board_id") and b.get("active") != "N"]
+            if not boards:
+                raise ValueError("Не удалось получить доступные воронки")
+            if pending.get("board_id") and not any(str(b["board_id"]) == str(pending["board_id"]) for b in boards):
+                pending.pop("board_id", None)
+            if not pending.get("board_id"):
+                if len(boards) == 1:
+                    pending["board_id"] = boards[0]["board_id"]
+                else:
+                    pending.update(field="board", options=boards)
+                    options = "\n".join(f"{i}. {b.get('name') or 'Без названия'} · №{b['board_id']}" for i, b in enumerate(boards, 1))
+                    return PipelineResult(answer="В какой воронке создать сделку? Ответьте номером варианта:\n" + options)
+            draft = self.tools.draft_create_offer(board_id=int(pending["board_id"]), phone=phone,
+                contact_id=pending.get("contact_id"), title=pending.get("title"), _contact_snapshot=pending.get("contact_snapshot"))
+        except Exception as exc:
+            self._offer_create_pending.pop(ident, None)
+            return PipelineResult(answer=f"Не удалось подготовить сделку: {exc}. В этой попытке ничего не записано.")
+        self._offer_create_pending.pop(ident, None)
+        return PipelineResult(answer="Проверьте клиента и воронку. Для создания нажмите «Применить»; до подтверждения ничего не изменено.", drafts=[draft])
+
     def _direct_create_contact(self, text: str, user_id: int | None) -> PipelineResult | None:
         """Явное создание клиента до разбора товаров; телефон никогда не артикул."""
         key = user_id or 0
@@ -2529,6 +2632,11 @@ class BotPipeline:
             return PipelineResult(answer="Со склада в сделку не добавляю и складскую позицию не привязываю. Могу найти её для справки или подготовить свободную позицию по вашему отдельному запросу.")
         if _ADD_VERB.search(text) and not money_text.deal_in_text(text) and re.match(r"^\s*(?:и\s+)?лк\s+\d{3,6}\b", text, re.I):
             return PipelineResult(answer="Номер сделки прозвучал неразборчиво. Повторите команду со словами «в сделку» и номером: не использую предыдущую сделку и ничего не записываю.")
+        offer_create = await asyncio.to_thread(self._direct_create_offer, text, user_id)
+        if offer_create is not None:
+            history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": offer_create.answer}])
+            del history[:max(0, len(history) - self.s.max_history_messages)]
+            return offer_create
         contact_create = await asyncio.to_thread(self._direct_create_contact, text, user_id)
         if contact_create is not None:
             history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": contact_create.answer}])

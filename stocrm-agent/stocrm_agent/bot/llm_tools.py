@@ -191,7 +191,7 @@ TOOL_SPEC: list[dict[str, Any]] = [
 
     # ---------------------------------------------------------- черновики
     _tool("draft_create_offer",
-          "ЧЕРНОВИК создания сделки. Если клиента нет в CRM — передайте phone и title, контакт создастся вместе со сделкой. "
+          "ЧЕРНОВИК создания сделки. Обязательно передайте phone; клиент ищется по номеру. Если клиента нет, спросите настоящее имя и передайте его в title; не подставляйте «Новая сделка». "
           "Ответственного по сделке не назначает — исполнители ставятся на конкретные работы.",
           {"board_id": _INT, "contact_id": _INT, "phone": _STR, "title": _STR, "comment": _STR},
           ["board_id"]),
@@ -701,7 +701,7 @@ class ToolRouter:
         extra_drafts, extra_notes, extra_pending = self._build_extra_parts(clean_args, extra_parts)
         if name_hint:  # «Исполнитель: Петров Пётр» в резюме черновика
             draft["summary"] = f"{draft.get('summary')} ({name_hint})" if name_hint not in str(draft.get("summary")) else draft.get("summary")
-        needs_confirm = bool(self.prepare_only) or self.policy.requires_confirmation(name)
+        needs_confirm = bool(self.prepare_only) or name == "draft_create_offer" or self.policy.requires_confirmation(name)
 
         if not needs_confirm:
             if name == PART_TOOL and extra_drafts:

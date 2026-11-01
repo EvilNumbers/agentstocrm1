@@ -2964,34 +2964,115 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
     # ---------------------------------------------------------------- DRAFTS
     def draft_create_offer(
-        self,
-        *,
-        board_id: int,
-        contact_id: int | None = None,
-        phone: str | None = None,
-        title: str | None = None,
-        comment: str | None = None,
+        self, *, board_id: int, contact_id: int | None = None, phone: str | None = None,
+        title: str | None = None, comment: str | None = None,
+        _contact_snapshot: list[int] | None = None,
     ) -> dict[str, Any]:
-        if not contact_id and not phone:
-            raise ValueError("Нужен либо contact_id (найденный контакт), либо phone для создания нового клиента")
-        if contact_id:
-            method = "offer/new"
-            payload: dict[str, Any] = {"BOARD_ID": int(board_id), "CONTACT_ID": int(contact_id)}
-            if comment:
-                payload["COMMENT"] = comment
-            summary = f"Создать сделку в воронке {board_id} для контакта {contact_id}"
+        """Новая сделка только после проверки номера, без угадывания контакта."""
+        if not phone or not 10 <= len(phone_key(phone)) <= 15:
+            raise ValueError("Укажите полный телефон клиента для поиска")
+        self._invalidate_cache()
+        boards = [b for b in self.boards() if str(b.get("board_id")) == str(board_id) and b.get("active") != "N"]
+        if len(boards) != 1:
+            raise ValueError("Воронка не найдена или недоступна")
+        matches = self._booking_contacts(phone)
+        ids = sorted(int(c["contact_id"]) for c in matches)
+        if _contact_snapshot is not None and _contact_snapshot != ids:
+            raise ValueError("Список клиентов изменился; выберите клиента заново")
+        if (len(matches) > 1 or any(c.get("search_incomplete") for c in matches)) and (contact_id is None or _contact_snapshot != ids):
+            raise ValueError("По номеру найдено несколько клиентов или поиск неполон. Выберите клиента явно в чате.")
+        if contact_id is not None and int(contact_id) not in ids:
+            raise ValueError("Выбранный контакт не найден по этому телефону")
+        contact = next((c for c in matches if c["contact_id"] == int(contact_id)), None) if contact_id else (matches[0] if matches else None)
+        contact_id = int(contact["contact_id"]) if contact else None
+        if not contact and (not str(title or "").strip() or str(title).strip().casefold() in {"новая сделка", "сделка", "клиент", "новый клиент"}):
+            raise ValueError("Клиент не найден. Укажите настоящее имя нового клиента")
+        self._booking_uncertain_client(phone, contact_id)
+        for previous in self.drafts.list("all"):
+            check = previous.get("check") or {}
+            old_phone = check.get("phone") or (previous.get("payload") or {}).get("PHONE")
+            if previous.get("tool") != "create_offer" or phone_key(old_phone) != phone_key(phone):
+                continue
+            if previous.get("status") in ("partial", "applying") or previous.get("archived_partial"):
+                raise ValueError("Предыдущая попытка создания сделки не подтверждена. Проверьте CRM и /drafts; повтор заблокирован")
+            if previous.get("status") == "pending":
+                raise ValueError("Для этого номера уже есть черновик сделки. Проверьте /drafts, второй не создаю")
+        payload: dict[str, Any] = {"BOARD_ID": int(board_id), "PHONE": str(phone)}
+        name = str(contact.get("title") or f"Контакт №{contact_id}") if contact else str(title).strip()
+        if contact:
+            payload["CONTACT_ID"] = contact_id
         else:
-            method = "offer/new/with_contact"
-            payload = {"BOARD_ID": int(board_id), "PHONE": str(phone)}
-            if title:
-                payload["TITLE"] = title
-            if comment:
-                payload["COMMENT"] = comment
-            summary = f"Создать контакт {title or phone} и сделку в воронке {board_id}"
+            payload.update(PHONE=str(phone), TITLE=name)
+        if comment:
+            payload["COMMENT"] = comment
+        board_name = str(boards[0].get("name") or board_id)
+        summary = (f"Создать новую сделку в воронке «{board_name}» для существующего клиента {name} (контакт №{contact_id}, телефон {phone})"
+                   if contact else f"Создать клиента {name} (телефон {phone}) и новую сделку в воронке «{board_name}»")
         if comment:
             summary += f". Комментарий: {comment}"
+        check = {"kind": "standalone_offer", "phone": str(phone), "contact_id": contact_id,
+                 "client_name": name, "board_id": int(board_id), "contact_matches": ids,
+                 "incomplete": any(c.get("search_incomplete") for c in matches), "expected": dict(payload)}
+        return self.drafts.create(tool="create_offer", method="offer/new/with_contact", payload=payload,
+                                  summary=summary, extra={"check": check})
 
-        return self.drafts.create(tool="create_offer", method=method, payload=payload, summary=summary)
+    def _apply_standalone_offer(self, token: str, current: dict[str, Any]) -> dict[str, Any]:
+        from .booking import _id_from, key
+        from .calendar import _positive
+        check = current["check"]
+        if current.get("status") == "pending":
+            if current.get("method") != "offer/new/with_contact" or current.get("steps") or current.get("payload") != check.get("expected"):
+                raise ValueError("Данные черновика изменились; запись остановлена")
+            self._invalidate_cache()
+            if not any(str(b.get("board_id")) == str(check["board_id"]) and b.get("active") != "N" for b in self.boards()):
+                raise ValueError("Воронка больше недоступна")
+            matches = self._booking_contacts(check["phone"])
+            if sorted(int(c["contact_id"]) for c in matches) != check["contact_matches"]:
+                raise ValueError("Клиенты по телефону изменились; подготовьте новый черновик")
+            if bool(any(c.get("search_incomplete") for c in matches)) != bool(check.get("incomplete")):
+                raise ValueError("Полнота поиска клиента изменилась; подготовьте новый черновик")
+            if check.get("contact_id") is not None and check["contact_id"] not in check["contact_matches"]:
+                raise ValueError("Контакт больше не найден по телефону")
+            if check.get("contact_id") is not None:
+                chosen = next(c for c in matches if c["contact_id"] == check["contact_id"])
+                current_name = str(chosen.get("title") or f"Контакт №{check['contact_id']}")
+                if current_name != check["client_name"]:
+                    raise ValueError("Имя клиента изменилось после подготовки; проверьте его и подготовьте новый черновик")
+            self._booking_uncertain_client(check["phone"], check.get("contact_id"))
+            prior_ids = self._booking_offer_ids(check.get("contact_id"))
+        else:
+            prior_ids = set()
+        draft = self.drafts.claim(token)
+        created: dict[str, Any] = {}
+        try:
+            self.drafts.mark(token, "applying", booking_stage="создание сделки отправляется")
+            response = self.client.call("offer/new/with_contact", draft["payload"])
+            ident = _positive(response, "ID новой сделки") if isinstance(response, (int, str)) and not isinstance(response, bool) else _id_from(response, "OFFER_ID")
+            created["OFFER_ID"] = ident
+            self.drafts.mark(token, "applying", result=dict(created))
+            if ident in prior_ids:
+                raise ValueError("CRM вернула номер уже существовавшей сделки")
+            self._invalidate_cache()
+            offer = self._booking_offer(ident)
+            if offer.get("error") or str(offer.get("offer_id")) != str(ident) or str(offer.get("board_id")) != str(check["board_id"]):
+                raise ValueError("Не удалось подтвердить новую сделку и воронку")
+            contact_id = _positive(offer.get("contact_id"), "Контакт сделки")
+            created["CONTACT_ID"] = contact_id
+            if check.get("contact_id") and contact_id != check["contact_id"]:
+                raise ValueError("Сделка привязана к другому контакту")
+            matches = self._booking_contacts(check["phone"], contact_id)
+            if not any(c["contact_id"] == contact_id and (check.get("contact_id") or key(c.get("title")) == key(check["client_name"])) for c in matches):
+                raise ValueError("Не удалось подтвердить телефон или имя клиента")
+            created["SUMMARY"] = f"Новая сделка №{ident}, контакт №{contact_id}. {draft['summary']}"
+            self.drafts.mark(token, "applied", applied_at=time.time(), result=created)
+            return {"status": "applied", "token": token, "method": draft["method"], "result": created, "verified": True}
+        except BaseException as exc:
+            warning = (f"Результат создания сделки не подтверждён: {exc}. Известные номера: {created or 'нет'}. "
+                       "Проверьте STOCRM и /drafts; повтор заблокирован, ничего автоматически не удаляю.")
+            self.drafts.mark(token, "partial", failed_at=time.time(), result=created, check_warning=warning)
+            if not isinstance(exc, Exception):
+                raise
+            return {"status": "partial", "token": token, "method": draft["method"], "result": created, "warning": warning, "verified": False}
 
     def draft_change_status(
         self, *, offer_id: int, status_id: int, board_id: int | None = None,
@@ -4185,6 +4266,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             problem = current.get("part_conflict") or self._duplicate_part_check(current)
             if problem:
                 raise ValueError(str(problem))
+        if current and current.get("tool") == "create_offer":
+            if current.get("check", {}).get("kind") != "standalone_offer":
+                raise ValueError("Старый черновик сделки не содержит проверки клиента. Не применяйте его; если запись не отправлялась, отмените и подготовьте заново. Partial проверьте в CRM.")
+            return self._apply_standalone_offer(token, current)
         if current and current.get("check", {}).get("kind") == "existing_booking":
             return self._apply_existing_booking(token, current)
         if current and current.get("check", {}).get("kind") == "booking":

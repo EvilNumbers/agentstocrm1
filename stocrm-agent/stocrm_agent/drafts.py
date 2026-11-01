@@ -493,6 +493,15 @@ class DraftStore:
                             and phone_key(other_check.get("phone")) == phone_key(check.get("phone"))
                             and (other.get("status") in (APPLYING, PARTIAL, APPLIED) or other.get("archived_partial"))):
                         raise ValueError("Создание контакта с этим телефоном уже выполнялось или требует проверки. Повтор запрещён.")
+            if check.get("kind") == "standalone_offer":
+                from .contact_search import phone_key
+                for other in self._data.values():
+                    old = other.get("check") or {}
+                    if (other.get("token") != token and other.get("tool") == "create_offer"
+                            and phone_key(old.get("phone") or (other.get("payload") or {}).get("PHONE")) == phone_key(check.get("phone"))
+                            and (other.get("status") in (APPLYING, PARTIAL) or other.get("archived_partial")
+                                 or (other.get("status") == APPLIED and float(other.get("applied_at") or 0) >= float(draft.get("created_at") or 0)))):
+                        raise ValueError("Создание сделки с этим телефоном уже выполняется или требует проверки. Повтор запрещён.")
             draft["status"] = APPLYING
             draft["claimed_at"] = time.time()
             self._save()
