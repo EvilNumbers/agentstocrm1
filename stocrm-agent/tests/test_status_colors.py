@@ -70,13 +70,14 @@ def test_missing_and_failed_statuses_do_not_break_list(setup):
     assert '🟩' not in answer.answer and '🟨' not in answer.answer
 
 
-def test_board_and_status_ids_are_both_required():
+def test_color_uses_board_and_unique_name_not_status_id():
     class Stub:
         def statuses(self, board):
-            return [{'board_id': 1, 'status_id': 10, 'front_color': '#f00'},
-                    {'board_id': 2, 'status_id': 10, 'front_color': '#0f0'}]
-    rows = [{'board_id': 1, 'status_id': 10}, {'board_id': 2, 'status_id': 10},
-            {'board_id': None, 'status_id': 10}, {'board_id': 1, 'status_id': 11}]
+            return [{'board_id': 1, 'status_id': 10, 'title': 'Запись', 'front_color': '#f00'},
+                    {'board_id': 2, 'status_id': 10, 'title': 'Запись', 'front_color': '#0f0'}]
+    rows = [{'board_id': 1, 'status_id': None, 'status': 'Запись'},
+            {'board_id': 2, 'status_id': 99, 'status': 'Запись'},
+            {'board_id': None, 'status': 'Запись'}, {'board_id': 1, 'status': 'Заказ'}]
     result = with_status_colors(Stub(), rows)
     assert [r.get('status_marker') for r in result] == ['🟥', '🟩', None, None]
     assert all('status_marker' not in row for row in rows)
@@ -85,8 +86,9 @@ def test_board_and_status_ids_are_both_required():
 def test_conflicting_colors_are_not_guessed():
     class Stub:
         def statuses(self, board):
-            return [{'status_id': 10, 'front_color': '#f00'}, {'status_id': 10, 'front_color': '#0f0'}, {'status_id': 10, 'front_color': '#f00'}]
-    assert 'status_marker' not in with_status_colors(Stub(), [{'board_id': 1, 'status_id': 10}])[0]
+            return [{'board_id': 1, 'title': 'Запись', 'front_color': '#f00'},
+                    {'board_id': 1, 'title': 'Запись', 'front_color': '#0f0'}]
+    assert 'status_marker' not in with_status_colors(Stub(), [{'board_id': 1, 'status': 'Запись'}])[0]
 
 
 def test_model_tool_path_uses_current_crm_color(setup):

@@ -15,7 +15,12 @@ def parse(text: str) -> dict[str, Any]:
     match = re.search(r'\bбыстр\w*\s+сделк\w*', text, re.I)
     if not match:
         raise ValueError('Не распознана быстрая сделка')
-    new = bool(re.search(r'\bнов(?:ая|ую|ой)\s+быстр', text[:match.end()], re.I))
+    prefix = text[:match.start()]
+    if re.search(r'\bне\s+(?:добав\w*|созда\w*|внес\w*)\b', prefix, re.I):
+        raise ValueError('Запрос содержит запрет на действие; ничего не записываю')
+    create = bool(re.search(r'\b(?:добавь(?:те)?|добавить|создай(?:те)?|создать)\s+(?:(?:мне|нам)\s+)?$', prefix, re.I))
+    existing_only = bool(re.search(r'\b(?:добавь(?:те)?|добавить|внеси(?:те)?|внести)\s+(?:(?:мне|нам)\s+)?в\s*$', prefix, re.I))
+    new = bool(re.search(r'\bнов(?:ая|ую|ой)\s+быстр', text[:match.end()], re.I)) or create
     tail = text[match.end():].strip(' ,:;—-')
     number = re.match(r'^(?:№|#)\s*(\d+)\b', tail)
     offer_id = int(number[1]) if number else None
@@ -25,6 +30,8 @@ def parse(text: str) -> dict[str, Any]:
     if cut:
         work_text = tail[:cut.start()]
         work_text = re.sub(r'\s*(?:,?\s*и\s*)?(?:добав\w*|внес\w*)\s*$', '', work_text, flags=re.I).strip(' ,:;—-')
+        if re.fullmatch(r'(?:и|с)', work_text, re.I):
+            work_text = ''
         part_text = tail[cut.start():]
     else:
         work_text, part_text = tail, ''
@@ -68,8 +75,8 @@ def parse(text: str) -> dict[str, Any]:
                 if explicit and not re.match(r'\s*(?:шт\.?|штук\w*)\b', after[explicit.end(1):], re.I):
                     price = parse_price(explicit.group(1))
             articles.append({'sku': item['sku'], 'brand': brand, 'qty': item.get('qty') or 1, 'price': price})
-    if not work and not articles:
+    if not work and not articles and not new:
         raise ValueError('Назовите работу с ценой или артикул с ценой')
     if new and offer_id:
         raise ValueError('Уточните: создать новую или выбрать указанную сделку')
-    return {'new': new, 'offer_id': offer_id, 'work': work, 'articles': articles}
+    return {'new': new, 'existing_only': existing_only and not new, 'offer_id': offer_id, 'work': work, 'articles': articles}

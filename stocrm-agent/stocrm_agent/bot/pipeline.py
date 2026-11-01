@@ -2649,7 +2649,7 @@ class BotPipeline:
             if incomplete:
                 note += '\n\n⚠️ Список может быть неполным: часть сделок не удалось проверить.'
             if by_name:
-                note += '\n\nℹ️ Часть статусов сверена по названию и справочнику: CRM не вернула ID. Это только просмотр.'
+                note += '\n\nℹ️ Статус сверен по названию и справочнику, а не по ID. Это только просмотр.'
             choice = {"kind": "quick_read", "owner": user_id, "status_ids": status_ids,
                       "contacts": {oid: rows[oid] for oid in shown}, "offers": shown,
                       "question": 'Сделки в статусе «Быстрые сделки» (все контакты):\n\n' + "\n\n".join(details) + note}
@@ -2704,14 +2704,17 @@ class BotPipeline:
             return PipelineResult(answer=f"Не удалось подтвердить бренд артикула {sku}. Некоторые источники могут быть недоступны или поиск неполон — отсутствие товара не доказано. Введите бренд вручную или напишите «отмена». Цена и остальные позиции сохранены; запись не начата.")
         self._quick_pending.pop(user_id, None)
         try:
-            ids = quick_read.identity(self.tools)
-            # Явная «новая» не зависит от списка уже существующих сделок.
-            rows = [] if plan["new"] else quick_read.offers(self.tools, ids)
+            # Просмотр и выбор существующих сделок не зависят от контакта.
+            ids = quick_read.identity(self.tools) if plan['new'] else (0, *quick_read.status_identity(self.tools))
             selected = plan.get("offer_id")
-            if selected and selected not in rows:
-                raise ValueError("Указанная сделка не подтверждена для системного контакта и статуса")
+            # Указанный номер проверяется точечно в prepare, а не сканированием всех сделок.
+            rows = [] if plan["new"] or selected else quick_read.offers(self.tools, ids)
+            if plan.get('existing_only') and not selected and not rows:
+                return PipelineResult(answer='Подтверждённых существующих быстрых сделок не найдено. Новая сделка не создана; для создания скажите «добавь быструю сделку».')
             if plan["new"] or selected or not rows:
                 if not selected:
+                    if not plan['new']:
+                        ids = quick_read.identity(self.tools)
                     reasons = status_reasons(self.tools, ids)
                     if len(reasons) > 1 and not plan.get("reason_id"):
                         choice = {"kind": "quick_reason", "owner": user_id, "ids": ids,
@@ -2724,11 +2727,12 @@ class BotPipeline:
                 return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
             shown = rows[:10]
             descriptions = quick_read.details(self.tools, ids, shown)
-            question = "Выберите существующую сделку или создайте новую:\n\n" + "\n\n".join(descriptions)
+            allow_new = not plan.get('existing_only')
+            question = ("Выберите существующую сделку или создайте новую:\n\n" if allow_new else "Выберите существующую быструю сделку:\n\n") + "\n\n".join(descriptions)
             if len(rows) > len(shown):
                 question += f"\n\nПоказаны {len(shown)} из {len(rows)}. Для другой укажите «быстрая сделка №ID ...»."
             choice = {"kind": "quick_select", "owner": user_id, "ids": ids, "offers": shown,
-                      "snapshot": sorted(rows), "plan": plan, "question": question}
+                      "snapshot": sorted(rows), "allow_new": allow_new, "plan": plan, "question": question}
             self._quick_choices[user_id] = choice
             return PipelineResult(choices=[choice])
         except Exception as exc:
@@ -2765,7 +2769,7 @@ class BotPipeline:
         return self._quick_continue(pending["plan"], user_id)
 
     def quick_read_choice(self, choice: dict[str, Any], user_id: int, index: int) -> PipelineResult:
-        size = len(choice.get("offers") or []) + (1 if choice.get("kind") in ("quick_select", "quick_brand") else 0)
+        size = len(choice.get("offers") or []) + (1 if choice.get("kind") == "quick_brand" or (choice.get("kind") == "quick_select" and choice.get("allow_new", True)) else 0)
         if (self._quick_choices.get(user_id) is not choice or choice.get("owner") != user_id or not 0 <= index < size
                 or (choice.get('kind') == 'quick_brand' and time.time() - choice['at'] > 1800)):
             return PipelineResult(answer="Этот выбор устарел или принадлежит другому сотруднику. Повторите запрос.")
@@ -2784,30 +2788,24 @@ class BotPipeline:
         try:
             if choice.get('kind') == 'quick_read':
                 status_ids = quick_read.status_identity(self.tools)
-                if status_ids != choice.get('status_ids'):
-                    raise ValueError('Статус изменился; повторите список')
-                rows, _, _ = quick_read.status_offers(self.tools, status_ids)
+                if status_ids[0] != choice.get('status_ids', (None,))[0]:
+                    raise ValueError('Воронка статуса изменилась; повторите список')
                 oid = choice['offers'][index]
-                contact_id = choice['contacts'][oid]
-                if rows.get(oid) != contact_id:
-                    raise ValueError('Контакт или статус сделки больше не подтверждён; повторите список')
-                return PipelineResult(answer=quick_read.status_detail(self.tools, status_ids, oid, contact_id), structured_offer_details=True)
-            ids = quick_read.identity(self.tools)
+                return PipelineResult(answer=quick_read.status_detail(self.tools, status_ids, oid), structured_offer_details=True)
             if choice.get("kind") == "quick_reason":
                 from ..quick_deal import status_reasons
+                ids = quick_read.identity(self.tools)
                 if ids != choice["ids"] or status_reasons(self.tools, ids) != choice["reasons"]:
                     raise ValueError("Статус или причины изменились; повторите запрос")
                 plan = choice["plan"]
                 plan["reason_id"] = choice["offers"][index]
                 plan["new"] = True
                 return self._quick_continue(plan, user_id)
-            rows = quick_read.offers(self.tools, ids)
-            if ids != choice["ids"]:
-                raise ValueError("Контакт или статус изменились; повторите список")
+            ids = (0, *quick_read.status_identity(self.tools))
+            if ids[1] != choice["ids"][1]:
+                raise ValueError("Воронка статуса изменилась; повторите список")
             if choice.get("kind") == "quick_select":
                 from ..quick_deal import prepare
-                if sorted(rows) != choice["snapshot"]:
-                    raise ValueError("Список быстрых сделок изменился; повторите выбор")
                 oid = choice["offers"][index] if index < len(choice["offers"]) else None
                 plan = choice["plan"]
                 if oid is None:
@@ -2817,8 +2815,6 @@ class BotPipeline:
                 self._part_batch[user_id] = {"token": draft["token"], "at": time.time()}
                 return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
             oid = choice["offers"][index]
-            if oid not in rows:
-                raise ValueError("Сделка больше не подтверждена; повторите список")
             return PipelineResult(answer=quick_read.detail(self.tools, ids, oid), structured_offer_details=True)
         except Exception as exc:
             return PipelineResult(answer=f"Не удалось подтвердить сделку: {exc}. Ничего не записано.")

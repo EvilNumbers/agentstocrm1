@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 from .status_colors import with_status_colors
 
@@ -327,7 +330,7 @@ def is_status_offers_request(text: str) -> bool:
 def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, list[int]]:
     """Список только для проверенной пары (воронка, точный статус)."""
     from ..client import read_budget
-    from .status_view import match as match_view_status
+    from .status_view import match_name as match_view_status_name
 
     kind = str(request.get("kind") or "")
     board_name = request.get("board")
@@ -339,7 +342,7 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
         specific, generic = _STATUS_TITLES[kind], set()
     targets = specific | generic
     try:
-        with read_budget(8.0):
+        with read_budget(20.0):
             tools._invalidate_quick_identity_cache()
             boards = tools.boards()
             if board_name:
@@ -368,11 +371,7 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                     status_board = status.get("board_id")
                     if status_board not in (None, "") and str(status_board) != str(board_id):
                         continue  # справочник иногда возвращает статусы других воронок
-                    try:
-                        status_id = int(str(status.get("status_id")))
-                        if status_board in (None, "") or status_id <= 0:
-                            raise ValueError("invalid status")
-                    except (TypeError, ValueError):
+                    if status_board in (None, "", False):
                         unresolved = True
                         continue
                     (precise if title in specific else fallback).append((board, status))
@@ -394,10 +393,10 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             uncertain = False
             by_name = False
             page_size = 100
-            for page in range(1, 6):
+            for page in range(1, 21):
                 try:
                     rows = tools.find_offers(board_id=int(board["board_id"]),
-                        status_id=int(status["status_id"]), limit=page_size, page=page, fresh=True)
+                        limit=page_size, page=page, fresh=True)
                 except Exception:
                     uncertain = True
                     break
@@ -412,10 +411,8 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                     if ident in seen:
                         continue
                     seen.add(ident)
-                    matched = match_view_status(tools, board=row.get('board_id'), status_id=row.get('status_id'),
-                        status_id_missing=row.get('status_id_missing') is True, status_name=row.get('status'),
-                        expected_board=int(board['board_id']), expected_status=int(status['status_id']),
-                        expected_name=status['title'])
+                    matched = match_view_status_name(tools, board=row.get('board_id'), status_name=row.get('status'),
+                        expected_board=int(board['board_id']), expected_name=status['title'])
                     if matched == 'unknown':
                         uncertain = True
                     elif matched in ('id', 'name'):
@@ -424,7 +421,7 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                 if len(valid) > 25:
                     uncertain = True
                     break
-                if len(rows) < page_size:
+                if not rows:
                     complete = True
                     break
             if not complete:
@@ -432,15 +429,18 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             valid = valid[:25]
             qualifier = "\n⚠️ Проверка не завершена или список ограничен; он может быть неполным." if uncertain else ""
             if by_name:
-                qualifier += "\nℹ️ Часть статусов сверена по названию и справочнику: CRM не вернула их ID. Это только просмотр."
+                qualifier += "\nℹ️ Статусы сверены по названию и справочнику, а не по ID. Это только просмотр."
             label = f"«{status['title']}» · воронка «{board['name']}»"
             if not valid:
                 return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
-            result = format_offers_list(with_status_colors(tools, valid))
+            from .status_colors import color_marker
+            marker = color_marker(status.get('front_color'))
+            result = format_offers_list([{**row, 'status_marker': marker} for row in valid])
             result = result.replace(f"📋 Последние сделки ({len(valid)}):", f"📋 Сделки в статусе {label}:", 1)
             return result + qualifier, [int(r["offer_id"]) for r in valid]
-    except Exception:
-        return "Не удалось прочитать воронки или статусы CRM. Список сделок не подтверждён.", []
+    except Exception as exc:
+        log.warning('Чтение статусного списка не удалось: %s', type(exc).__name__)
+        return "Не удалось прочитать воронки или статусы CRM. Список сделок не подтверждён. Проверьте связь командой /crm_test и повторите чтение.", []
 
 
 def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:

@@ -6,6 +6,33 @@ from typing import Any
 from ..booking import key
 
 
+def match_name(tools: Any, *, board: Any, status_name: Any, expected_board: int,
+               expected_name: str) -> str:
+    """Сверка названия статуса; идентификатор статуса из сделки не нужен."""
+    if str(board) != str(expected_board):
+        return 'unknown' if board in (None, '', False) else 'other'
+    if not isinstance(status_name, str) or not status_name.strip():
+        return 'unknown'
+    if key(status_name) != key(expected_name):
+        return 'other'
+    try:
+        candidates = []
+        for status in tools.statuses(expected_board):
+            bid = status.get('board_id')
+            if bid not in (None, '') and str(bid) != str(expected_board):
+                continue
+            title = status.get('title')
+            if not isinstance(title, str) or not title.strip() or bid in (None, '', False):
+                return 'unknown'
+            if key(title) == key(expected_name):
+                candidates.append(status)
+        if len(candidates) != 1:
+            return 'unknown'
+    except Exception:  # noqa: BLE001 — ошибка справочника не подтверждает статус
+        return 'unknown'
+    return 'name'
+
+
 def match(tools: Any, *, board: Any, status_id: Any, status_id_missing: bool,
           status_name: Any, expected_board: int, expected_status: int,
           expected_name: str) -> str:

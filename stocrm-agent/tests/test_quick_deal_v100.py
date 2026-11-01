@@ -135,11 +135,12 @@ def test_stale_choice_and_changed_status_before_apply(env):
     session, tools, pipe = env
     existing(session, 1900); existing(session, 1901)
     choice = send(pipe, 'быстрая сделка диагностика 1000 рублей').choices[0]
-    session.data['offers/get_from_filter'][-1]['STATUS_ID'] = 15
+    session.data['offers/get_from_filter'][-2].update(STATUS_ID=15, STATUS_NAME='В работе')
     assert not pipe.quick_read_choice(choice, 1, 0).drafts
+    session.data['offers/get_from_filter'][-2].update(STATUS_ID=51, STATUS_NAME='Быстрые сделки')
     choice = send(pipe, 'быстрая сделка диагностика 1000 рублей').choices[0]
     draft = pipe.quick_read_choice(choice, 1, 0).drafts[0]
-    session.data['offers/get_from_filter'][-2]['STATUS_ID'] = 15
+    session.data['offers/get_from_filter'][-2].update(STATUS_ID=15, STATUS_NAME='В работе')
     with pytest.raises(ValueError):
         tools.apply_draft(draft['token'])
     assert not writes(session)
@@ -345,7 +346,7 @@ def test_unverified_work_stops_chain_before_article(env, monkeypatch):
     assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add']
 
 
-def test_changes_in_status_during_write_stop_next_steps(env, monkeypatch):
+def test_changes_in_status_during_write_follow_selected_deal(env, monkeypatch):
     session, tools, pipe = env
     existing(session, 1900)
     choice = send(pipe, 'быстрая сделка диагностика 1000 рублей и добавь артикул NGK CR9E цена 300').choices[0]
@@ -354,12 +355,12 @@ def test_changes_in_status_during_write_stop_next_steps(env, monkeypatch):
     def moved(method, payload=None, **kwargs):
         response = original(method, payload, **kwargs)
         if method == 'work/add':
-            session.data['offers/get_from_filter'][-1]['STATUS_ID'] = 15
+            session.data['offers/get_from_filter'][-1].update(STATUS_ID=15, STATUS_NAME='В работе')
         return response
     monkeypatch.setattr(tools.client, 'call', moved)
     result = tools.apply_draft(draft['token'])
-    assert result['status'] == 'partial'
-    assert [c['method'] for c in writes(session)] == ['work/add']
+    assert result['status'] == 'applied'
+    assert [c['method'] for c in writes(session)] == ['work/add', 'offer/require/add', 'offer/order/add_free_order']
 
 
 def test_reason_choice_after_existing_or_new_selection(env):

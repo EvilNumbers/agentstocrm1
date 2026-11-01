@@ -120,13 +120,7 @@ class BookingMixin:
                     continue
                 status = str(row.get("STATUS_NAME") or "").strip()
                 if not status:
-                    board = _positive(row.get("BOARD_ID"), "Воронка сделки")
-                    status_id = _positive(row.get("STATUS_ID"), "Статус сделки")
-                    found = [s for s in self.statuses(board) if str(s.get("status_id")) == str(status_id)
-                             and str(s.get("board_id")) == str(board) and s.get("title")]
-                    if len(found) != 1:
-                        raise ValueError("CRM не подтвердила статус сделки; выбор остановлен")
-                    status = str(found[0]["title"])
+                    raise ValueError("CRM не вернула название статуса сделки; выбор остановлен")
                 if key(status) not in {"успешно реализовано", "отказ", "мусор", "возврат"}:
                     selected.append({"offer_id": ident, "status": status,
                                      "board": str(row.get("BOARD_NAME") or ""),
@@ -247,15 +241,15 @@ class BookingMixin:
         if row is None:
             return {"error": "Сделка не найдена"}
         offer = self._slim_offer(row)
-        value = offer.get("status_id")
-        if not re.fullmatch(r"[1-9]\d*", str(value)):
-            offer["status_id"] = None
-            if offer.get("status") and offer.get("board_id"):
-                found = [s for s in self.statuses(int(offer["board_id"]))
-                         if key(s.get("title")) == key(offer["status"])
-                         and str(s.get("board_id")) == str(offer["board_id"])]
-                if len(found) == 1 and re.fullmatch(r"[1-9]\d*", str(found[0].get("status_id"))):
-                    offer["status_id"] = int(found[0]["status_id"])
+        # Используем только название в строке; ID берётся из справочника, а не
+        # из STATUS_ID сделки. Он по-прежнему необходим API при смене статуса.
+        offer["status_id"] = None
+        if offer.get("status") and offer.get("board_id"):
+            found = [s for s in self.statuses(int(offer["board_id"]))
+                     if key(s.get("title")) == key(offer["status"])
+                     and str(s.get("board_id")) == str(offer["board_id"])]
+            if len(found) == 1 and re.fullmatch(r"[1-9]\d*", str(found[0].get("status_id"))):
+                offer["status_id"] = int(found[0]["status_id"])
         return offer
 
     def _booking_slot(self: Any, args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -469,7 +463,7 @@ class BookingMixin:
             raise ValueError("В текущей воронке нет единственного активного статуса «Запись». Другую воронку сам не выбираю")
         status: dict[str, Any] = statuses[0] if change_status else {"status_id": offer.get("status_id"), "reasons": []}
         reasons = status.get("reasons") or []
-        already = str(offer.get("status_id")) == str(status["status_id"])
+        already = not change_status or key(offer.get('status')) == key(status.get('title'))
         if not already and reasons and reason_id is None:
             options = [{"value": r["reason_id"], "label": r.get("title") or str(r["reason_id"])} for r in reasons]
             raise BookingNeeds("Выберите причину перехода в «Запись»: " + "; ".join(f"{i}. {o['label']}" for i, o in enumerate(options, 1)), "reason_id", args, options)
@@ -579,8 +573,8 @@ class BookingMixin:
         if (offer.get("error") or str(offer.get("offer_id")) != str(check["expected"]["OFFER_ID"])
                 or str(offer.get("board_id")) != str(check["board_id"])
                 or str(offer.get("contact_id")) != check["original"]["contact_id"]
-                or str(offer.get("status_id")) != str(check["status_id"])
-                or (check["status_id"] is None and str(offer.get("status")) != check["original"]["status"])):
+                or not key(offer.get('status'))
+                or key(offer.get('status')) != ('запись' if check.get('change_status') else key(check['original']['status']))):
             raise ValueError("Выбранный статус, воронка или контакт сделки не подтверждены контрольным чтением")
 
     def _booking_offer_ids(self: Any, contact_id: int | None) -> set[int]:
@@ -666,7 +660,7 @@ class BookingMixin:
             done.append("запрос перехода в «Запись»")
             self._invalidate_cache()
             offer = self._booking_offer(ident)
-            if (str(offer.get("status_id")) != str(check["status_id"]) or
+            if (key(offer.get("status")) != 'запись' or
                     str(offer.get("board_id")) != str(check["board_id"]) or
                     str(offer.get("contact_id")) != str(contact_id)):
                 raise ValueError("Статус «Запись» или привязка контакта не подтверждены — календарь ещё не создавался")

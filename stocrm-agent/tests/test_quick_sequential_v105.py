@@ -23,13 +23,13 @@ def test_missing_status_after_change_stops_before_any_items_and_archived_remains
         row, count = original(oid)
         if any(call['method'] == 'offer/status/change' for call in writes(session)):
             row = dict(row)
-            row.pop('STATUS_ID', None)
+            row.pop('STATUS_NAME', None)
         return row, count
     monkeypatch.setattr(tools, '_search_offer_row', missing)
     monkeypatch.setattr(tools, '_search_offer_row_without_required_fields', lambda _: None)
     monkeypatch.setattr(quick_deal.time, 'sleep', lambda _: None)
     result = tools.apply_draft(draft['token'])
-    assert result['status'] == 'partial' and 'STATUS_ID' in result['warning']
+    assert result['status'] == 'partial' and 'название статуса' in result['warning']
     assert [c['method'] for c in writes(session)] == ['offer/new/with_contact', 'offer/status/change']
     tools.drafts.archive(draft['token'])
     assert tools.drafts.get(draft['token'])['archived_partial']

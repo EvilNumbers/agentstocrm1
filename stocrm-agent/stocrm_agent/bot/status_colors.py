@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from ..client import read_budget
+from ..booking import key
 
 log = logging.getLogger(__name__)
 _HEX = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\Z")
@@ -42,41 +43,36 @@ def color_marker(color: Any) -> str:
 
 
 def with_status_colors(tools: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Копии строк с цветом по паре ID воронки и статуса. Ошибка чтения не мешает списку."""
+    """Цвет только по точному названию и воронке, без ID статуса сделки."""
     result = [dict(row) for row in rows]
-    boards: dict[int, dict[str, str]] = {}
+    boards: dict[int, dict[str, list[str]]] = {}
     with read_budget(4.0):
         for row in result:
-            # Не доверяем произвольным полям из строки сделки или прошлому ответу модели.
             row.pop("status_marker", None)
             try:
                 board_id = int(str(row.get("board_id")))
-                status_id = int(str(row.get("status_id")))
-                if board_id <= 0 or status_id <= 0:
+                if board_id <= 0:
                     continue
             except (ValueError, TypeError):
+                continue
+            name = row.get('status')
+            if not isinstance(name, str) or not name.strip():
                 continue
             if board_id not in boards:
                 boards[board_id] = {}
                 try:
-                    statuses = tools.statuses(board_id)
-                    for status in statuses:
-                        # При наличии BOARD_ID исключаем статус другой воронки.
-                        status_board = status.get("board_id")
-                        if status_board not in (None, "") and str(status_board) != str(board_id):
+                    for status in tools.statuses(board_id):
+                        status_board = status.get('board_id')
+                        if str(status_board) != str(board_id):
                             continue
-                        marker = color_marker(status.get("front_color"))
-                        if marker and status.get("status_id") is not None:
-                            key = str(status["status_id"])
-                            if key in boards[board_id] and boards[board_id][key] != marker:
-                                boards[board_id][key] = ""  # неоднозначный ответ
-                            else:
-                                boards[board_id][key] = marker
+                        title = status.get('title')
+                        if isinstance(title, str) and title.strip():
+                            boards[board_id].setdefault(key(title), []).append(color_marker(status.get('front_color')))
                 except Exception as exc:  # noqa: BLE001 — цвет необязателен
-                    log.info("Цвета статусов воронки %s недоступны: %s", board_id, exc)
-            marker = boards[board_id].get(str(status_id), "")
-            if marker:
-                row["status_marker"] = marker
+                    log.info('Цвета статусов воронки %s недоступны: %s', board_id, type(exc).__name__)
+            markers = boards[board_id].get(key(name), [])
+            if len(markers) == 1 and markers[0]:
+                row['status_marker'] = markers[0]
     return result
 
 

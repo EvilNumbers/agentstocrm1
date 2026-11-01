@@ -507,6 +507,11 @@ class MockSession:
             for offer in self.data["offers/get_from_filter"]:
                 if str(offer["OFFER_ID"]) == str(body.get("OFFER_ID")):
                     offer.update(STATUS_ID=body["STATUS_ID"], BOARD_ID=body["BOARD_ID"])
+                    statuses = self.data.get('offer/all_statuses') or {}
+                    entries = statuses.values() if isinstance(statuses, dict) else statuses
+                    status = next((s for s in entries if isinstance(s, dict) and str(s.get('STATUS_ID')) == str(body['STATUS_ID']) and str(s.get('BOARD_ID')) == str(body['BOARD_ID'])), None)
+                    if status:
+                        offer['STATUS_NAME'] = status.get('TITLE')
             return MockResponse({"CODE": 200, "RESPONSE": {"OFFER_ID": body.get("OFFER_ID"), "STATUS_ID": body.get("STATUS_ID")}}, 200)
         if method in ("calendar/post/get", "calendar/card/get", "calendar/post/get_filtered",
                       "calendar/card/new", "calendar/card/edit"):

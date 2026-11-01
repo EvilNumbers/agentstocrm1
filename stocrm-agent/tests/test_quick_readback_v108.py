@@ -34,7 +34,7 @@ def test_legacy_read_resolves_id_and_items_write_in_order_after_confirmation(env
     assert result['status'] == 'applied' and result['verified']
     assert [x['method'] for x in writes(session)] == ['offer/new/with_contact', 'offer/status/change', 'work/add', 'offer/require/add', 'offer/order/add_free_order']
     reads = [c for c in session.calls if c['method'] == 'offers/get_from_filter']
-    assert any('REQUIRED_FIELDS' not in c['payload'] for c in reads)
+    assert all('REQUIRED_FIELDS' in c['payload'] for c in reads)
 
 
 @pytest.mark.parametrize('legacy', [None, {}, {'OFFER_ID': 10, 'CONTACT_ID': 5555, 'BOARD_ID': 2, 'STATUS_ID': 51},
