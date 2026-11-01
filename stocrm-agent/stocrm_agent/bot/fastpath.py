@@ -217,50 +217,213 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _estimate_offers(tools: Any, *, parts_only: bool = False) -> tuple[str, list[int]]:
-    """Не доверяем серверному фильтру: отбираем только подтверждённые строки."""
+# Только самостоятельная просьба о списке: не перехватываем изменения или другие
+# фильтры (клиент, дата, исполнитель), которые потребовали бы отдельного разбора.
+_WORKING_OFFERS = re.compile(
+    r"(?:(?:покажи|покажите|найди|найдите|дай|дайте|какие|выведи|выведите)\s+)?"
+    r"(?:(?:мне|нам|все|всё|список|последние|сейчас|у нас)\s+)*"
+    r"(?:сделки|сделок|сделку|заказы|заказов|заказ-наряды|заказ наряды|наряды|что)(?:\s+(?:сейчас|у нас|которые))?\s+в\s+работе"
+    r"(?:\s+(?:на|в)\s+сервисе)?(?:\s+сейчас)?"
+    r"(?:\s+в\s+воронк[еи]\s+(?P<board>[^!?]{1,100}?))?\s*[.!?]*",
+    re.IGNORECASE,
+)
+
+
+def _working_request(text: str) -> re.Match[str] | None:
+    return _WORKING_OFFERS.fullmatch((text or "").strip())
+
+
+def is_working_offers_request(text: str) -> bool:
+    return _working_request(text) is not None
+
+
+# Статусы не определяются по подстроке: «Заказ» не включает «Заказ собран».
+_STATUS_TITLES: dict[str, set[str]] = {
+    "record": {"запись", "в записи"},
+    "order": {"заказ", "в заказе"},
+    "estimate": {"просчет", "в просчете", "просчет запчастей", "проценка", "проценка запчастей"},
+    "estimate_parts": {"просчет запчастей", "проценка запчастей"},
+    "assembled": {"заказ собран", "заказы собраны", "собранный заказ", "собранные заказы", "собрано", "собран"},
+}
+_PREFIX = r"(?:(?:покажи|покажите|найди|найдите|дай|дайте|какие|выведи|выведите|список)\s+)?(?:(?:мне|нам|все|всё|последние|сейчас|у нас|список)\s+)*"
+_SUBJECT = r"(?:сделки|сделок|сделку|заказы|заказов|заказ-наряды|заказ наряды|наряды|что)"
+_BOARD_SUFFIX = r"(?:\s+в\s+воронк[еи]\s+(?P<board>[^!?]{1,100}?))?\s*[.!?]*"
+_CATEGORY_REQUEST = re.compile(
+    _PREFIX + _SUBJECT + r"(?:\s+(?:сейчас|у нас|которые))?\s+(?:в|на)\s+"
+    r"(?P<stage>записи|заказе|просч[её]те(?:\s+запчаст(?:ей|и|ями))?|проценке(?:\s+запчаст(?:ей|и|ями))?)"
+    r"(?:\s+сейчас)?" + _BOARD_SUFFIX, re.I)
+_ASSEMBLED_REQUEST = re.compile(
+    _PREFIX + r"(?:(?:собранные|собранных)\s+(?:заказы|заказов|сделки|сделок|заказ-наряды)|"
+    r"(?:заказы|сделки|заказ-наряды)\s+(?:собраны|собранные))"
+    r"(?:\s+сейчас)?" + _BOARD_SUFFIX, re.I)
+_EXPLICIT_REQUEST = re.compile(
+    _PREFIX + _SUBJECT + r"\s+(?:в\s+статусе|со\s+статусом|по\s+статусу)\s+"
+    r"(?P<title>[^!?]{1,100}?)" + _BOARD_SUFFIX, re.I)
+_STATUS_MARKERS = re.compile(
+    r"\b(?:в|на)\s+(?:работе|записи|заказе|просч[её]те|проценке)\b|"
+    r"\bсобранн\w*\b|\bсобраны\b|\b(?:статусе|статусом|статусу)\b", re.I)
+_LIST_SUBJECT = re.compile(r"\b(?:сделки|сделок|заказы|заказов|наряды|заказ-наряды)\b", re.I)
+_WRITE_ACTION = re.compile(r"\b(?:добав\w*|созда\w*|измен\w*|помен\w*|удал\w*|перевед\w*|"
+                           r"перевод\w*|смени\w*|назнач\w*|запиш\w*|записать|собери\w*|собрать|отмен\w*)\b", re.I)
+_READ_START = re.compile(r"^\s*(?:покажи|покажите|найди|найдите|дай|дайте|какие|что|сколько|список|выведи|выведите|сделки|сделок|заказы|собранные)\b", re.I)
+# Неизвестные состояния тоже не превращаем в список активных. Исключаем
+# формулировки с воронкой и названиями месяцев/относительными датами.
+_UNKNOWN_STAGE = re.compile(
+    r"\b(?:сделки|сделок|заказы|заказов|наряды)(?:\s+(?:сейчас|которые))?\s+(?:в|на)\s+"
+    r"(?!(?:воронк\w*|январ\w*|феврал\w*|март\w*|апрел\w*|ма[ейя]\w*|июн\w*|июл\w*|"
+    r"август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*|сегодня|завтра|вчера|этой|этот|прошл\w*)\b)"
+    r"[а-яё][а-яё-]*", re.I)
+
+
+def _norm_status(value: Any) -> str:
+    return " ".join(str(value or "").lower().replace("ё", "е").split()).strip(' «»"')
+
+
+def _status_request(text: str) -> dict[str, str | None] | None:
+    message = (text or "").strip()
+    if not message or message.startswith("/"):
+        return None
+    working = _working_request(message)
+    if working:
+        return {"kind": "working", "board": working.group("board")}
+    explicit = _EXPLICIT_REQUEST.fullmatch(message)
+    if explicit:
+        return {"kind": "explicit", "board": explicit.group("board"),
+                "title": explicit.group("title").strip().rstrip(".").strip(' «»"')}
+    assembled = _ASSEMBLED_REQUEST.fullmatch(message)
+    if assembled:
+        return {"kind": "assembled", "board": assembled.group("board")}
+    category = _CATEGORY_REQUEST.fullmatch(message)
+    if category:
+        stage = _norm_status(category.group("stage"))
+        if stage == "записи":
+            kind = "record"
+        elif stage == "заказе":
+            kind = "order"
+        else:
+            kind = "estimate_parts" if "запчаст" in stage else "estimate"
+        return {"kind": kind, "board": category.group("board")}
+    # Если к статусу прибавили ещё условия, не передаём неоднозначную выборку
+    # модели как обычный список активных сделок: просим сформулировать отдельно.
+    if (_READ_START.search(message) and _LIST_SUBJECT.search(message)
+            and (_STATUS_MARKERS.search(message) or _UNKNOWN_STAGE.search(message)) and not _WRITE_ACTION.search(message)):
+        return {"kind": "clarify"}
+    return None
+
+
+def is_status_offers_request(text: str) -> bool:
+    return _status_request(text) is not None
+
+
+def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, list[int]]:
+    """Список только для проверенной пары (воронка, точный статус)."""
     from ..client import read_budget
+
+    kind = str(request.get("kind") or "")
+    board_name = request.get("board")
+    if kind == "working":
+        specific, generic = {"в работе на сервисе", "в работе в сервисе"}, {"в работе"}
+    elif kind == "explicit":
+        specific, generic = {_norm_status(request.get("title"))}, set()
+    else:
+        specific, generic = _STATUS_TITLES[kind], set()
+    targets = specific | generic
     try:
         with read_budget(8.0):
-            matches = []
-            for board in tools.boards():
-                for status in tools.statuses(int(board["board_id"])):
-                    title = str(status.get("title") or "").lower().replace("ё", "е")
-                    if (str(status.get("board_id")) == str(board.get("board_id"))
-                            and title.startswith("просчет") and (not parts_only or "запчаст" in title)):
-                        matches.append((board, status))
+            boards = tools.boards()
+            if board_name:
+                name = _norm_status(board_name).rstrip(".")
+                boards = [b for b in boards if _norm_status(b.get("name")) == name
+                          or (name.lstrip("№#").strip().isdigit() and str(b.get("board_id")) == name.lstrip("№#").strip())]
+                if len(boards) != 1:
+                    return "Не удалось однозначно найти указанную воронку в CRM. Уточните её название или номер.", []
+            precise: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            fallback: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            unresolved = False
+            for board in boards:
+                try:
+                    board_id = int(str(board.get("board_id")))
+                    if board_id <= 0 or not str(board.get("name") or "").strip():
+                        raise ValueError("invalid board")
+                except (TypeError, ValueError):
+                    unresolved = True
+                    continue
+                for status in tools.statuses(board_id):
+                    title = _norm_status(status.get("title"))
+                    if title not in targets:
+                        if not title:
+                            unresolved = True
+                        continue
+                    status_board = status.get("board_id")
+                    if status_board not in (None, "") and str(status_board) != str(board_id):
+                        continue  # справочник иногда возвращает статусы других воронок
+                    try:
+                        status_id = int(str(status.get("status_id")))
+                        if status_board in (None, "") or status_id <= 0:
+                            raise ValueError("invalid status")
+                    except (TypeError, ValueError):
+                        unresolved = True
+                        continue
+                    (precise if title in specific else fallback).append((board, status))
+            if unresolved:
+                return "Не удалось надёжно проверить справочник воронок или статусов. Список сделок не подтверждён.", []
+            matches = precise or fallback
             if not matches:
-                return "Подходящий статус просчёта в справочнике не найден. Уточните название статуса.", []
+                if kind == "working":
+                    return "В CRM не найден точный статус «В работе на сервисе» или «В работе». Проверьте название статуса в воронке.", []
+                return "В CRM не найден подходящий точный статус. Уточните название из CRM: «покажи сделки в статусе НАЗВАНИЕ».", []
             if len(matches) > 1:
-                return "Уточните воронку и статус:\n" + "\n".join(f"• {b['name']} · {s['title']}" for b, s in matches), []
+                labels = "\n".join(f"• {b['name']} (№{b['board_id']}) · {s['title']}" for b, s in matches)
+                return ("Нашлось несколько подходящих статусов. Уточните статус и воронку:\n" + labels +
+                        "\nНапример: «покажи сделки в статусе НАЗВАНИЕ в воронке НАЗВАНИЕ».", [])
             board, status = matches[0]
             valid: list[dict[str, Any]] = []
             seen: set[str] = set()
             complete = False
+            uncertain = False
             page_size = 100
             for page in range(1, 6):
-                rows = tools.find_offers(board_id=int(board["board_id"]), status_id=int(status["status_id"]), limit=page_size, page=page)
-                if rows and all(str(r.get("offer_id")) in seen for r in rows):
-                    break  # CRM повторяет страницу, полноту подтвердить нельзя
-                for r in rows:
-                    ident = str(r.get("offer_id") or "")
-                    if not ident or ident in seen:
+                try:
+                    rows = tools.find_offers(board_id=int(board["board_id"]),
+                        status_id=int(status["status_id"]), limit=page_size, page=page, fresh=True)
+                except Exception:
+                    uncertain = True
+                    break
+                if rows and all(str(r.get("offer_id") or "") in seen for r in rows):
+                    uncertain = True
+                    break
+                for row in rows:
+                    ident = str(row.get("offer_id") or "")
+                    if not ident.isdigit() or int(ident) <= 0:
+                        uncertain = True
+                        continue
+                    if ident in seen:
                         continue
                     seen.add(ident)
-                    if str(r.get("status_id")) == str(status["status_id"]) and str(r.get("board_id")) == str(board["board_id"]):
-                        valid.append(r)
+                    if row.get("board_id") in (None, "") or row.get("status_id") in (None, ""):
+                        uncertain = True
+                        continue
+                    if str(row["status_id"]) == str(status["status_id"]) and str(row["board_id"]) == str(board["board_id"]):
+                        # Наименование статуса берём из проверенного справочника ID, а не из чужой строки.
+                        valid.append({**row, "status": status["title"]})
+                if len(valid) > 25:
+                    uncertain = True
+                    break
                 if len(rows) < page_size:
                     complete = True
                     break
-                if len(valid) >= 25:
-                    break
+            if not complete:
+                uncertain = True
             valid = valid[:25]
-            qualifier = "" if complete else " Проверка ограничена просмотренными страницами, список может быть неполным."
+            qualifier = "\n⚠️ Проверка не завершена или список ограничен; он может быть неполным." if uncertain else ""
+            label = f"«{status['title']}» · воронка «{board['name']}»"
             if not valid:
-                return f"В просмотренных сделках статус «{status['title']}» ({board['name']}) не найден." + qualifier, []
-            return format_offers_list(with_status_colors(tools, valid)) + f"\nСтатус: {status['title']} ({board['name']})." + qualifier, [int(r["offer_id"]) for r in valid]
-    except Exception as exc:
-        return f"Не удалось закончить чтение сделок в просчёте: {exc}", []
+                return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
+            result = format_offers_list(with_status_colors(tools, valid))
+            result = result.replace(f"📋 Последние сделки ({len(valid)}):", f"📋 Сделки в статусе {label}:", 1)
+            return result + qualifier, [int(r["offer_id"]) for r in valid]
+    except Exception:
+        return "Не удалось прочитать воронки или статусы CRM. Список сделок не подтверждён.", []
 
 
 def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
@@ -272,8 +435,13 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
     message = (text or "").strip()
     if not message or message.startswith("/"):
         return None
-    if re.fullmatch(r"(?:покажи|покажите|найди|список)\s+сделк(?:и|ок)\s+(?:в|на)\s+просч[её]т[еа]?(?:\s+запчаст(?:ей|и|ями))?[.!?]?", message, re.I):
-        return _estimate_offers(tools, parts_only=bool(re.search(r"запчаст", message, re.I)))
+    status_request = _status_request(message)
+    if status_request:
+        if status_request["kind"] == "clarify":
+            return ("Не удалось надёжно разделить условия. Уточните один статус и воронку отдельной фразой; "
+                    "Клиента или дату в таком запросе пока нельзя надёжно совместить: отправьте запросы отдельно. "
+                    "Общий список активных сделок не подменяю.", [])
+        return _status_offers(tools, status_request)
     if _is_action(message):
         return None
 

@@ -19,7 +19,7 @@ from ..client import StocrmError, read_budget
 from ..human import humanize_error, payload_text, polish
 from ..policy import ConfirmationPolicy
 from ..tools import Toolset
-from .fastpath import format_offer_card, format_offers_list, try_answer
+from .fastpath import format_offer_card, format_offers_list, is_status_offers_request, try_answer
 from .status_colors import append_llm_colors, with_status_colors
 from .llm import LLMClient, LLMError
 from .llm_tools import (
@@ -738,6 +738,11 @@ SYSTEM_PROMPT = """Правка цены существующей услуги �
    создают черновик, который человек подтвердит кнопкой: тогда не говори, что данные уже изменены.
    Если инструмент вернул mode="auto" (подтверждение отключено в настройках бота), данные
    действительно внесены — сообщи об этом прямо.
+Запросы о списках по статусу («в записи», «в заказе», «в просчёте», «в работе»,
+«собранные заказы») нельзя подменять всеми активными сделками. Каждый статус отдельный:
+«Заказ» не означает «Заказ собран»; запись и просчёт не означают работу на сервисе.
+При работе предпочтителен точный статус «В работе на сервисе», иначе «В работе».
+Получай названия и ID воронки/статуса из CRM, не угадывай; при неоднозначности уточняй.
 3. Если в просьбе не хватает данных (какой заказ-наряд, какой статус, какая сумма) — сначала
    найди кандидатов и задай один короткий уточняющий вопрос с вариантами.
 4. Если голосовая расшифровка звучит искажённо (ошибки распознавания, странные слова) — не
@@ -2762,10 +2767,12 @@ class BotPipeline:
 
         # Быстрый путь: простые вопросы («покажи сделку 1309», «последние сделки»)
         # отвечаем сразу из панели, не дожидаясь модели (это 1–3 секунды на шаг).
-        if self.fastpath:
+        if self.fastpath or is_status_offers_request(text):
             quick = await asyncio.to_thread(try_answer, text, self.tools)
             if quick:
                 answer, _ids = quick
+                if is_status_offers_request(text):
+                    self._lists.pop(user_id or 0, None)  # не оставить предыдущий список при ошибке или пустом ответе
                 self._contact_lookups.pop(user_id or 0, None)
                 log.info("быстрый ответ без модели: %s", text[:60])
                 self._remember_list(user_id, answer)

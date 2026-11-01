@@ -792,6 +792,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         date_to: Any = None,
         limit: int = 25,
         page: int = 1,
+        fresh: bool = False,
     ) -> list[dict[str, Any]]:
         filters: dict[str, Any] = {}
         if board_id:
@@ -808,13 +809,15 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             filters["DATE_CREATE"] = date_range(date_from, date_to)
 
         key = "offers:" + json.dumps([filters, limit, page], sort_keys=True, default=str)
-        rows = self._cached(key, lambda: self._page(
-            "find_offers", "offers/get_from_filter",
-            filters=filters or None, sort={"DATE_CREATE": "DESC"}, limit=limit, page=page,
-        ), ttl=20.0)
+        def read_rows() -> list[Any]:
+            return self._page("find_offers", "offers/get_from_filter",
+                filters=filters or None, sort={"DATE_CREATE": "DESC"}, limit=limit, page=page)
+        rows = read_rows() if fresh else self._cached(key, read_rows, ttl=20.0)
         # Строка без OFFER_ID означает, что ответ панели не разобрался (неизвестная
         # обёртка). Такую «сделку» показывать нельзя — иначе бот расскажет про пустышку.
         valid = [r for r in rows if isinstance(r, dict) and r.get("OFFER_ID") not in (None, "", False)]
+        if fresh and len(valid) != len(rows):
+            raise ValueError("Ответ CRM содержит непроверяемые строки сделок")
         if rows and not valid:
             log.warning("find_offers: панель вернула %s строк без OFFER_ID — ответ не разобран", len(rows))
         return [self._slim_offer(r) for r in valid]
