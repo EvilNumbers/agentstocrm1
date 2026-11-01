@@ -755,15 +755,23 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         if diag['status'] != 'ok':
             await message.answer(f'Сделка №{oid}: не удалось подтвердить поля в ответе CRM. Это не доказывает отсутствия сделки. Запись не выполнялась.')
             return
-        await message.answer('\n'.join([
+        lines = [
             f'Диагностика сделки №{oid} (только чтение):',
             'Номер сделки совпал: ' + ('да' if diag['offer_id_matches'] else 'нет'),
             'ID контакта получен: ' + ('да' if diag['contact_id_present'] else 'нет'),
             f"ID воронки: {diag['board_id'] if diag['board_id'] is not None else 'не получен'}",
-            f"ID статуса: {diag['status_id'] if diag['status_id'] is not None else 'не получен'}",
-            'Название статуса получено: ' + ('да' if diag['status_name_present'] else 'нет'),
-            'Личные данные и ключи не выводятся; эта проверка не снимает блокировку.'
-        ]))
+            f"ID статуса: {diag['status_id'] if diag['status_id'] is not None else 'не распознан'}",
+            f"Формат поля ID статуса: {diag['status_id_shape']}",
+            'Название статуса получено: ' + ('да' if diag['status_name_present'] else 'нет')]
+        ref = diag['quick_reference']
+        if ref['status'] == 'ok':
+            match = 'неизвестно' if ref['name_matches'] is None else ('да' if ref['name_matches'] else 'нет')
+            lines.extend([f"Статус «Быстрые сделки» в справочнике: воронка №{ref['board_id']}, ID {ref['status_id']}",
+                          'Название статуса сделки совпадает со справочником: ' + match])
+        else:
+            lines.append('Статус «Быстрые сделки» в справочнике однозначно не подтверждён.')
+        lines.append('Это диагностика, не подтверждение результата записи. Личные данные и ключи не выводятся; блокировка сохранена.')
+        await message.answer('\n'.join(lines))
 
     @router.message(F.text.regexp(r'^/balance_test(?:@\w+)?(?:\s+\d+)?\s*$'))
     async def cmd_balance_test(message: Message) -> None:

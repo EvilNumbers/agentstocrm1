@@ -42,7 +42,9 @@ def test_offer_diagnostic_does_not_expose_contact_or_raw_status(env, monkeypatch
         'BOARD_ID': 2, 'STATUS_ID': None, 'STATUS_NAME': 'Быстрые сделки', 'SECRET': 'private'}, 1))
     result = tools.offer_identity_diagnostic(1900)
     assert result == {'status': 'ok', 'offer_id_matches': True, 'contact_id_present': True,
-                      'board_id': 2, 'status_id': None, 'status_name_present': True}
+                      'board_id': 2, 'status_id': None, 'status_id_shape': 'null',
+                      'status_name_present': True,
+                      'quick_reference': {'status': 'ok', 'board_id': 2, 'status_id': 51, 'name_matches': True}}
     assert '5555' not in str(result) and 'private' not in str(result)
 
 
