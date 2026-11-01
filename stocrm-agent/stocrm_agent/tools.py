@@ -853,6 +853,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "board_id": r.get("BOARD_ID"),
             "status": r.get("STATUS_NAME"),
             "status_id": r.get("STATUS_ID"),
+            "status_id_missing": "STATUS_ID" not in r,
             "contact_id": r.get("CONTACT_ID"),
             "contact": r.get("CONTACT_TITLE"),
             "car": r.get("CAR_TITLE_TABLE"),
