@@ -54,13 +54,35 @@ def _all_offer_ids(tools: Any, contact_id: int) -> set[int]:
     raise ValueError('Список прежних сделок неполный')
 
 
-def _assert_offer(tools: Any, ids: tuple[int, int, int], oid: int) -> None:
-    tools._invalidate_cache()
-    if quick_read.identity(tools) != ids:
-        raise ValueError('Системный контакт или статус изменились')
-    row, _ = tools._search_offer_row(oid)
-    if not row or tuple(str(row.get(k)) for k in ('CONTACT_ID', 'BOARD_ID', 'STATUS_ID')) != tuple(map(str, ids)):
-        raise ValueError(f'Сделка №{oid} больше не принадлежит системному контакту и статусу')
+def _assert_offer(tools: Any, ids: tuple[int, int, int], oid: int, *, after_status_change: bool = False) -> None:
+    # Некоторые системы возвращают прежнее состояние сразу после записи. Только
+    # здесь допускаем несколько свежих ЧТЕНИЙ; никаких повторов записи. В любой
+    # другой момент несоответствие сразу останавливает операцию.
+    delays = (0.0, 0.5, 1.0, 2.0) if after_status_change else (0.0,)
+    fields = ('CONTACT_ID', 'BOARD_ID', 'STATUS_ID')
+    problem = ''
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        tools._invalidate_cache()
+        if quick_read.identity(tools) != ids:
+            raise ValueError('Системный контакт или статус изменились')
+        row, _ = tools._search_offer_row(oid)
+        if row and tuple(str(row.get(k)) for k in fields) == tuple(map(str, ids)):
+            return
+        if not row:
+            problem = 'сделка не найдена в ответе CRM'
+        else:
+            # Не копируем произвольное содержимое CRM в предупреждение или лог.
+            differences = []
+            for field, expected in zip(fields, ids):
+                value = row.get(field)
+                if str(value) != str(expected):
+                    actual = str(value).strip()
+                    actual = actual if actual.isascii() and actual.isdigit() and len(actual) <= 20 else 'не получен'
+                    differences.append(f'{field}: ожидался {expected}, получен {actual}')
+            problem = '; '.join(differences)
+    raise ValueError(f'Сделка №{oid}: контакт, воронка или статус не подтверждены при чтении CRM ({problem})')
 
 
 def positions(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -207,7 +229,7 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError('Причина статуса изменилась')
             mark('смена статуса отправляется')
             tools.client.call('offer/status/change', status)
-            _assert_offer(tools, ids, oid)
+            _assert_offer(tools, ids, oid, after_status_change=True)
             result['completed'].append('статус «Быстрые сделки»')
             mark('статус подтверждён')
         oid = int(oid)
