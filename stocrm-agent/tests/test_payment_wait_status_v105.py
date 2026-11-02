@@ -26,7 +26,8 @@ def test_waiting_payment_is_exact_status_not_generic_unpaid(env, message):
     assert 'ОЖИДАЕТ ОПЛАТЫ' in result.answer and not result.drafts and not result.applied
     call = next(c for c in session.calls if c['method'] == 'offers/get_from_filter')
     assert call['payload']['FILTER'] == {'BOARD_ID': 2}
-    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
+    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter', 'payment/get_balance'} for c in session.calls)
+    assert 'долг:' in result.answer.lower()
 
 
 def test_multiple_wait_status_names_request_clarification(env):

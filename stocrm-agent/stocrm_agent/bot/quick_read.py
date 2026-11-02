@@ -175,8 +175,7 @@ def status_detail(tools: Any, status_ids: tuple[int, int], oid: int, contact_id:
     contact = str(card.get('contact') or 'имя не получено')
     current_contact = card.get('contact_id')
     contact_note = f' · контакт №{current_contact}' if str(current_contact or '').isdigit() else ''
-    note = '\nℹ️ Статус сверен по названию, а не по ID. Только просмотр.'
-    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + format_offer_items(card) + note
+    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + format_offer_items(card)
 
 
 def status_details(tools: Any, status_ids: tuple[int, int], offers: dict[int, int | None]) -> list[str]:
