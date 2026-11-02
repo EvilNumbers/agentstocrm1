@@ -334,7 +334,13 @@ def _part_line(number: int, item: dict[str, Any]) -> str:
     return f"{number}. {title}" + (f" · {item['stock_note']}" if item.get("stock_note") else "")
 
 
-def part_keyboard(token: str, candidates: list[dict[str, Any]], *, page: int = 0, text_only: bool = False) -> InlineKeyboardMarkup:
+def part_keyboard(token: str, candidates: list[dict[str, Any]], *, page: int = 0, text_only: bool = False, default_price: bool = False) -> InlineKeyboardMarkup:
+    if default_price:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, цена 0 ₽", callback_data=f"prt:{token}:priceyes"),
+             InlineKeyboardButton(text="✍️ Указать цену", callback_data=f"prt:{token}:priceno")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"prt:{token}:pricecancel")],
+        ])
     pages = max(1, (len(candidates) + 5) // 6)
     page = max(0, min(page, pages - 1))
     rows = [[InlineKeyboardButton(text=_part_button(c, page * 6 + n + 1),
@@ -387,7 +393,7 @@ def render_part_choice(choice: dict[str, Any]) -> str:
         known = choice.get("args") or {}
         lines.append("Выберите подходящую позицию кнопкой." if known.get("sku") else
                      "Выберите вариант кнопкой или уточните бренд и артикул.")
-    elif not (choice.get("args") or {}).get("sku"):
+    elif not choice.get('_default_price') and not (choice.get("args") or {}).get("sku"):
         lines.append("Укажите бренд и артикул запчасти, если они известны.")
     # Диагностика доступна в /parts_test, а не дублируется в каждом вопросе.
     return "\n".join(lines)
@@ -705,7 +711,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                     continue
                 if choice.get("kind") == "part":
                     await message.answer(render_part_choice(choice),
-                                         reply_markup=part_keyboard(token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}))
+                                         reply_markup=part_keyboard(token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}, default_price=bool(choice.get("_default_price"))))
                     continue
                 if choice.get("kind") == "to":
                     await message.answer(render_to_choice(choice),
@@ -1407,7 +1413,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                                         reply_markup=to_keyboard(new_token, choice.get("candidates") or []))
                 elif choice.get("kind") == "part":
                     await target.answer(render_part_choice(choice),
-                                        reply_markup=part_keyboard(new_token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}))
+                                        reply_markup=part_keyboard(new_token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}, default_price=bool(choice.get("_default_price"))))
         # Черновики показываем ВСЕГДА: иначе после «Стандартное ТО» человек видел только
         # вопрос про масло, а подобранные фильтры висели в черновиках без кнопок.
         text_out = result.answer or "Готово."
@@ -1433,6 +1439,44 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
 
         if value == "noop":
             await callback.answer()
+            return
+        if value in {"priceyes", "priceno", "pricecancel"}:
+            choice = (entry or {}).get('choice') or {}
+            user_id = callback.from_user.id if callback.from_user else 0
+            if (not entry or not choice.get('_default_price') or choice.get('_price_owner') != user_id
+                    or not choice.get('_price_nonce') or time.time() - entry['created_at'] > 1800):
+                await callback.answer("Этот выбор устарел или принадлежит другому сотруднику.", show_alert=True)
+                return
+            pending_choices.pop(token, None)
+            command = {'priceyes': 'yes', 'priceno': 'no', 'pricecancel': 'cancel'}[value]
+            result = await pipeline.handle_text(f"__price_button__:{choice['_price_nonce']}:{command}", [], user_id=user_id)
+            if result.answer.startswith('Этот выбор устарел'):
+                await callback.answer(result.answer, show_alert=True)
+                return
+            await callback.answer()
+            await safe_edit(_cb_msg(callback), "Выбор: " + {'yes': 'цена 0 ₽', 'no': 'указать цену', 'cancel': 'отмена'}[command])
+            target = _cb_msg(callback)
+            if target is not None:
+                if result.choices:
+                    for next_choice in result.choices:
+                        next_token = remember_choice(next_choice)
+                        if next_choice.get('kind') == 'part':
+                            await target.answer(render_part_choice(next_choice), reply_markup=part_keyboard(
+                                next_token, next_choice.get('candidates') or [],
+                                text_only=next_choice.get('_group_step') in {'price', 'offer'},
+                                default_price=bool(next_choice.get('_default_price'))))
+                        elif next_choice.get('kind') in ('quick_read', 'quick_select', 'quick_reason', 'quick_brand'):
+                            await target.answer(next_choice['question'], reply_markup=quick_choice_keyboard(next_token, next_choice))
+                        else:
+                            await target.answer(render_choice(next_choice), reply_markup=employee_keyboard(next_token, next_choice.get('candidates') or []))
+                else:
+                    body = result.answer or 'Продолжаем.'
+                    if result.drafts:
+                        body += "\n\n" + drafts_block(result.drafts, body)
+                    if result.applied:
+                        body += "\n\n⚡ Внесено без подтверждения:\n" + render_applied(result.applied)
+                    for piece in chunk(body):
+                        await target.answer(piece, reply_markup=drafts_keyboard(result.drafts))
             return
         if value == "cancel":
             pending_choices.pop(token, None)
@@ -1481,7 +1525,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             if target is not None:
                 for choice in result.choices:
                     new_token = remember_choice(choice)
-                    await target.answer(render_part_choice(choice), reply_markup=part_keyboard(new_token, choice.get("candidates") or [], text_only=choice.get("_group_step") in {"price", "offer"}))
+                    await target.answer(render_part_choice(choice), reply_markup=part_keyboard(new_token, choice.get("candidates") or [], text_only=choice.get("_group_step") in {"price", "offer"}, default_price=bool(choice.get("_default_price"))))
                 text_out = result.answer or "Продолжаем."
                 if result.applied:
                     text_out += "\n\n⚡ Внесено без подтверждения:\n" + render_applied(result.applied)
@@ -1524,7 +1568,7 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 if choice.get("kind") == "part":
                     await target.answer(
                         render_part_choice(choice),
-                        reply_markup=part_keyboard(new_token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}),
+                        reply_markup=part_keyboard(new_token, choice["candidates"], text_only=choice.get("_group_step") in {"price", "offer"}, default_price=bool(choice.get("_default_price"))),
                     )
                     continue
                 if choice.get("kind") == "to":
