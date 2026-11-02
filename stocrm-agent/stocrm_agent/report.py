@@ -232,7 +232,7 @@ def format_apply_result(method: str, result: Any, *, summary: str = "", warning:
 
     if price is not None and price <= 0:
         lines.append(
-            "\n⚠️ Цена продажи 0 ₽ — похоже, она не проставлена. "
+            "\n⚠️ Цена продажи 0 ₽ — товар бесплатный. "
             "Проверьте позицию в сделке: «Реализация» → «Товары»."
         )
     if warning:

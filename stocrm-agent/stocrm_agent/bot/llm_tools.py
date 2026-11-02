@@ -165,7 +165,7 @@ TOOL_SPEC: list[dict[str, Any]] = [
     _tool("resolve_part",
           "Подбор запчасти, включая справочный поиск по складу только на чтение, с обязательным совпадением названных бренда и артикула. Возвращает варианты "
           "(status: matched — можно брать первый; ambiguous — нужно спросить человека). "
-          "ВСЕГДА вызывай перед draft_add_offer_part: в карточке нужен точный бренд, артикул и цена.",
+          "При добавлении нужен точный бренд и артикул; цену не бери из каталога — её должен указать человек.",
           {"query": {"type": "string", "description": "как сказал человек: «фильтр масляный w914/2»"},
            "brand": _STR, "sku": _STR, "offer_id": _INT, "limit": _INT}),
     _tool("users", "Сотрудники (user_id + ФИО) — для поиска ответственного.", {}),
@@ -563,7 +563,7 @@ class ToolRouter:
             outcome.payload = json.dumps(payload, ensure_ascii=False, default=str)
         return outcome
 
-    def execute(self, name: str, arguments: dict[str, Any]) -> ToolOutcome:
+    def execute(self, name: str, arguments: dict[str, Any], *, _confirmed_zero: bool = False) -> ToolOutcome:
         from ..diagnostics import safe_record
         self.tools.audit.write("bot.tool.request", tool=name, payload=safe_record(arguments))
         if name == "draft_create_calendar_entry":
@@ -573,6 +573,11 @@ class ToolRouter:
             return ToolOutcome(payload=json.dumps({"error": f"неизвестный инструмент {name}"}, ensure_ascii=False))
 
         clean_args = {k: v for k, v in (arguments or {}).items() if v not in (None, "")}
+
+        if name == PART_TOOL:
+            clean_args.pop("allow_zero_price", None)  # модель не может подтверждать 0 за человека
+            if _confirmed_zero and clean_args.get("price") == 0:
+                clean_args["allow_zero_price"] = True
 
         if name == "draft_add_offer_work":
             if "sum" in clean_args:
@@ -642,7 +647,7 @@ class ToolRouter:
                 clean_args["qty"] = own_qty
         extra_parts: list[dict[str, Any]] = []
         if name == PART_TOOL:
-            if not clean_args.get("price"):
+            if clean_args.get("price") is None:
                 own_price = self._hint_price(clean_args) or self.price_hint
                 if own_price:
                     # цену назвал сам человек — берём её, догадки не нужны
@@ -701,7 +706,7 @@ class ToolRouter:
         extra_drafts, extra_notes, extra_pending = self._build_extra_parts(clean_args, extra_parts)
         if name_hint:  # «Исполнитель: Петров Пётр» в резюме черновика
             draft["summary"] = f"{draft.get('summary')} ({name_hint})" if name_hint not in str(draft.get("summary")) else draft.get("summary")
-        needs_confirm = bool(self.prepare_only) or name == "draft_create_offer" or self.policy.requires_confirmation(name)
+        needs_confirm = bool(self.prepare_only) or _confirmed_zero or name == "draft_create_offer" or self.policy.requires_confirmation(name)
 
         if not needs_confirm:
             if name == PART_TOOL and extra_drafts:
@@ -1326,9 +1331,9 @@ class ToolRouter:
             args["brand"] = chosen["brand"]
         if chosen.get("sku"):
             args["sku"] = chosen["sku"]
-        if chosen.get("source") != "склад" and chosen.get("price") and not args.get("price"):
-            args["price"] = chosen["price"]
-        if not args.get("price"):
+        # Цена источника может быть закупочной; если человек цену не называл,
+        # всегда спрашиваем, даже если каталог вернул какую-то сумму.
+        if args.get("price") is None:
             # Цену не выдумываем и 0 не подставляем: позиция с ценой 0 уже уезжала
             # в сделку «бесплатной». Инструмент вежливо попросит назвать цену.
             args.pop("price", None)
@@ -1529,7 +1534,7 @@ class ToolRouter:
         clean["title"] = title
         return clean
 
-    def resume_part_price(self, args: dict[str, Any], price: float) -> ToolOutcome:
+    def resume_part_price(self, args: dict[str, Any], price: float, *, confirmed_zero: bool = False) -> ToolOutcome:
         """Продолжает добавление запчасти, когда человек назвал цену продажи.
 
         Повторно искать позицию в панели не нужно: бренд, артикул и название уже есть.
@@ -1540,7 +1545,7 @@ class ToolRouter:
         clean.pop("title", None)
         clean["_part_chosen"] = True
         clean["price"] = int(price) if float(price) == int(price) else float(price)
-        return self.execute(PART_TOOL, clean)
+        return self.execute(PART_TOOL, clean, _confirmed_zero=confirmed_zero)
 
     def resume_supplier_choice(self, choice: dict[str, Any], index: int | None) -> ToolOutcome:
         candidate = next((c for c in choice.get("candidates") or [] if c.get("index") == index), None)

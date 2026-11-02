@@ -855,9 +855,9 @@ SYSTEM_PROMPT = """Правка цены существующей услуги �
    `draft_add_offer_part`. Не переспрашивай цену, которая уже названа.
    КОЛИЧЕСТВО передавай сразу в том же вызове: «2 шт» → qty=2, «одну» → qty=1.
    Если количество не названо — qty=1 (не оставляй поле пустым).
-   Если инструмент ответил, что не указана цена продажи, — НЕ ищи позицию заново и не
-   спрашивай бренд повторно: просто назови человеку позицию и спроси цену одной строкой.
-   Когда он её назовёт, вызови `draft_add_offer_part` с теми же name/brand/sku и price.
+   Если цена человеком не названа, не подставляй цену из каталога, склада или истории:
+   инструмент вернёт вопрос с кнопками «0 ₽» или «Указать цену». Сам не подтверждай 0 ₽.
+   Не ищи позицию и бренд заново; после ответа человека диалог продолжится автоматически.
 11.5. Удаление позиции из сделки: «убери её», «удали тормозную жидкость», «эта позиция
    не нужна» — вызывай `draft_remove_offer_part` (offer_id + query или order_id).
    НИКОГДА не пытайся «удалить» позицию через `draft_change_part_price` с количеством 0:
@@ -1248,7 +1248,7 @@ class BotPipeline:
         key = user_id or 0
         self._part_pending.pop(key, None)
         for choice in result.choices:
-            if choice.get("kind") == "part" and (choice.get("_group") or choice.get("candidates") or (choice.get("args") or {}).get("sku") or (choice.get("args") or {}).get("name")):
+            if choice.get("kind") == "part" and (not choice.get("_default_price") or choice.get("_group")) and (choice.get("_group") or choice.get("candidates") or (choice.get("args") or {}).get("sku") or (choice.get("args") or {}).get("name")):
                 self._part_pending[key] = {"choice": choice, "at": time.time()}
                 break
         if len(self._part_pending) > 200:        # простая защита от роста памяти
@@ -1256,12 +1256,60 @@ class BotPipeline:
             for old_key in oldest:
                 self._part_pending.pop(old_key, None)
 
+    @staticmethod
+    def _default_price_choice(user_id: int | None, title: str, scope: str) -> dict[str, Any]:
+        question = (f"Цена продажи для «{title}» не указана. Добавить с ценой по умолчанию 0 ₽? "
+                    "Это бесплатная позиция. Или выберите «Указать цену» и отправьте сумму.")
+        return {"kind": "part", "tool": PART_TOOL, "args": {}, "candidates": [],
+                "_default_price": True, "_price_scope": scope, "_price_owner": user_id or 0,
+                "_price_nonce": secrets.token_hex(12), "question": question}
+
+    async def _price_button(self, text: str, user_id: int | None) -> PipelineResult:
+        key = user_id or 0
+        bits = text.split(':')
+        if len(bits) != 3 or bits[2] not in {'yes', 'no', 'cancel'}:
+            return PipelineResult(answer='Некорректный выбор; запись не начата.')
+        nonce, action = bits[1], bits[2]
+        group_entry = self._part_pending.get(key) or {}
+        price_entry = self._price_pending.get(key) or {}
+        quick_entry = self._quick_pending.get(key) or {}
+        possible = [(group_entry.get('choice'), group_entry),
+                    (price_entry.get('price_choice'), price_entry),
+                    (quick_entry.get('price_choice'), quick_entry)]
+        match = next(((c, entry) for c, entry in possible if c and c.get('_price_nonce') == nonce
+                      and c.get('_price_owner') == key and c.get('_default_price')
+                      and time.time() - float(entry.get('at') or 0) <= self.to_pending_ttl), None)
+        if not match:
+            return PipelineResult(answer='Этот выбор устарел или принадлежит другому сотруднику. Ничего не записано.')
+        choice, entry = match
+        choice.pop('_price_nonce', None)  # повторное нажатие недействительно
+        scope = choice['_price_scope']
+        if action == 'cancel':
+            if scope == 'group': self._part_pending.pop(key, None)
+            elif scope == 'quick': self._quick_pending.pop(key, None)
+            else: self._price_pending.pop(key, None)
+            return PipelineResult(answer='Отменено. В CRM ничего не записано.')
+        if action == 'no':
+            return PipelineResult(answer='Укажите цену продажи в рублях. Заявка сохранена; запись не начата.')
+        if scope == 'group':
+            return await asyncio.to_thread(self._group_reply, choice, '__confirmed_zero__', key)
+        if scope == 'quick':
+            entry['item']['price'] = 0
+            entry['item']['zero_price_confirmed'] = True
+            return await asyncio.to_thread(self._quick_continue, entry['plan'], key)
+        result = await self._pending_price('', key, confirmed_zero=True)
+        return result or PipelineResult(answer='Вопрос о цене устарел; запись не начата.')
+
     def _track_price(self, result: PipelineResult, user_id: int | None) -> None:
         """Запоминает «ждём цену продажи» или снимает ожидание."""
         key = user_id or 0
         info = result.pending_price
         if info:
-            self._price_pending[key] = {"args": dict(info), "at": time.time()}
+            choice = self._default_price_choice(key, str(info.get("title") or info.get("name") or "товар"), 'single')
+            self._price_pending[key] = {"args": dict(info), "at": time.time(), "price_choice": choice}
+            if not result.choices:
+                result.choices.append(choice)
+                result.answer = choice['question']
         else:
             self._price_pending.pop(key, None)
         if len(self._price_pending) > 200:
@@ -1269,7 +1317,7 @@ class BotPipeline:
             for old_key in oldest:
                 self._price_pending.pop(old_key, None)
 
-    async def _pending_price(self, text: str, user_id: int | None) -> PipelineResult | None:
+    async def _pending_price(self, text: str, user_id: int | None, *, confirmed_zero: bool = False) -> PipelineResult | None:
         """Человек назвал цену — собираем черновик без модели и без нового поиска."""
         key = user_id or 0
         owner = key
@@ -1287,7 +1335,7 @@ class BotPipeline:
         if low in {"отмена", "отмени", "стоп", "не надо"}:
             self._price_pending.pop(owner, None)
             return PipelineResult(answer="❌ Отменено, запчасть не добавлена.")
-        price = parse_price(text)
+        price = 0.0 if confirmed_zero else parse_price(text)
         if price is None:
             # не цена — новая просьба не должна «съедаться» ожиданием
             if _looks_like_new_request(low):
@@ -1302,7 +1350,7 @@ class BotPipeline:
             if qty:
                 args["qty"] = qty
         log.info("цена %s названа человеком — собираю черновик без модели", price)
-        outcome = await asyncio.to_thread(self.router.resume_part_price, args, price)
+        outcome = await asyncio.to_thread(self.router.resume_part_price, args, price, confirmed_zero=confirmed_zero)
         result = self._from_outcome(outcome, default="Готово — проверьте и подтвердите.",
                                     user_key=key)  # noqa: RET504
         self._track_price(result, user_id)     # сначала снять/поставить ожидание цены
@@ -1754,10 +1802,8 @@ class BotPipeline:
                     self._track_part(result, user_id)
                     return result
             if item.get('price') is None:
-                choice = {'kind': 'part', 'tool': PART_TOOL, 'args': {'sku': item['sku']},
-                          'candidates': [], '_group': group, '_group_index': index,
-                          '_group_step': 'price',
-                          'question': f"Назовите цену продажи для {item['sku']} (за штуку). Остальные данные сохранены."}
+                choice = self._default_price_choice(user_id, item['sku'], 'group')
+                choice.update(args={'sku': item['sku']}, _group=group, _group_index=index, _group_step='price')
                 result = PipelineResult(answer=choice['question'], choices=[choice])
                 self._track_part(result, user_id)
                 return result
@@ -1773,7 +1819,8 @@ class BotPipeline:
                 item, chosen = state['item'], state['selected']
                 draft = self.tools.draft_add_offer_part(offer_id=group['offer_id'],
                     name=chosen.get('name') or item['sku'], sku=item['sku'],
-                    brand=chosen.get('brand'), qty=item.get('qty') or 1, price=item['price'], source='manual')
+                    brand=chosen.get('brand'), qty=item.get('qty') or 1, price=item['price'], source='manual',
+                    allow_zero_price=item.get('zero_price_confirmed') is True)
                 if chosen.get('source') == 'склад':
                     warning = "; ".join(x for x in (str(draft.get('warning') or ''), "Склад использован только для поиска; свободная позиция не привязана к складскому остатку. Применяемость требует проверки.") if x)
                     draft = self.tools.drafts.mark(draft['token'], 'pending', warning=warning)
@@ -1798,7 +1845,7 @@ class BotPipeline:
             BATCH_PREPARING.reset(token)
         self._part_pending.pop(user_id or 0, None)
         self._part_batch[user_id or 0] = {'token': merged['token'], 'offer_id': group['offer_id'], 'at': time.time()}
-        if self.router.policy.requires_confirmation(PART_TOOL):
+        if self.router.policy.requires_confirmation(PART_TOOL) or any(state['item'].get('zero_price_confirmed') is True for state in selected):
             return PipelineResult(answer="Все позиции подготовлены в одном черновике. Проверьте и подтвердите.", drafts=[merged])
         applied = self.router._apply_now(merged, tool=PART_TOOL)
         if applied.get('ok'):
@@ -1832,10 +1879,14 @@ class BotPipeline:
             state['skipped'] = True
             return self._group_next(group, user_id)
         if choice['_group_step'] == 'price':
-            price = parse_price(value)
-            if price is None or price <= 0:
+            price = 0.0 if value == '__confirmed_zero__' else parse_price(value)
+            if price is None:
+                if not choice.get('_price_nonce'):
+                    return PipelineResult(answer='Укажите положительную цену продажи в рублях или напишите «отмена».')
                 return PipelineResult(answer=choice['question'], choices=[choice])
             item['price'] = price
+            if price == 0:
+                item['zero_price_confirmed'] = True
             return self._group_next(group, user_id)
         if low in {'повтори поиск', 'повторить поиск', 'поищи снова', 'retry'} and not choice['candidates']:
             from .. import websearch
@@ -1925,8 +1976,6 @@ class BotPipeline:
             previous = (self.router.part_context or {}).get(item["normalized"], {})
             if not item.get("brand") and previous.get("brand"):
                 item["brand"] = previous["brand"]
-            if item.get("price") is None and item.get("brand") == previous.get("brand"):
-                item["price"] = previous.get("price")
         self.router.set_request_parts(items)
         match = _DEAL_IN_TEXT.search(source)
         if match:
@@ -2739,9 +2788,14 @@ class BotPipeline:
         missing = ([plan["work"]] if plan.get("work") else []) + plan.get("extra_works", []) + plan["articles"]
         for item in missing:
             if item.get("price") is None:
-                self._quick_pending[user_id] = {"plan": plan, "item": item, "at": time.time()}
+                pending = {"plan": plan, "item": item, "at": time.time()}
+                self._quick_pending[user_id] = pending
                 what = f"артикула {item['sku']}" if item.get("sku") else f"работы «{item['title']}»"
-                return PipelineResult(answer=f"Укажите цену продажи {what} в рублях. Ноль вместо неизвестной цены не подставляю; запись ещё не начата.")
+                if item.get('sku'):
+                    choice = self._default_price_choice(user_id, item['sku'], 'quick')
+                    pending['price_choice'] = choice
+                    return PipelineResult(answer=choice['question'], choices=[choice])
+                return PipelineResult(answer=f"Укажите цену продажи {what} в рублях. Работа с нулевой ценой не добавляется; запись ещё не начата.")
         for item in plan['articles']:
             if parts.known_brand(item.get('brand')):
                 continue
@@ -2952,6 +3006,21 @@ class BotPipeline:
 
     async def _handle_text(self, text: str, history: list[dict[str, Any]],
                            user_id: int | None = None) -> PipelineResult:
+        if text.startswith('__price_button__:'):
+            return await self._price_button(text, user_id)
+        # Короткий устный/текстовый ответ эквивалентен кнопке в текущем вопросе.
+        answer = (text or '').strip().lower().replace('ё', 'е').strip(' .!?')
+        if answer in {'да', 'нет'}:
+            key = user_id or 0
+            entries = [self._part_pending.get(key) or {}, self._price_pending.get(key) or {},
+                       self._quick_pending.get(key) or {}]
+            choices = [(entry.get('price_choice') or entry.get('choice'), entry) for entry in entries]
+            choices = [(choice, entry) for choice, entry in choices
+                       if choice and choice.get('_default_price') and choice.get('_price_nonce')]
+            if choices:
+                choice, _ = max(choices, key=lambda pair: float(pair[1].get('at') or 0))
+                action = 'yes' if answer == 'да' else 'no'
+                return await self._price_button(f"__price_button__:{choice['_price_nonce']}:{action}", user_id)
         text = _normalize_deal_slip(text)
         if quick_read.is_quick_request(text):
             self._quick_pending.pop(user_id or 0, None)
@@ -2972,6 +3041,18 @@ class BotPipeline:
                 parts.check_sku_tokens(text)
             except ValueError as exc:
                 return PipelineResult(answer=f"{exc}. Ничего не записано.")
+        # Новая заявка не должна оставлять действующей старую кнопку цены.
+        if _ADD_VERB.search(text) and _supersedes_pending(text.lower()) and parse_price(text) is None:
+            key = user_id or 0
+            part_wait = self._part_pending.get(key) or {}
+            if (part_wait.get('choice') or {}).get('_default_price'):
+                self._part_pending.pop(key, None)
+            price_wait = self._price_pending.get(key) or {}
+            if price_wait.get('price_choice'):
+                self._price_pending.pop(key, None)
+            quick_wait = self._quick_pending.get(key) or {}
+            if quick_wait.get('price_choice'):
+                self._quick_pending.pop(key, None)
         if _mixed_work_and_part(text):
             self._quick_pending.pop(user_id or 0, None)
             self._quick_choices.pop(user_id or 0, None)
@@ -3205,6 +3286,15 @@ class BotPipeline:
                     args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
                 except json.JSONDecodeError:
                     args = {}
+                if name == PART_TOOL:
+                    # Не разрешаем модели выдать цену каталога или догадку за слова человека.
+                    # Ответы на ранее заданный вопрос проходят отдельным маршрутом до LLM.
+                    explicit_price = self.router._hint_price(args) or self.router.price_hint
+                    args.pop('price', None)
+                    args.pop('allow_zero_price', None)
+                    args.pop('_part_chosen', None)
+                    if explicit_price is not None:
+                        args['price'] = explicit_price
                 prepared.append((call, name, args))
 
             def read_key(name: str, args: dict[str, Any]) -> str:

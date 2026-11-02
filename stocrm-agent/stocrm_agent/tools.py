@@ -442,7 +442,7 @@ def _part_line(check: dict[str, Any]) -> str:
     qty = check.get("qty") or 1
     line = f"{head} × {_num(qty)}"
     price = _money(check.get("price") or 0)
-    if price > 0:
+    if check.get("price") is not None:
         line += f" — {_thousands(price)} ₽"
         if int(qty or 1) > 1:
             line += f" (итого {_thousands(price * int(qty or 1))} ₽)"
@@ -1234,6 +1234,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if row_offer not in (None, False, "") and int(row_offer) != int(offer_id):
                 continue
             stock: dict[str, Any] = r["FORMATTED_STOCK"] if isinstance(r.get("FORMATTED_STOCK"), dict) else {}
+            known_price = _known_work_sum(r.get("PRICE"))
             out.append({
                 "order_id": r.get("ORDER_ID"),
                 "offer_id": r.get("OFFER_ID"),
@@ -1244,7 +1245,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 "name": r.get("NAME") or stock.get("NAME"),
                 "qty": r.get("QUANTITY_CURRENT") if r.get("QUANTITY_CURRENT") is not None else r.get("QUANTITY"),
                 "qty_source": "QUANTITY_CURRENT" if r.get("QUANTITY_CURRENT") is not None else "QUANTITY",
-                "price": _money(r.get("PRICE")),
+                "price": known_price if known_price is not None else 0.0,
+                "price_known": known_price is not None,
                 "order_sum": _money(r.get("ORDER_SUM")),
                 "supplier_price": _money(r.get("SUPPLIER_PRICE")),
                 "supplier": r.get("SUPPLIER_NAME"),
@@ -1441,6 +1443,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         require_id: int | None = None,
         need_markup: bool = False,
         allow_duplicate: bool = False,
+        allow_zero_price: bool = False,
     ) -> dict[str, Any]:
         """ЧЕРНОВИК добавления запчасти в сделку.
 
@@ -1491,15 +1494,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 )
         if price is None:
             raise ValueError(
-                "Не указана цена продажи (price). Возьмите её из найденной позиции — "
-                "stock/offer_parts — или спросите человека"
+                "Не указана цена продажи (price). Спросите человека о цене или выборе 0 ₽"
             )
-        if _money(price) <= 0:
-            # Позиция с ценой 0 ₽ уезжала в сделку молча (так и получилось «масло за 0»).
-            raise ValueError(
-                "Цена продажи 0 — такую позицию не добавляю: в сделке она будет бесплатной. "
-                "Уточните у человека цену продажи и передайте её в price"
-            )
+        parsed_price = _known_work_sum(price) if not isinstance(price, bool) else None
+        if parsed_price is None or parsed_price < 0 or (parsed_price == 0 and allow_zero_price is not True):
+            raise ValueError("Цена продажи должна быть положительной; 0 ₽ допустим только после явного выбора человека")
+        price = parsed_price
         if source == "supplier" and not supplier_id:
             raise ValueError(
                 "Для source=supplier нужен supplier_id — сначала вызовите suppliers и выберите поставщика"
@@ -1533,6 +1533,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         where = "свободный ордер (без подбора склада и заказа поставщику)"
 
         step: dict[str, Any] = {"method": method, "payload": payload}
+        if price == 0:
+            step["zero_price_confirmed"] = True  # входит в подпись шагов, не отправляется в CRM
         steps.append(step)
 
         check: dict[str, Any] = {
@@ -4588,7 +4590,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             for step in current.get("steps") or []:
                 if step.get("method") == "offer/order/add_free_order":
                     native = step.get("payload") or {}
-                    if native.get("NEED_MARKUP") is not False or _money(native.get("PRICE")) <= 0 or type(native.get("AMOUNT")) is not int or native["AMOUNT"] < 1:
+                    if (native.get("NEED_MARKUP") is not False or _known_work_sum(native.get("PRICE")) is None
+                            or _known_work_sum(native.get("PRICE")) < 0
+                            or (_known_work_sum(native.get("PRICE")) == 0 and step.get("zero_price_confirmed") is not True)
+                            or type(native.get("AMOUNT")) is not int or native["AMOUNT"] < 1):
                         raise ValueError("Свободный ордер не содержит подтверждённые цену/количество и запрет наценки. Запись не начата; старые partial не повторяются")
                     check = current.get("check") or {}
                     if check.get("kind") == "added_line" and (
@@ -4962,7 +4967,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         valid_qty = math.isfinite(quantity) and quantity > 0 and quantity.is_integer()
         actual_qty = int(quantity) if valid_qty else None
         problems: list[str] = []
-        if wanted_price and abs(actual_price - wanted_price) > 0.01:
+        if line.get("price_known") is False or _known_work_sum(line.get("price")) is None:
+            problems.append("не удалось проверить цену в строке сделки")
+        elif abs(actual_price - wanted_price) > 0.01:
             problems.append(f"цена в сделке {actual_price:.0f} ₽ вместо {wanted_price:.0f} ₽")
         if actual_qty != wanted_qty:
             if line.get("qty_source") == "QUANTITY_CURRENT" and actual_qty is not None:

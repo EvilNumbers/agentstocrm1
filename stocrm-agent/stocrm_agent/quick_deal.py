@@ -298,10 +298,12 @@ def prepare(tools: Any, ids: tuple[int, int, int], offer_id: int | None,
         raise ValueError('Название работы не указано')
     if offer_id:
         _assert_offer(tools, ids, offer_id, number_only=True)
-    for item in all_works + articles:
+    for item, is_article in [(item, False) for item in all_works] + [(item, True) for item in articles]:
         price = item.get('price')
-        if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
-            raise ValueError('Для каждой работы и запчасти нужна положительная цена')
+        zero_allowed = is_article and item.get('zero_price_confirmed') is True
+        if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price)
+                or price < 0 or (price == 0 and not zero_allowed)):
+            raise ValueError('Для работы нужна положительная цена, для товара 0 ₽ требует выбора человека')
     articles = [dict(item, sku=parts.sku_for_write(item.get('sku'))) for item in articles]
     for item in articles:
         if not item.get('sku') or not parts.known_brand(item.get('brand')) or type(item.get('qty')) is not int or not 1 <= item['qty'] <= 9999:
@@ -335,6 +337,8 @@ def apply(tools: Any, token: str, current: dict[str, Any]) -> dict[str, Any]:
     if (p.get('confirmation_policy') not in {'deal_number_only_v117', 'multi_work_v119'} or
             (p.get('confirmation_policy') == 'deal_number_only_v117' and p.get('extra_works'))):
         raise ValueError('Старый черновик не содержит новых условий проверки. Если запись не отправлялась, отмените его и создайте новый; частичную запись не повторяйте')
+    if any(item.get('price') == 0 and item.get('zero_price_confirmed') is not True for item in p.get('articles') or []):
+        raise ValueError('Цена 0 ₽ не подтверждена человеком; запись не начата')
     if any(not parts.known_brand(item.get('brand')) for item in p.get('articles') or []):
         raise ValueError('В старом черновике не указан бренд. Отмените его, если запись не отправлялась, и укажите бренд вручную; CRM не изменена')
     if any(not parts.sku_is_latin(item.get('sku')) for item in p.get('articles') or []):
