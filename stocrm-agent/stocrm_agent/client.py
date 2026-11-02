@@ -341,9 +341,9 @@ class StocrmClient:
             return raw.get("RESPONSE", raw)
         if code_int != 200:
             message = str(raw.get("MESSAGE") or "неизвестная ошибка API")
-            if tolerate_empty and method == "contacts/get_from_filter" and code_int not in (401, 403, 429) and message.lower().strip(" .!") == "контакты по запрашиваемым критериям не найдены":
+            if tolerate_empty and method == "contacts/get_from_filter" and code_int not in (401, 403, 429) and not 500 <= code_int <= 599 and message.lower().strip(" .!") == "контакты по запрашиваемым критериям не найдены":
                 return []
-            if tolerate_empty and _is_empty_answer(message):
+            if tolerate_empty and code_int not in (401, 403, 429) and not 500 <= code_int <= 599 and _is_empty_answer(message):
                 # «Не найдено» — это пустая выборка, а не сбой. Но ТОЛЬКО у чтения:
                 # на запись такой ответ означает «не записалось», и выдавать его за
                 # успех нельзя — иначе человеку скажут «готово», а в сделке пусто.
@@ -644,6 +644,24 @@ def _as_items(chunk: Any) -> list[Any]:
             return list(values[0])
         return [chunk]
     return [chunk]
+
+
+def _strict_items(chunk: Any) -> list[Any]:
+    """Подтверждённый формат выборки; неизвестная обёртка не означает пустоту."""
+    if isinstance(chunk, list):
+        return chunk
+    if not isinstance(chunk, dict) or not chunk:
+        raise ValueError("CRM не подтвердила формат списка")
+    for key in ("DATA", "ITEMS", "LIST", "ROWS"):
+        if key in chunk:
+            if not isinstance(chunk[key], list):
+                raise ValueError("CRM вернула непроверяемую обёртку списка")
+            return list(chunk[key])
+    if any(k in chunk for k in ("OFFER_ID", "CONTACT_ID", "CUSTOMER_ID", "CARD_ID", "POST_ID", "ORDER_ID", "WORK_ID", "CAR_PROFILE_ID")):
+        return [chunk]
+    if all(isinstance(v, dict) for v in chunk.values()):
+        return list(chunk.values())
+    raise ValueError("CRM вернула неизвестный формат списка")
 
 
 def _row_id(item: Any) -> Any:

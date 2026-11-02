@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -74,33 +75,36 @@ def _is_action(text: str) -> bool:
 
 def _money(value: Any) -> str:
     try:
-        return f"{float(value):,.0f}".replace(",", " ")
-    except (TypeError, ValueError):
-        return "0"
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("invalid amount")
+        return f"{number:,.2f}".replace(",", " ").rstrip("0").rstrip(".").replace(".", ",")
+    except (TypeError, ValueError, OverflowError):
+        return "сумма не получена"
 
 
 def _money_exact(value: Any) -> str:
     """Не терять копейки в сумме и долге."""
-    return f"{float(value):,.2f}".replace(",", " ").rstrip("0").rstrip(".").replace(".", ",")
+    return _money(value)
 
 
 def _qty_line(item: dict[str, Any]) -> str:
-    """«1 шт. × 6 000 ₽ = 6 000 ₽» — без выдуманных чисел."""
-    qty = item.get("qty")
-    price = item.get("price")
-    if qty is None or qty == "":
-        return "количество не получено" + (f" · цена {_money(price)} ₽" if price else "")
+    """Цена 0 отличается от неизвестной цены, копейки сохраняются."""
+    qty, price = item.get("qty"), item.get("price")
+    price_known = item.get("price_known", price is not None)
+    try:
+        p = float(price)
+        price_known = bool(price_known) and math.isfinite(p)
+    except (TypeError, ValueError, OverflowError):
+        p, price_known = 0.0, False
     try:
         number = float(qty)
-        if not (number >= 0 and number < 1e9):
+        if not math.isfinite(number) or not 0 <= number < 1e9:
             raise ValueError("invalid quantity")
-    except (ValueError, TypeError, OverflowError):
-        return "количество не получено" + (f" · цена {_money(price)} ₽" if price else "")
+    except (TypeError, ValueError, OverflowError):
+        return "количество не получено" + (f" · цена {_money(p)} ₽" if price_known else " · цена не получена")
     line = f"{qty} шт."
-    if price:
-        line += f" × {_money(price)} ₽"
-        line += f" = {_money(float(price) * number)} ₽"
-    return line
+    return line + (f" × {_money(p)} ₽ = {_money(p * number)} ₽" if price_known else " · цена не получена")
 
 
 def format_offer_items(card: dict[str, Any]) -> str:
@@ -162,6 +166,8 @@ def format_offer_vehicle(card: dict[str, Any]) -> list[str]:
     def clean(value: Any) -> str:
         return value.strip() if isinstance(value, str) else ''
     name, plate, vin = (clean(card.get(field)) for field in ('car', 'plate', 'vin'))
+    if card.get('car_conflict'):
+        return ["🚗 Автомобиль: данные CRM противоречивы"]
     if name:
         line = f"🚗 Автомобиль: {name}"
     elif plate:
@@ -170,7 +176,7 @@ def format_offer_vehicle(card: dict[str, Any]) -> list[str]:
         line = "🚗 Автомобиль: не указан или не получен"
     if plate and plate.casefold() not in name.casefold():
         line += f" · {plate}"
-    return [line] + ([f"VIN: {vin}"] if vin else [])
+    return [line] + (["VIN: данные CRM противоречивы"] if card.get('vin_conflict') else [f"VIN: {vin}"] if vin else [])
 
 
 def format_offer_card(card: dict[str, Any], *, detailed: bool = False) -> str:
@@ -185,11 +191,14 @@ def format_offer_card(card: dict[str, Any], *, detailed: bool = False) -> str:
     if status:
         marker = card.get("status_marker")
         lines.append(f"Воронка и статус: {marker + ' ' if marker else ''}{status}")
-    sums = f"Сумма: {_money(card.get('sum'))} ₽"
+    sums = (f"Сумма: {_money(card.get('sum'))} ₽" if card.get('sum_known', card.get('sum') is not None)
+            else "Сумма: не получена")
     parts_sum = card.get("parts_sum")
     works_sum = card.get("works_sum")
     if parts_sum or works_sum:
-        sums += f" (работы {_money(works_sum)} ₽, запчасти {_money(parts_sum)} ₽)"
+        work_text = f"{_money(works_sum)} ₽" if works_sum is not None else "не получено"
+        part_text = f"{_money(parts_sum)} ₽" if parts_sum is not None else "не получено"
+        sums += f" (работы {work_text}, запчасти {part_text})"
     lines.append(sums)
     if card.get("payment_status") and not detailed:
         # в подробном виде ниже будут реальные суммы оплат — «Нет оплаты» из карточки
@@ -239,7 +248,7 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
             else:
                 head += f" · долг: {_money_exact(debt)} ₽"
         else:
-            head += f" — {_money(row.get('sum'))} ₽"
+            head += f" — {_money(row.get('sum'))} ₽" if row.get('sum_known', row.get('sum') is not None) else " — сумма не получена"
         if row.get("status"):
             head += f", {row['status']}"
         lines.append(head)

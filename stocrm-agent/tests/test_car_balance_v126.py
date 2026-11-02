@@ -118,7 +118,7 @@ def test_older_panel_rejecting_car_fields_still_returns_card(env, monkeypatch):
     monkeypatch.setattr(tools, '_read_uncached', read)
     text = format_offer_card(tools.offer_card(1900))
     assert '1900' in text and 'Автомобиль: не указан или не получен' in text
-    assert 'CAR_PROFILE_ID' in calls[0] and 'CAR_PROFILE_ID' not in calls[1]
+    assert 'CAR_PROFILE_ID' in calls[0] and 'CAR_PROFILE_ID' in calls[1] and 'CAR_PROFILE_ID' not in calls[2]
 
 
 @pytest.mark.parametrize('balance,total,expected', [
