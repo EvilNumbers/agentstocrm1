@@ -30,7 +30,7 @@ def test_work_status_list_with_missing_id_only_reads(env, monkeypatch):
     omit_status_ids(session, monkeypatch)
     result = send(pipe, 'Покажи сделки в работе')
     assert '№1654' in result.answer
-    assert 'по названию' in result.answer and 'только просмотр' in result.answer
+    assert 'сверен по названию' not in result.answer and 'сверены по названию' not in result.answer
     assert not result.drafts and not writes(session)
 
 
@@ -42,11 +42,11 @@ def test_quick_list_and_button_check_own_data_and_status(env, monkeypatch):
     omit_status_ids(session, monkeypatch)
     choice = send(pipe, 'Покажи быстрые сделки').choices[0]
     assert set(choice['offers']) == {1900, 1901}
-    assert 'по названию' in choice['question']
+    assert 'сверен по названию' not in choice['question'] and 'сверены по названию' not in choice['question']
     assert 'Клиент Б' not in choice['question'].split('📋 Быстрая сделка №1900')[1].split('📋 Быстрая сделка №1901')[0]
     index = choice['offers'].index(1901)
     card = pipe.quick_read_choice(choice, 1, index)
-    assert 'Клиент Б' in card.answer and 'по названию' in card.answer
+    assert 'Клиент Б' in card.answer and 'сверен по названию' not in card.answer
     assert not writes(session)
 
 

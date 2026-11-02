@@ -1858,6 +1858,18 @@ async def warm_up(tools: Any) -> None:
         log.debug("прогрев не выполнен: %s", exc)
 
 
+async def start_fresh_polling(bot: Bot, dispatcher: Dispatcher) -> None:
+    """Отбрасываем очередь Telegram перед опросом, иначе старые команды выполнятся после запуска.
+
+    Если Telegram не подтвердил очистку, опрос не запускается. Очистка относится ко всем
+    ожидающим обновлениям, в том числе старым нажатиям кнопок, а не к истории чата.
+    """
+    if await bot.delete_webhook(drop_pending_updates=True) is not True:
+        raise RuntimeError("Telegram не подтвердил очистку ожидающих обновлений; бот не запущен")
+    log.info("Очередь Telegram очищена; бот запускает опрос новых обновлений. Остановить: Ctrl+C")
+    await dispatcher.start_polling(bot)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -1912,9 +1924,8 @@ async def main() -> None:
     _tools.audit.write("bot.lifecycle.start", **{k: v for k, v in boot_record.items() if k != "event"})
     # прогрев панели — в фоне, запуску не мешает
     warm = asyncio.create_task(warm_up(_tools))
-    log.info("Бот запущен (опрос Telegram). Остановить: Ctrl+C")
     try:
-        await dp.start_polling(bot)
+        await start_fresh_polling(bot, dp)
     except Exception as exc:
         _ACTIVE_DIAGNOSTIC.emit('runtime.poll_error', error_class=type(exc).__name__, error_kind=error_kind(exc))
         if not _is_network_error(exc):

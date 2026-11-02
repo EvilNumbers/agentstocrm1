@@ -129,7 +129,7 @@ def test_no_status_id_in_directory_for_general_list(env, monkeypatch):
     session.data['offer/all_statuses']['15'].pop('STATUS_ID')
     hide_all_status_ids(session, monkeypatch)
     answer, ids = try_answer('Покажи сделки в работе', tools)
-    assert ids == [1654] and 'по названию' in answer
+    assert ids == [1654] and 'сверены по названию' not in answer
     assert not writes(session)
 
 

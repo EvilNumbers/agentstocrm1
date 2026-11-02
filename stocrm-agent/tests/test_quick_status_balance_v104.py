@@ -101,7 +101,7 @@ def test_work_without_deal_identity_is_not_shown(env, monkeypatch):
     assert 'Чужая работа' not in quick_read.status_detail(pipe.tools, (2, 51), 1900, 5555)
 
 
-@pytest.mark.parametrize('response', [None, {}, [], {'RUB_CASH': {'CURRENCY_VALUE': 0}},
+@pytest.mark.parametrize('response', [None, {}, [],
     {'RUB_CASH': {'CURRENCY_VALUE': 0, 'ENTITY_ID': 999, 'ENTITY_TYPE': 'OFFER'}},
     {'RUB_CASH': {'CURRENCY_VALUE': 0, 'ENTITY_ID': 1900, 'ENTITY_TYPE': 'CONTACT'}},
     {'RUB_CASH': {'CURRENCY_VALUE': 'invalid', 'ENTITY_ID': 1900, 'ENTITY_TYPE': 'OFFER'}}])

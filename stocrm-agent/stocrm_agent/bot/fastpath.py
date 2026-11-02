@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -75,6 +77,11 @@ def _money(value: Any) -> str:
         return f"{float(value):,.0f}".replace(",", " ")
     except (TypeError, ValueError):
         return "0"
+
+
+def _money_exact(value: Any) -> str:
+    """Не терять копейки в сумме и долге."""
+    return f"{float(value):,.2f}".replace(",", " ").rstrip("0").rstrip(".").replace(".", ",")
 
 
 def _qty_line(item: dict[str, Any]) -> str:
@@ -211,7 +218,18 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
             head += f" {row['contact']}"
         if row.get("car"):
             head += f" · {row['car']}"
-        head += f" — {_money(row.get('sum'))} ₽"
+        if "debt" in row:
+            if row.get('sum_known'):
+                head += f" — сумма {_money_exact(row.get('sum'))} ₽"
+            else:
+                head += " — сумма не получена"
+            debt = row.get('debt')
+            if debt is None:
+                head += " · долг: не удалось проверить"
+            else:
+                head += f" · долг: {_money_exact(debt)} ₽"
+        else:
+            head += f" — {_money(row.get('sum'))} ₽"
         if row.get("status"):
             head += f", {row['status']}"
         lines.append(head)
@@ -391,7 +409,6 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             seen: set[str] = set()
             complete = False
             uncertain = False
-            by_name = False
             page_size = 100
             for page in range(1, 21):
                 try:
@@ -416,7 +433,6 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                     if matched == 'unknown':
                         uncertain = True
                     elif matched in ('id', 'name'):
-                        by_name |= matched == 'name'
                         valid.append({**row, "status": status["title"]})
                 if len(valid) > 25:
                     uncertain = True
@@ -428,11 +444,22 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                 uncertain = True
             valid = valid[:25]
             qualifier = "\n⚠️ Проверка не завершена или список ограничен; он может быть неполным." if uncertain else ""
-            if by_name:
-                qualifier += "\nℹ️ Статусы сверены по названию и справочнику, а не по ID. Это только просмотр."
             label = f"«{status['title']}» · воронка «{board['name']}»"
             if not valid:
                 return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
+            # Только для «Ожидает оплаты»: отдельно читаем баланс каждой
+            # найденной сделки. Сумма сделки и долг — разные значения.
+            if _norm_status(status.get('title')) in _STATUS_TITLES['waiting_payment']:
+                def with_debt(row: dict[str, Any]) -> dict[str, Any]:
+                    debt = None
+                    if row.get('sum_known') is True:
+                        try:
+                            debt = tools.offer_balance_for_list(int(row['offer_id']), row.get('sum'))
+                        except Exception as exc:  # одна ошибка не скрывает остальные сделки
+                            log.warning('Не удалось проверить баланс сделки: %s', type(exc).__name__)
+                    return {**row, 'debt': debt}
+                with ThreadPoolExecutor(max_workers=4, thread_name_prefix='status-balance') as pool:
+                    valid = [f.result() for f in [pool.submit(copy_context().run, with_debt, row) for row in valid]]
             from .status_colors import color_marker
             marker = color_marker(status.get('front_color'))
             result = format_offers_list([{**row, 'status_marker': marker} for row in valid])

@@ -482,6 +482,30 @@ def _known_work_sum(value: Any) -> float | None:
     return round(number, 2) if math.isfinite(number) else None
 
 
+def _usable_rub_balances(balance: Any, offer_id: int) -> dict[str, Any] | None:
+    """Правило v80: сумма обязательна, ID и тип сверяются только если переданы.
+
+    Отсутствующие ID/тип не доказывают принадлежность строк сделке; запрос
+    выполняется с её номером, но мы полагаемся на корректность ответа CRM.
+    """
+    rub = {k: v for k, v in balance.items() if str(k).startswith("RUB_")} if isinstance(balance, dict) else {}
+    if not rub or any(not isinstance(v, dict) or _known_work_sum(v.get("CURRENCY_VALUE")) is None
+                      or (v.get("ENTITY_ID") not in (None, False, "") and str(v.get("ENTITY_ID")) != str(offer_id))
+                      or v.get("ENTITY_TYPE") not in (None, False, "", "OFFER") for v in rub.values()):
+        return None
+    return rub
+
+
+def _offer_balance_values(balance: Any, offer_id: int, total: Any) -> tuple[float | None, float | None, float | None]:
+    """Правило v80 для карточки и списка; неизвестное не становится нулём."""
+    total_value = _known_work_sum(total)
+    rub = _usable_rub_balances(balance, offer_id)
+    if total_value is None or rub is None:
+        return None, None, None
+    paid = round(sum(_known_work_sum(v.get("CURRENCY_VALUE")) for v in rub.values()), 2)
+    return paid, round(max(0.0, total_value - paid), 2), round(max(0.0, paid - total_value), 2)
+
+
 # --------------------------------------------------------------------- toolset
 
 
@@ -847,6 +871,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
     @staticmethod
     def _slim_offer(r: dict[str, Any]) -> dict[str, Any]:
+        known_sum = _known_work_sum(r.get("OFFER_SUM"))
         return {
             "offer_id": r.get("OFFER_ID"),
             "board": r.get("BOARD_NAME"),
@@ -860,7 +885,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "plate": r.get("CAR_NUMBER_FLAT"),
             "vin": r.get("CAR_VIN") or r.get("VIN"),
             "car_profile_id": r.get("CAR_PROFILE_ID"),
-            "sum": _money(r.get("OFFER_SUM")),
+            "sum": known_sum if known_sum is not None else 0.0,
+            "sum_known": known_sum is not None,
             "works_sum": _money(r.get("WORKS_SUM")),
             "parts_sum": _money(r.get("ORDERS_SUM")),
             "payment_status": r.get("PAYMENT_STATUS"),
@@ -1031,6 +1057,14 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         result['wrong_entity'] = sum(isinstance(v, dict) and ((v.get('ENTITY_ID') not in (None, False, '') and not _same_id(v.get('ENTITY_ID'), offer_id)) or (v.get('ENTITY_TYPE') not in (None, False, '', 'OFFER'))) for v in rub)
         return result
 
+    def offer_balance_for_list(self, offer_id: int, total: float | None) -> float | None:
+        """Только чтение баланса одной сделки; при непригодном ответе возвращается None."""
+        if total is None:
+            return None
+        balance = self._read("offer_balance", "payment/get_balance",
+                             {"ENTITY_ID": int(offer_id), "ENTITY_TYPE": "OFFER"})
+        return _offer_balance_values(balance, int(offer_id), total)[1]
+
     def offer_card(self, offer_id: int, *, with_items: bool = False) -> dict[str, Any]:
         """Карточка сделки.
 
@@ -1105,23 +1139,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 k: _money(v.get("CURRENCY_VALUE")) for k, v in balance.items() if isinstance(v, dict)
             }
         # Баланс нельзя подменять нулём при ошибке API или повреждённой сумме.
-        total = _known_work_sum(row.get("OFFER_SUM"))
-        rub = {k: v for k, v in (balance or {}).items() if str(k).startswith("RUB_")} if isinstance(balance, dict) else {}
-        amounts = [_known_work_sum(v.get("CURRENCY_VALUE")) if isinstance(v, dict) else None for v in rub.values()]
-        # Без номера и типа источника нельзя доказать, что баланс относится к этой
-        # сделке. В документированном ответе оба поля присутствуют (WIKI-A-612).
-        balance_known = bool(rub) and all(v is not None for v in amounts) and all(
-            isinstance(v, dict) and v.get("ENTITY_ID") not in (None, False, "")
-            and _same_id(v.get("ENTITY_ID"), offer_id) and v.get("ENTITY_TYPE") == "OFFER"
-            for v in rub.values()
-        )
-        if total is not None and balance_known:
-            paid = round(sum(v for v in amounts if v is not None), 2)
-            offer["paid"] = paid
-            offer["debt"] = round(max(0.0, total - paid), 2)
-            offer["overpaid"] = round(max(0.0, paid - total), 2)
-        else:
-            offer["paid"] = offer["debt"] = offer["overpaid"] = None
+        offer["paid"], offer["debt"], offer["overpaid"] = _offer_balance_values(
+            balance, offer_id, row.get("OFFER_SUM"))
         if not with_items:
             return offer
 
@@ -1133,7 +1152,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             offer["works_error"] = items["works_error"]
         if errors:
             offer["items_error"] = "; ".join(errors)
-        offer["payments"] = _payments_total({k: _money(v.get("CURRENCY_VALUE")) for k, v in rub.items()}) if balance_known else {}
+        rub = _usable_rub_balances(balance, offer_id)
+        offer["payments"] = _payments_total({k: _money(v.get("CURRENCY_VALUE")) for k, v in rub.items()}) if rub is not None else {}
         return offer
 
     # ------------------------------------------------------------------- работы
