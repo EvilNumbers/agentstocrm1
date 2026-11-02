@@ -34,7 +34,7 @@ from . import parts, profit_liga, rossko
 from .booking import BookingMixin
 from .calendar import CalendarMixin
 from .audit import AuditLog
-from .client import StocrmClient, StocrmError, _as_items, _forbidden_supplier_order
+from .client import StocrmClient, StocrmError, _as_items, _strict_items, _forbidden_supplier_order
 from .contact_search import detail_phones, name_key, phone_key, phone_matches, title_of, unique_phones
 from .draft_recovery import DraftRecoveryMixin, lock_refusal
 from .drafts import DraftStore
@@ -783,9 +783,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 raise ValueError('Неизвестный формат REQUIRED_FIELDS')
             fields = ('OFFER_ID', 'CONTACT_ID', 'BOARD_ID', 'STATUS_ID', 'CONTACT_TITLE',
                       'BOARD_NAME', 'STATUS_NAME', 'OFFER_SUM', 'WORKS_SUM', 'ORDERS_SUM', 'PAYMENT_STATUS')
-            # Только для карточек: поля автомобиля документированы в WIKI-A-593.
-            # Не меняем запросы проверки записи и статусных списков.
-            car_fields = ('CAR_TITLE_TABLE', 'CAR_NUMBER_FLAT', 'CAR_PROFILE_ID') if tool == 'offer_card' else ()
+            # Только для карточек: документированные поля и имена из журнала.
+            # Статусные списки остаются на прежнем наборе полей.
+            car_fields = ('CAR_TITLE_TABLE', 'CAR_NUMBER_FLAT', 'CAR_PROFILE_ID', 'CUSTOMER_ID',
+                          'CAR_TITLE', 'CAR_PROFILE_VIN') if tool == 'offer_card' else ()
             payload['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields, *car_fields]))
         # Динамические данные объединяются только пока HTTP в полёте (TTL=0).
         # Небольшой буфер завершённых ответов — лишь для справочников.
@@ -796,13 +797,22 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             return self._cached(key, lambda: self._read_uncached(tool, method, payload),
                                 ttl=15.0 if method in stable else 0.0)
         except StocrmError as exc:
-            if method != 'offers/get_from_filter' or tool != 'offer_card' or exc.code in (401, 403, 429):
+            if (method != 'offers/get_from_filter' or tool != 'offer_card' or exc.code in (401, 403, 429)
+                    or (isinstance(exc.code, int) and 500 <= exc.code <= 599)):
                 raise
             # Совместимость со старыми панелями: при отказе расширенного набора
             # повторяем только чтение с прежними полями, не теряя всю карточку.
             fallback = dict(payload or {})
-            fallback['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields]))
-            return self._read_uncached(tool, method, fallback)
+            # Сначала только документированные поля, затем прежний набор: панель
+            # может не принимать имена, которые наблюдались в журнале другой версии.
+            fallback['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields, 'CAR_TITLE_TABLE', 'CAR_NUMBER_FLAT', 'CAR_PROFILE_ID', 'CUSTOMER_ID']))
+            try:
+                return self._read_uncached(tool, method, fallback)
+            except StocrmError as retry_exc:
+                if retry_exc.code in (401, 403, 429) or (isinstance(retry_exc.code, int) and 500 <= retry_exc.code <= 599):
+                    raise
+                fallback['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields]))
+                return self._read_uncached(tool, method, fallback)
 
     def _read_uncached(self, tool: str, method: str, payload: dict[str, Any] | None = None, *, get: bool = False) -> Any:
         started = time.monotonic()
@@ -912,6 +922,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
     @staticmethod
     def _slim_offer(r: dict[str, Any]) -> dict[str, Any]:
         known_sum = _known_work_sum(r.get("OFFER_SUM"))
+        def consistent(*values: Any) -> tuple[str | None, bool]:
+            found = [v.strip() for v in values if isinstance(v, str) and v.strip()]
+            keys = {' '.join(v.casefold().split()) for v in found}
+            return (found[0] if len(keys) == 1 else None, len(keys) > 1)
+        car, car_conflict = consistent(r.get("CAR_TITLE_TABLE"), r.get("CAR_TITLE"))
+        vin, vin_conflict = consistent(r.get("CAR_VIN"), r.get("VIN"), r.get("CAR_PROFILE_VIN"))
         return {
             "offer_id": r.get("OFFER_ID"),
             "board": r.get("BOARD_NAME"),
@@ -920,15 +936,18 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "status_id": r.get("STATUS_ID"),
             "status_id_missing": "STATUS_ID" not in r,
             "contact_id": r.get("CONTACT_ID"),
+            "customer_id": r.get("CUSTOMER_ID"),
             "contact": r.get("CONTACT_TITLE"),
-            "car": r.get("CAR_TITLE_TABLE"),
-            "plate": r.get("CAR_NUMBER_FLAT"),
-            "vin": r.get("CAR_VIN") or r.get("VIN"),
+            "car": car,
+            "car_conflict": car_conflict,
+            "plate": None if car_conflict else r.get("CAR_NUMBER_FLAT"),
+            "vin": None if car_conflict else vin,
+            "vin_conflict": vin_conflict and not car_conflict,
             "car_profile_id": r.get("CAR_PROFILE_ID"),
             "sum": known_sum if known_sum is not None else 0.0,
             "sum_known": known_sum is not None,
-            "works_sum": _money(r.get("WORKS_SUM")),
-            "parts_sum": _money(r.get("ORDERS_SUM")),
+            "works_sum": _known_work_sum(r.get("WORKS_SUM")),
+            "parts_sum": _known_work_sum(r.get("ORDERS_SUM")),
             "payment_status": r.get("PAYMENT_STATUS"),
             "responsible": r.get("OFFER_RESPONSIBLE"),
             "created": r.get("OFFER_DATE_CREATE_FRONTEND_TIMESTAMP"),
@@ -982,28 +1001,39 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
     def _search_offer_row(self, offer_id: int) -> tuple[dict[str, Any] | None, int]:
         wanted = str(offer_id).strip()
-        rows = self._page("offer_card", "offers/get_from_filter",
-                          filters={"OFFER_ID": int(offer_id)}, limit=5)
+        raw = self._read("offer_card", "offers/get_from_filter",
+                         {"FILTER": {"OFFER_ID": int(offer_id)}, "PAGE": 1, "LIMIT": 5})
+        rows = _strict_items(raw)
         seen = len(rows)
-        for row in rows:
-            if isinstance(row, dict) and _same_id(row.get("OFFER_ID"), wanted):
-                return row, seen
+        matches = [row for row in rows if isinstance(row, dict) and _same_id(row.get("OFFER_ID"), wanted)]
+        if len(matches) > 1:
+            raise ValueError("CRM вернула несколько сделок с одним номером; данные не подтверждены")
+        if matches:
+            return matches[0], seen
         if rows:
             log.info("offer_card: фильтр по OFFER_ID не сработал (вернулось %s строк), смотрю страницы",
                      len(rows))
         page_size = min(self.page_size, 200)
+        inspected: set[str] = set()
         for page in range(1, self.max_pages + 1):
             try:
-                chunk = self._page("offer_card", "offers/get_from_filter", page=page, limit=page_size)
-            except StocrmError:
-                break
+                raw = self._read("offer_card", "offers/get_from_filter", {"PAGE": page, "LIMIT": page_size})
+                chunk = _strict_items(raw)
+            except StocrmError as exc:
+                raise ValueError("Поиск сделки не завершён из-за ошибки CRM; отсутствие не подтверждено") from exc
             seen += len(chunk)
+            if not chunk:
+                return None, seen
             for row in chunk:
-                if isinstance(row, dict) and _same_id(row.get("OFFER_ID"), wanted):
+                if not isinstance(row, dict) or row.get("OFFER_ID") in (None, False, ""):
+                    raise ValueError("Поиск сделки неполон: CRM вернула строку без номера")
+                ident = str(row['OFFER_ID'])
+                if ident in inspected:
+                    raise ValueError("Поиск сделки неполон: CRM повторила строки или страницы")
+                inspected.add(ident)
+                if _same_id(row['OFFER_ID'], wanted):
                     return row, seen
-            if len(chunk) < page_size:
-                break
-        return None, seen
+        raise ValueError("Поиск сделки неполон: достигнут предел страниц; отсутствие не подтверждено")
 
     def _search_offer_row_without_required_fields(self, offer_id: int) -> dict[str, Any] | None:
         """Дополнительное свежее чтение в формате v81; только точный уникальный номер."""
@@ -1110,7 +1140,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
     def _fill_offer_car(self, offer: dict[str, Any]) -> None:
         """Название из сделки; иначе читаем только связанный профиль по его ID."""
-        if isinstance(offer.get('car'), str) and offer['car'].strip():
+        if offer.get('car_conflict') or (isinstance(offer.get('car'), str) and offer['car'].strip()):
             return
         profile_id = offer.get('car_profile_id')
         if isinstance(profile_id, bool) or not str(profile_id or '').isdigit() or int(profile_id) <= 0:
@@ -1154,7 +1184,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 offer['car'] = title.strip()
             for field, key in (('plate', 'LICENSE_PLATE_NUMBER'), ('vin', 'VIN')):
                 value = car.get(key)
-                if not offer.get(field) and isinstance(value, str) and value.strip():
+                if not offer.get(field) and not (field == 'vin' and offer.get('vin_conflict')) and isinstance(value, str) and value.strip():
                     offer[field] = value.strip()
         except Exception as exc:  # отсутствие профиля не должно скрывать карточку
             log.warning('Не удалось прочитать профиль автомобиля: %s', type(exc).__name__)
@@ -1254,13 +1284,37 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
     # ------------------------------------------------------------------- работы
     def offer_works(self, offer_id: int, limit: int = 100) -> list[dict[str, Any]]:
         """Работы (услуги) внутри сделки с их исполнителями."""
-        raw = self._read(
-            "offer_works", "work/get_filtered",
-            {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"WORK_ID": "ASC"}, "PAGE": 1, "LIMIT": limit},
-        )
-        if raw is None or isinstance(raw, bool):
-            raise ValueError("CRM не подтвердила список работ")
-        rows = _as_items(raw.get("DATA") if isinstance(raw, dict) and "DATA" in raw else raw)
+        limit = max(1, min(int(limit), 200))
+        rows: list[Any] = []
+        seen: set[str] = set()
+        for page in range(1, 6):
+            raw = self._read("offer_works", "work/get_filtered",
+                {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"WORK_ID": "ASC"}, "PAGE": page, "LIMIT": limit})
+            if raw is None or isinstance(raw, bool) or not isinstance(raw, (dict, list)):
+                raise StocrmError("CRM не подтвердила список работ")
+            if isinstance(raw, dict) and 'DATA' in raw and not isinstance(raw['DATA'], list):
+                raise StocrmError("CRM вернула неизвестный формат работ")
+            try:
+                chunk = _strict_items(raw)
+            except ValueError as exc:
+                raise StocrmError("CRM не подтвердила формат работ") from exc
+            if any(not isinstance(r, dict) or r.get("OFFER_ID") in (None, False, "") for r in chunk):
+                raise StocrmError("CRM вернула работу без номера сделки; принадлежность не подтверждена")
+            page_keys = set()
+            for row in chunk:
+                key = ('id:' + str(row['WORK_ID']) if row.get('WORK_ID') not in (None, False, '')
+                       else 'row:' + json.dumps(row, sort_keys=True, default=str, ensure_ascii=False))
+                if key in seen or (key.startswith('id:') and key in page_keys):
+                    raise StocrmError("CRM повторяет работы или страницы; список не подтверждён")
+                page_keys.add(key)
+            seen.update(page_keys)
+            rows.extend(chunk)
+            if len(rows) > limit:
+                raise StocrmError("Список работ ограничен; есть ещё позиции")
+            if not chunk:
+                break
+        else:
+            raise StocrmError("Предел страниц работ; список не подтверждён")
         out = []
         for r in rows[:limit]:
             if not isinstance(r, dict) or r.get("OFFER_ID") in (None, False, ""):
@@ -1298,11 +1352,13 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
     # ------------------------------------------------------------------ запчасти
     def offer_parts(self, offer_id: int, limit: int = 100) -> list[dict[str, Any]]:
-        """Первые строки товаров сделки. Для подробной карточки см. ограниченный обход."""
-        raw = self._read("offer_parts", "products/get_filtered_orders",
-            {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": 1, "LIMIT": limit})
-        rows = _as_items(raw.get("DATA") if isinstance(raw, dict) and "DATA" in raw else raw)
-        return self._normalize_offer_parts(offer_id, rows[:limit])
+        """Проверенный список товаров; при неполном чтении не выдаём его за полный."""
+        rows, problem = self._offer_parts_details(offer_id)
+        if problem:
+            raise StocrmError(problem)
+        if len(rows) > limit:
+            raise StocrmError("Список товаров превышает запрошенный предел; результат неполон")
+        return rows
 
     def _offer_parts_details(self, offer_id: int) -> tuple[list[dict[str, Any]], str | None]:
         """Ограниченный обход страниц; неполный список не выдаётся за полный."""
@@ -1313,9 +1369,11 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             try:
                 raw = self._read("offer_parts", "products/get_filtered_orders",
                     {"FILTER": {"OFFER_ID": int(offer_id)}, "SORT": {"DATE_CREATE": "DESC"}, "PAGE": page, "LIMIT": page_size})
-                if raw is None or isinstance(raw, bool):
+                if raw is None or isinstance(raw, bool) or not isinstance(raw, (dict, list)):
                     raise ValueError("CRM не подтвердила список товаров")
-                rows = _as_items(raw.get("DATA") if isinstance(raw, dict) and "DATA" in raw else raw)
+                if isinstance(raw, dict) and 'DATA' in raw and not isinstance(raw['DATA'], list):
+                    raise ValueError("CRM вернула неизвестный формат товаров")
+                rows = _strict_items(raw)
                 if any(not isinstance(r, dict) for r in rows):
                     raise ValueError("CRM вернула неизвестный формат строк товара")
                 if any(r.get("OFFER_ID") in (None, False, "") for r in rows):
@@ -1333,10 +1391,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 return items, f"Не удалось полностью прочитать товары: {exc}"
             if len(items) > result_limit:
                 return items[:result_limit], f"Показаны первые {result_limit} товаров; список ограничен"
-            if len(rows) < page_size:
+            if not rows:
                 return items, None
-            if len(items) == result_limit:
-                return items, f"Показаны первые {result_limit} товаров; возможно, есть ещё"
         return items, f"Проверены первые {page_limit} страниц; список товаров может быть неполным"
 
     @staticmethod
@@ -2031,7 +2087,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if not matches:
                 names = ", ".join(
                     f"«{r.get('name')}» {_money(r.get('price')):.0f} ₽"
-                    for r in self.offer_parts(int(offer_id), limit=10)
+                    for r in self.offer_parts(int(offer_id), limit=200)[:10]
                 )
                 raise ValueError(
                     f"В сделке {offer_id} не нашёл позицию «{query or ''}». "
@@ -2255,7 +2311,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if not matches:
             names = ", ".join(
                 f"«{r.get('name')}» {_money(r.get('price')):.0f} ₽"
-                for r in self.offer_parts(offer_id, limit=10)
+                for r in self.offer_parts(offer_id, limit=200)[:10]
             )
             raise ValueError(
                 f"В сделке {offer_id} не нашёл позицию «{query or ''}». "

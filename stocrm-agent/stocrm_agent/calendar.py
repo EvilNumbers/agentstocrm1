@@ -9,16 +9,22 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .client import StocrmError, _as_items
+from .client import StocrmError, _strict_items
 
 
 def _rows(raw: Any) -> list[dict[str, Any]]:
-    if raw in (None, False):
-        return []
-    rows = _as_items(raw)
+    try:
+        rows = _strict_items(raw)
+    except ValueError as exc:
+        raise ValueError("Неизвестный формат списка STOCRM — проверка не завершена") from exc
     if any(not isinstance(r, dict) for r in rows):
-        raise ValueError("STOCRM вернул неизвестный формат календаря — запись запрещена до проверки")
+        raise ValueError("STOCRM вернул неизвестный формат списка — проверка не завершена")
     return rows
+
+
+def _calendar_rows(raw: Any) -> list[dict[str, Any]]:
+    """Пустой список подтверждён; null и неизвестные обёртки не означают пустоту."""
+    return _rows(raw)
 
 
 def _positive(value: Any, label: str) -> int:
@@ -103,14 +109,19 @@ class CalendarMixin:
 
     def _calendar_customers(self: Any) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
+        seen: set[int] = set()
         for page in range(1, 21):
-            rows = _rows(self._read("calendar_customers", "customers/get_filtered",
+            rows = _calendar_rows(self._read("calendar_customers", "customers/get_filtered",
                                    {"FILTER": {}, "SORT": {"DATE_CREATE": "ASC"}, "PAGE": page, "LIMIT": 500}))
-            result.extend({"customer_id": r.get("CUSTOMER_ID"), "name": r.get("CUSTOMER_NAME"),
-                           "timezone": r.get("TIME_ZONE"), "active": r.get("ACTIVE")}
-                          for r in rows if r.get("CUSTOMER_ID"))
-            if len(rows) < 500:
+            if not rows:
                 return result
+            for r in rows:
+                ident = _positive(r.get("CUSTOMER_ID"), "Подразделение")
+                if ident in seen:
+                    raise ValueError("CRM повторяет подразделения; список не подтверждён")
+                seen.add(ident)
+                result.append({"customer_id": ident, "name": r.get("CUSTOMER_NAME"),
+                               "timezone": r.get("TIME_ZONE"), "active": r.get("ACTIVE")})
         raise ValueError("Список подразделений неполный — уточните доступ к API")
 
     def _calendar_customer(self: Any, customer_id: int) -> dict[str, Any]:
@@ -127,7 +138,7 @@ class CalendarMixin:
 
     def _calendar_posts(self: Any, customer_id: int) -> list[dict[str, Any]]:
         ident = _positive(customer_id, "Подразделение")
-        rows = _rows(self._read("calendar_posts", "calendar/post/get", {"CUSTOMER_ID": ident}))
+        rows = _calendar_rows(self._read("calendar_posts", "calendar/post/get", {"CUSTOMER_ID": ident}))
         return [{"post_id": r.get("POST_ID"), "customer_id": r.get("CUSTOMER_ID"),
                  "name": r.get("NAME"), "active": r.get("ACTIVE"), "manager_id": r.get("MANAGER_ID")}
                 for r in rows if r.get("POST_ID") and str(r.get("CUSTOMER_ID")) == str(ident)]
@@ -141,7 +152,7 @@ class CalendarMixin:
             raise ValueError("Укажите дату календаря в формате ГГГГ-ММ-ДД") from exc
         stamp = int(dt.datetime.combine(day, dt.time(), zone).timestamp())
         raw = self._read("calendar_entries", "calendar/card/get", {"CUSTOMER_ID": int(customer_id), "DATE": stamp})
-        rows = [_entry(r, zone) for r in _rows(raw)]
+        rows = [_entry(r, zone) for r in _calendar_rows(raw)]
         if any(not r["card_id"] or not r["customer_id"] or not r["post_id"] for r in rows):
             raise ValueError("В ответе календаря нет ID записей — не могу подтвердить расписание")
         rows = [r for r in rows if r["customer_id"] == int(customer_id)
@@ -159,7 +170,7 @@ class CalendarMixin:
         raw = self._read("calendar_entry", "calendar/post/get_filtered",
                          {"FILTER": {"CUSTOMER_ID": customer_id, "CARD_ID": card_id},
                           "SORT": {"DATE_CREATE": "ASC"}, "PAGE": 1, "LIMIT": 500})
-        matching = [r for r in _rows(raw) if str(r.get("CARD_ID")) == str(card_id)
+        matching = [r for r in _calendar_rows(raw) if str(r.get("CARD_ID")) == str(card_id)
                     and str(r.get("CUSTOMER_ID")) == str(customer_id)]
         if len(matching) != 1:
             raise ValueError("Не найдена однозначная запись календаря этого подразделения — проверьте её ID")
@@ -193,18 +204,25 @@ class CalendarMixin:
                     raise ValueError(f"Время пересекается с записью календаря №{row['card_id']}. Выберите другой интервал или пост")
         return str(post["name"] or post_id)
 
+    @staticmethod
+    def _calendar_check_customer(offer: dict[str, Any], customer_id: int) -> None:
+        actual = _positive(offer.get("customer_id"), "Подразделение сделки")
+        if actual != _positive(customer_id, "Подразделение календаря"):
+            raise ValueError("Сделка относится к другому подразделению — уточните подразделение")
+
+    def _calendar_check_offer(self: Any, offer_id: int, customer_id: int) -> None:
+        row, _ = self._search_offer_row(_positive(offer_id, "Сделка"))
+        if not row or str(row.get("OFFER_ID")) != str(offer_id):
+            raise ValueError("Сделка не подтверждена CRM — укажите её настоящий номер")
+        self._calendar_check_customer(self._slim_offer(row), customer_id)
+
     def _calendar_draft(self: Any, *, customer_id: int, post_id: int, offer_id: int,
                         start: str, end: str, comment: str, card_id: int | None = None,
                         original: dict[str, Any] | None = None) -> dict[str, Any]:
         customer = self._calendar_customer(customer_id)
         zone = _zone(str(customer["timezone"]))
         offer_id = _positive(offer_id, "Сделка")
-        offer = self.offer_card(offer_id)
-        if offer.get("error") or str(offer.get("offer_id")) != str(offer_id):
-            raise ValueError("Сделка не подтверждена CRM — укажите её настоящий номер")
-        offer_customer = offer.get("customer_id")
-        if offer_customer and str(offer_customer) != str(customer_id):
-            raise ValueError("Сделка относится к другому подразделению — уточните подразделение")
+        self._calendar_check_offer(offer_id, customer_id)
         payload: dict[str, Any] = {"CUSTOMER_ID": int(customer_id), "POST_ID": _positive(post_id, "Пост"),
                    "OFFER_ID": offer_id, "DATE_FROM": _stamp(start, zone), "DATE_TO": _stamp(end, zone),
                    "COMMENT": comment}
@@ -247,6 +265,8 @@ class CalendarMixin:
     def _calendar_preflight(self: Any, check: dict[str, Any]) -> None:
         expected = check["expected"]
         card_id = expected.get("CARD_ID")
+        self._invalidate_cache()
+        self._calendar_check_offer(expected["OFFER_ID"], expected["CUSTOMER_ID"])
         if card_id and self.calendar_entry(expected["CUSTOMER_ID"], card_id) != check.get("original"):
             raise ValueError("Запись календаря изменилась после создания черновика — отмените его и подготовьте заново")
         self._calendar_validate(expected, ignore_card=card_id)

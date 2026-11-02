@@ -50,13 +50,13 @@ def test_filter_ignored_on_first_page_other_deal_found_on_second(env):
         if url.endswith('/products/get_filtered_orders'):
             session.calls.append({'method': 'products/get_filtered_orders', 'payload': json})
             page = json['PAGE']
-            rows = [row(i, 9999) for i in range(200)] if page == 1 else [row(999, 1654, 'Нужный товар')]
+            rows = [row(i, 9999) for i in range(200)] if page == 1 else ([row(999, 1654, 'Нужный товар')] if page == 2 else [])
             return MockResponse({'CODE': 200, 'RESPONSE': {'DATA': rows}})
         return original(url, json=json, timeout=timeout)
     session.post = post
     answer = send(pipe, 'подробно сделка 1654')
     assert 'Нужный товар' in answer and 'Деталь 0' not in answer
-    assert len([c for c in session.calls if c['method'] == 'products/get_filtered_orders']) == 2
+    assert len([c for c in session.calls if c['method'] == 'products/get_filtered_orders']) == 3
 
 
 def test_failed_parts_not_mistaken_for_empty(env, monkeypatch):

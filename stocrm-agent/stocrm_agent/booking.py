@@ -91,7 +91,7 @@ class BookingMixin:
                         incomplete = True
                 if phone_key(phone) in phones:
                     matches.append({"contact_id": int(ident), "title": row.get("TITLE"), "phone": row.get("MAIN_PHONE")})
-            if len(rows) < 500:
+            if not rows:
                 if incomplete and not matches:
                     raise ValueError("Не удалось проверить все дополнительные телефоны; создание нового контакта запрещено. Проверьте CRM вручную.")
                 if incomplete:
@@ -124,8 +124,8 @@ class BookingMixin:
                 if key(status) not in {"успешно реализовано", "отказ", "мусор", "возврат"}:
                     selected.append({"offer_id": ident, "status": status,
                                      "board": str(row.get("BOARD_NAME") or ""),
-                                     "car": str(row.get("CAR_TITLE_TABLE") or "")})
-            if len(rows) < 500:
+                                     "car": str(self._slim_offer(row).get("car") or "")})
+            if not rows:
                 return selected
         raise ValueError("Список сделок клиента неполный; запись остановлена")
 
@@ -457,6 +457,7 @@ class BookingMixin:
         if not isinstance(change_status, bool):
             raise ValueError("Выберите: менять статус — да или нет")
         slot, customer = self._booking_slot(args)
+        self._calendar_check_customer(offer, slot["CUSTOMER_ID"])
         statuses = [s for s in (self.statuses(board_id) if change_status else []) if str(s.get("board_id")) == str(board_id)
                     and key(s.get("title")) == "запись" and s.get("active") == "Y"]
         if change_status and len(statuses) != 1:
@@ -519,6 +520,7 @@ class BookingMixin:
         offer = self._booking_offer(check["expected"]["OFFER_ID"])
         if offer.get("error") or self._existing_booking_snapshot(offer) != check["original"]:
             raise ValueError("Сделка изменилась после подготовки (статус, воронка или контакт). Обновите черновик; ничего не записано")
+        self._calendar_check_customer(offer, check["expected"]["CUSTOMER_ID"])
         if check.get("change_status"):
             statuses = [s for s in self.statuses(check["board_id"]) if key(s.get("title")) == "запись"
                         and s.get("active") == "Y" and str(s.get("board_id")) == str(check["board_id"])]
@@ -570,6 +572,7 @@ class BookingMixin:
     def _verify_existing_booking_offer(self: Any, check: dict[str, Any]) -> None:
         self._invalidate_cache()
         offer = self._booking_offer(check["expected"]["OFFER_ID"])
+        self._calendar_check_customer(offer, check["expected"]["CUSTOMER_ID"])
         if (offer.get("error") or str(offer.get("offer_id")) != str(check["expected"]["OFFER_ID"])
                 or str(offer.get("board_id")) != str(check["board_id"])
                 or str(offer.get("contact_id")) != check["original"]["contact_id"]
@@ -593,7 +596,7 @@ class BookingMixin:
                 if ident in seen:
                     raise ValueError("CRM повторяет страницы сделок — безопасное создание остановлено")
                 seen.add(ident)
-            if len(rows) < 500:
+            if not rows:
                 return seen
         raise ValueError("Список существующих сделок неполный — создание новой остановлено")
 
@@ -644,6 +647,7 @@ class BookingMixin:
             offer = self._booking_offer(ident)
             if offer.get("error") or str(offer.get("offer_id")) != str(ident) or str(offer.get("board_id")) != str(check["board_id"]):
                 raise ValueError("Создание новой сделки не подтверждено контрольным чтением")
+            self._calendar_check_customer(offer, check["expected"]["CUSTOMER_ID"])
             contact_id = _positive(offer.get("contact_id"), "Контакт новой сделки")
             created["CONTACT_ID"] = contact_id
             if check.get("contact_id") and str(contact_id) != str(check["contact_id"]):
@@ -665,6 +669,7 @@ class BookingMixin:
                     str(offer.get("contact_id")) != str(contact_id)):
                 raise ValueError("Статус «Запись» или привязка контакта не подтверждены — календарь ещё не создавался")
             expected = {**check["expected"], "OFFER_ID": ident}
+            self._calendar_check_customer(offer, expected["CUSTOMER_ID"])
             self._calendar_validate(expected)
             self.drafts.mark(token, "applying", booking_stage="создание календаря отправляется", result=dict(created))
             response = self.client.call("calendar/card/new", expected)
