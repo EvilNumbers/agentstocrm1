@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import threading
@@ -133,6 +134,7 @@ PAYMENT_KINDS = {
     "BLACK_BANK_CARD": "карта (НФ)",
     "CASHLESS": "безнал",
     "TRANSFER": "перевод",
+    "SBP": "СБП",
 }
 
 
@@ -482,18 +484,44 @@ def _known_work_sum(value: Any) -> float | None:
     return round(number, 2) if math.isfinite(number) else None
 
 
-def _usable_rub_balances(balance: Any, offer_id: int) -> dict[str, Any] | None:
-    """Правило v80: сумма обязательна, ID и тип сверяются только если переданы.
+_UNNAMED_BALANCE_REQUIRED = frozenset({'CASH', 'BANK_CARD', 'BLACK_CASH', 'BLACK_BANK_CARD', 'CASHLESS', 'SBP'})
+_UNNAMED_BALANCE_ALLOWED = _UNNAMED_BALANCE_REQUIRED | {'TRANSFER'}
 
-    Отсутствующие ID/тип не доказывают принадлежность строк сделке; запрос
-    выполняется с её номером, но мы полагаемся на корректность ответа CRM.
+
+def _usable_rub_balances(balance: Any, offer_id: int) -> dict[str, Any] | None:
+    """v80 и подтверждённый формат без имени валюты в панели пользователя.
+
+    В формате RUB_ ID и тип как в v80 проверяются при наличии. Для формата
+    без префикса требуются все шесть наблюдавшихся строк, пустая валюта,
+    точные тип, ID и тип сущности. RUB — допущение для одновалютной панели;
+    STOCRM_BALANCE_EMPTY_CURRENCY=STRICT отключает это допущение.
     """
-    rub = {k: v for k, v in balance.items() if str(k).startswith("RUB_")} if isinstance(balance, dict) else {}
-    if not rub or any(not isinstance(v, dict) or _known_work_sum(v.get("CURRENCY_VALUE")) is None
-                      or (v.get("ENTITY_ID") not in (None, False, "") and str(v.get("ENTITY_ID")) != str(offer_id))
-                      or v.get("ENTITY_TYPE") not in (None, False, "", "OFFER") for v in rub.values()):
+    if not isinstance(balance, dict):
         return None
-    return rub
+    rub = {k: v for k, v in balance.items() if isinstance(k, str) and k.startswith('RUB_')}
+    if rub:
+        # Смешанные безвалютные и RUB-строки могут дублировать друг друга.
+        if any(k in balance for k in _UNNAMED_BALANCE_ALLOWED):
+            return None
+        if any(not isinstance(v, dict) or _known_work_sum(v.get('CURRENCY_VALUE')) is None
+               or (v.get('ENTITY_ID') not in (None, False, '') and str(v.get('ENTITY_ID')) != str(offer_id))
+               or v.get('ENTITY_TYPE') not in (None, False, '', 'OFFER') for v in rub.values()):
+            return None
+        return rub
+    if os.getenv('STOCRM_BALANCE_EMPTY_CURRENCY', 'RUB').strip().upper() != 'RUB':
+        return None
+    keys = set(balance)
+    if not _UNNAMED_BALANCE_REQUIRED <= keys or not keys <= _UNNAMED_BALANCE_ALLOWED:
+        return None
+    for key, row in balance.items():
+        if (not isinstance(row, dict) or row.get('CURRENCY_NAME') != ''
+                or row.get('CURRENCY_TYPE') != key
+                or isinstance(row.get('ENTITY_ID'), bool) or not _same_id(row.get('ENTITY_ID'), offer_id)
+                or row.get('ENTITY_TYPE') != 'OFFER'
+                or _known_work_sum(row.get('CURRENCY_VALUE')) is None):
+            return None
+    # Унифицируем ключи для корректной разбивки BLACK_CASH и остальных видов.
+    return {'RUB_' + key: row for key, row in balance.items()}
 
 
 def _offer_balance_values(balance: Any, offer_id: int, total: Any) -> tuple[float | None, float | None, float | None]:
@@ -755,14 +783,26 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 raise ValueError('Неизвестный формат REQUIRED_FIELDS')
             fields = ('OFFER_ID', 'CONTACT_ID', 'BOARD_ID', 'STATUS_ID', 'CONTACT_TITLE',
                       'BOARD_NAME', 'STATUS_NAME', 'OFFER_SUM', 'WORKS_SUM', 'ORDERS_SUM', 'PAYMENT_STATUS')
-            payload['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields]))
+            # Только для карточек: поля автомобиля документированы в WIKI-A-593.
+            # Не меняем запросы проверки записи и статусных списков.
+            car_fields = ('CAR_TITLE_TABLE', 'CAR_NUMBER_FLAT', 'CAR_PROFILE_ID') if tool == 'offer_card' else ()
+            payload['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields, *car_fields]))
         # Динамические данные объединяются только пока HTTP в полёте (TTL=0).
         # Небольшой буфер завершённых ответов — лишь для справочников.
         stable = {"boards/get_all", "offer/all_statuses", "users/get_from_filter",
                   "customers/get_filtered", "calendar/post/get"}
         key = "wire:" + method + ":" + json.dumps(payload or {}, sort_keys=True, ensure_ascii=False)
-        return self._cached(key, lambda: self._read_uncached(tool, method, payload),
-                            ttl=15.0 if method in stable else 0.0)
+        try:
+            return self._cached(key, lambda: self._read_uncached(tool, method, payload),
+                                ttl=15.0 if method in stable else 0.0)
+        except StocrmError as exc:
+            if method != 'offers/get_from_filter' or tool != 'offer_card' or exc.code in (401, 403, 429):
+                raise
+            # Совместимость со старыми панелями: при отказе расширенного набора
+            # повторяем только чтение с прежними полями, не теряя всю карточку.
+            fallback = dict(payload or {})
+            fallback['REQUIRED_FIELDS'] = list(dict.fromkeys([*required, *fields]))
+            return self._read_uncached(tool, method, fallback)
 
     def _read_uncached(self, tool: str, method: str, payload: dict[str, Any] | None = None, *, get: bool = False) -> Any:
         started = time.monotonic()
@@ -1049,7 +1089,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         if not isinstance(balance, dict):
             return result
         rub = [v for k, v in balance.items() if isinstance(k, str) and k.startswith('RUB_')]
+        result['field_count'] = len(balance)
         result['rub_count'] = len(rub)
+        result['unnamed_count'] = sum(key in balance for key in _UNNAMED_BALANCE_ALLOWED)
+        result['unnamed_usable'] = bool(not rub and _usable_rub_balances(balance, offer_id) is not None)
         result['known_wrappers'] = [key for key in ('DATA', 'ITEMS', 'BALANCE', 'BALANCES', 'RESPONSE') if key in balance]
         result['malformed_rows'] = sum(not isinstance(v, dict) for v in rub)
         result['invalid_amounts'] = sum(not isinstance(v, dict) or _known_work_sum(v.get('CURRENCY_VALUE')) is None for v in rub)
@@ -1064,6 +1107,57 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         balance = self._read("offer_balance", "payment/get_balance",
                              {"ENTITY_ID": int(offer_id), "ENTITY_TYPE": "OFFER"})
         return _offer_balance_values(balance, int(offer_id), total)[1]
+
+    def _fill_offer_car(self, offer: dict[str, Any]) -> None:
+        """Название из сделки; иначе читаем только связанный профиль по его ID."""
+        if isinstance(offer.get('car'), str) and offer['car'].strip():
+            return
+        profile_id = offer.get('car_profile_id')
+        if isinstance(profile_id, bool) or not str(profile_id or '').isdigit() or int(profile_id) <= 0:
+            return
+        try:
+            matches = []
+            # Панель может игнорировать фильтр и ограничивать размер страницы.
+            # Короткая страница не доказывает конец; подтверждаем его пустой страницей.
+            for page in range(1, 6):
+                raw = self._read('cars', 'car_profile/get_filtered_profiles',
+                                 {'FILTER': {'CAR_PROFILE_ID': int(profile_id)}, 'PAGE': page, 'LIMIT': 50})
+                if not isinstance(raw, (dict, list)):
+                    return
+                if isinstance(raw, dict):
+                    wrappers = ('DATA', 'ITEMS', 'LIST', 'ROWS')
+                    if not raw or (not any(isinstance(raw.get(k), list) for k in wrappers)
+                                   and 'CAR_PROFILE_ID' not in raw
+                                   and not all(isinstance(v, dict) for v in raw.values())):
+                        return
+                rows = _as_items(raw)
+                if not rows:
+                    break
+                if any(not isinstance(r, dict) or not r.get('CAR_PROFILE_ID') for r in rows):
+                    return
+                matches.extend(r for r in rows if isinstance(r, dict) and _same_id(r.get('CAR_PROFILE_ID'), profile_id))
+                if len(matches) > 1:
+                    return
+            else:
+                return  # конец списка или уникальность не подтверждены
+            if len(matches) != 1:
+                return
+            car = matches[0]
+            contact = offer.get('contact_id')
+            if contact in (None, False, '') or car.get('CONTACT_ID') in (None, False, '') or not _same_id(contact, car['CONTACT_ID']):
+                return
+            title = car.get('TITLE')
+            if not isinstance(title, str) or not title.strip():
+                title = ' '.join(v.strip() for v in (car.get('BRAND_NAME'), car.get('MODEL_NAME'))
+                                 if isinstance(v, str) and v.strip())
+            if isinstance(title, str) and title.strip():
+                offer['car'] = title.strip()
+            for field, key in (('plate', 'LICENSE_PLATE_NUMBER'), ('vin', 'VIN')):
+                value = car.get(key)
+                if not offer.get(field) and isinstance(value, str) and value.strip():
+                    offer[field] = value.strip()
+        except Exception as exc:  # отсутствие профиля не должно скрывать карточку
+            log.warning('Не удалось прочитать профиль автомобиля: %s', type(exc).__name__)
 
     def offer_card(self, offer_id: int, *, with_items: bool = False) -> dict[str, Any]:
         """Карточка сделки.
@@ -1132,6 +1226,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             log.warning("offer_card: запросили %s, API вернул %s", offer_id, returned)
             return {"error": f"Сделка {offer_id} не найдена (API вернул другую сделку)"}
         offer = self._slim_offer(row)
+        self._fill_offer_car(offer)
         if balance_error is not None:
             offer["balances_error"] = balance_error
         elif isinstance(balance, dict):
@@ -1141,6 +1236,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # Баланс нельзя подменять нулём при ошибке API или повреждённой сумме.
         offer["paid"], offer["debt"], offer["overpaid"] = _offer_balance_values(
             balance, offer_id, row.get("OFFER_SUM"))
+        rub = _usable_rub_balances(balance, offer_id)
+        offer["payments"] = _payments_total({k: _known_work_sum(v.get("CURRENCY_VALUE")) for k, v in rub.items()}) if rub is not None else {}
         if not with_items:
             return offer
 
@@ -1152,8 +1249,6 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             offer["works_error"] = items["works_error"]
         if errors:
             offer["items_error"] = "; ".join(errors)
-        rub = _usable_rub_balances(balance, offer_id)
-        offer["payments"] = _payments_total({k: _money(v.get("CURRENCY_VALUE")) for k, v in rub.items()}) if rub is not None else {}
         return offer
 
     # ------------------------------------------------------------------- работы
@@ -2021,16 +2116,15 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         card = self.offer_card(int(offer_id))
         if card.get("error"):
             raise ValueError(str(card["error"]))
-        totals = _payments_total(card.get("balances") or {})
-        total = _money(card.get("sum"))
-        paid = totals["total"]
+        # Используем только проверенный баланс, как карточка и список, а не
+        # сырые строки других валют или ошибку API, превращённую в ноль.
         return {
             "offer_id": int(offer_id),
-            "sum": round(total, 2),
-            "paid": round(paid, 2),
-            "debt": round(max(0.0, total - paid), 2),
-            "overpaid": round(max(0.0, paid - total), 2),
-            "by_kind": totals["by_kind"],
+            "sum": card.get("sum") if card.get("sum_known") else None,
+            "paid": card.get("paid"),
+            "debt": card.get("debt"),
+            "overpaid": card.get("overpaid"),
+            "by_kind": card.get("payments", {}).get("by_kind", {}),
             "payment_status": card.get("payment_status"),
         }
 

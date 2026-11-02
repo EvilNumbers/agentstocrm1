@@ -74,27 +74,3 @@ def with_status_colors(tools: Any, rows: list[dict[str, Any]]) -> list[dict[str,
             if len(markers) == 1 and markers[0]:
                 row['status_marker'] = markers[0]
     return result
-
-
-def append_llm_colors(answer: str, rows: list[dict[str, Any]]) -> str:
-    """Дополняет ответ модели данными только для явно названных сделок.
-
-    Не размечаем чужие числа и не красим результаты записи или старые черновики.
-    """
-    labels: dict[str, tuple[str, str] | None] = {}
-    for row in rows:
-        oid, status, marker = row.get("offer_id"), row.get("status"), row.get("status_marker")
-        if not str(oid or "").isdigit() or not status or not marker:
-            continue
-        key = str(oid)
-        label = (str(marker), str(status))
-        if key in labels and labels[key] != label:
-            labels[key] = None
-        else:
-            labels[key] = label
-    lines = []
-    for oid, value in labels.items():
-        if value and re.search(rf"(?:№|#|сделк[аиуеой]*\s*)(?:\s|\*|№|#)*{re.escape(oid)}\b", answer, re.I):
-            marker, status = value
-            lines.append(f"{marker} №{oid} — {status}")
-    return answer + "\n\nЦвета статусов по CRM (приблизительно):\n" + "\n".join(lines) if lines else answer

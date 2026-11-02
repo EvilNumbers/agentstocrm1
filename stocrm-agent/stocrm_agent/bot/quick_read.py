@@ -9,7 +9,7 @@ from typing import Any
 from ..booking import key
 from ..calendar import _positive, _rows
 from ..contact_search import phone_key, detail_phones
-from .fastpath import format_offer_items
+from .fastpath import format_offer_items, format_offer_vehicle
 from .status_view import match_name as match_view_status_name
 
 PHONE = "81111111110"
@@ -175,7 +175,7 @@ def status_detail(tools: Any, status_ids: tuple[int, int], oid: int, contact_id:
     contact = str(card.get('contact') or 'имя не получено')
     current_contact = card.get('contact_id')
     contact_note = f' · контакт №{current_contact}' if str(current_contact or '').isdigit() else ''
-    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + format_offer_items(card)
+    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + '\n'.join(format_offer_vehicle(card)) + '\n' + format_offer_items(card)
 
 
 def status_details(tools: Any, status_ids: tuple[int, int], offers: dict[int, int | None]) -> list[str]:

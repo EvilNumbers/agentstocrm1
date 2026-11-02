@@ -157,18 +157,28 @@ def format_offer_items(card: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_offer_vehicle(card: dict[str, Any]) -> list[str]:
+    """Показываем только авто из сделки или её подтверждённого профиля."""
+    def clean(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ''
+    name, plate, vin = (clean(card.get(field)) for field in ('car', 'plate', 'vin'))
+    if name:
+        line = f"🚗 Автомобиль: {name}"
+    elif plate:
+        line = "🚗 Автомобиль: название не получено"
+    else:
+        line = "🚗 Автомобиль: не указан или не получен"
+    if plate and plate.casefold() not in name.casefold():
+        line += f" · {plate}"
+    return [line] + ([f"VIN: {vin}"] if vin else [])
+
+
 def format_offer_card(card: dict[str, Any], *, detailed: bool = False) -> str:
     """Карточка сделки человеческим языком — то же, что раньше говорила модель."""
     lines = [f"📋 Сделка №{card.get('offer_id')}"]
     who = card.get("contact") or "клиент не указан"
-    line = f"Клиент: {who}"
-    if card.get("car"):
-        line += f" · {card['car']}"
-    if card.get("plate"):
-        line += f" ({card['plate']})"
-    lines.append(line)
-    if card.get("vin"):
-        lines.append(f"VIN: {card['vin']}")
+    lines.append(f"Клиент: {who}")
+    lines.extend(format_offer_vehicle(card))
     status = " · ".join(
         str(x) for x in (card.get("board"), card.get("status")) if x
     )

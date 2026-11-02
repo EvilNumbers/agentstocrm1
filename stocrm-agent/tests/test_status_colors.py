@@ -9,7 +9,7 @@ from stocrm_agent.audit import AuditLog
 from stocrm_agent.booking_dates import parse_when
 from stocrm_agent.bot.pipeline import BotPipeline
 from stocrm_agent.bot.settings import BotSettings
-from stocrm_agent.bot.status_colors import color_marker, with_status_colors, append_llm_colors
+from stocrm_agent.bot.status_colors import color_marker, with_status_colors
 from stocrm_agent.client import StocrmClient
 from stocrm_agent.drafts import DraftStore
 from stocrm_agent.mock import MockSession
@@ -91,7 +91,7 @@ def test_conflicting_colors_are_not_guessed():
     assert 'status_marker' not in with_status_colors(Stub(), [{'board_id': 1, 'status': 'Запись'}])[0]
 
 
-def test_model_tool_path_uses_current_crm_color(setup):
+def test_model_tool_path_does_not_append_duplicate_color_legend(setup):
     _, _, pipeline = setup
     pipeline.fastpath = False
     class Model:
@@ -103,15 +103,9 @@ def test_model_tool_path_uses_current_crm_color(setup):
             return {'content': 'Сделка №1654 в работе, сделка №1712 в просчёте. Сумма 1730 рублей.'}
     pipeline.llm = Model()
     response = run(pipeline, 'Какие сделки?', [])
-    assert '🟩 №1654 — В работе' in response.answer
-    assert '🟨 №1712 — Просчёт' in response.answer
+    assert 'Сделка №1654' in response.answer and 'сделка №1712' in response.answer
+    assert 'Цвета статусов по CRM' not in response.answer
     assert '№1730 —' not in response.answer
-
-
-def test_no_guess_in_model_result():
-    rows = [{'offer_id': 1234, 'status': 'Запись', 'status_marker': '🟦'}]
-    assert append_llm_colors('Сумма 1234 рублей', rows) == 'Сумма 1234 рублей'
-    assert '🟦 №1234' in append_llm_colors('Сделка №1234', rows)
 
 
 def test_time_regression():
