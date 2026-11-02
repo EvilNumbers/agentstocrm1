@@ -79,6 +79,7 @@ def parse(text: str) -> dict[str, Any]:
     articles = []
     if part_text:
         parts.check_sku_tokens(part_text)
+        part_text = parts.mark_adjacent_sku_prices(part_text)
         if re.search(r'\b(?:артикул\w*|фильтр\w*|свеч\w*|колодк\w*)\s+(?:№\s*)?\d+\s+\d+\b', part_text, re.I):
             raise ValueError('Артикул или цена разбиты на числа: назовите артикул целиком, а цену — со словом «за»')
         if re.search(r'\b(?:добав\w*|внес\w*|работ\w*|услуг\w*)\b', part_text, re.I):

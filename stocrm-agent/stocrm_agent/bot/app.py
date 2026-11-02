@@ -808,7 +808,10 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         lines = [f'Диагностика баланса сделки №{oid} (только чтение):',
                  f"Тип ответа: {diag['response_type']}"]
         if diag['response_type'] == 'object':
-            lines.extend([f"Рублёвых строк: {diag['rub_count']}",
+            lines.extend([f"Полей в ответе: {diag['field_count']}",
+                          f"Рублёвых строк: {diag['rub_count']}",
+                          f"Строк без префикса валюты: {diag['unnamed_count']}",
+                          'Безвалютный формат пригоден для расчёта: ' + ('да' if diag['unnamed_usable'] else 'нет'),
                           f"Строк неверного формата: {diag['malformed_rows']}",
                           f"Строк без корректной суммы: {diag['invalid_amounts']}",
                           f"Строк без ID или типа сущности: {diag['missing_entity']}",

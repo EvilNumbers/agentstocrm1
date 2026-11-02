@@ -20,7 +20,7 @@ from ..human import humanize_error, payload_text, polish
 from ..policy import ConfirmationPolicy
 from ..tools import Toolset
 from .fastpath import format_offer_card, format_offers_list, is_status_offers_request, try_answer
-from .status_colors import append_llm_colors, with_status_colors
+from .status_colors import with_status_colors
 from . import quick_read, quick_parse
 from .llm import LLMClient, LLMError
 from .llm_tools import (
@@ -200,6 +200,20 @@ def price_in_text(text: str) -> float | None:
     return None
 
 
+def _part_price_in_text(text: str) -> float | None:
+    """Цена позиции, включая небольшую явную сумму, но не «за 2 штуки»."""
+    price = price_in_text(text)
+    if price is not None:
+        return price
+    match = re.search(r'\b(?:цена|ценой|стоимость|за)\s*[:—-]?\s*(\d+(?:[.,]\d{1,2})?)(?![\d.,])', text or '', re.I)
+    if not match:
+        return None
+    rest = text[match.end():]
+    if not re.match(r'^(?:\s*$|\s*[,;]|\s+и\b|\s+(?:₽|руб\w*\.?)(?:\s*$|\s*[,;]|\s+и\b)|\s+\d+\s*(?:шт\.?|штук\w*|компл\.?|комплект\w*|пар[аы]?)(?![а-яё]))', rest, re.I):
+        return None
+    return parse_price(match.group(1))
+
+
 #: «2 шт», «3 штуки», «1 комплект» — количество, названное в просьбе.
 _QTY_UNIT = re.compile(
     r"(\d{1,4})\s*(?:шт\.?|штук[аи]?|штуки|компл\.?|комплект[аи]?|пар[аы]?)(?![а-яё])",
@@ -303,7 +317,7 @@ def parts_in_request(text: str) -> list[dict[str, Any]]:
     количество — наоборот. «Перед» смотрим только на 16 символов: иначе количество
     или цена соседней позиции достались бы этой.
     """
-    source = (text or "").strip()
+    source = parts.mark_adjacent_sku_prices((text or "").strip())
     if not source:
         return []
     spans = parts.sku_spans(source)
@@ -322,7 +336,7 @@ def parts_in_request(text: str) -> list[dict[str, Any]]:
         next_start = spans[index + 1][2] if index + 1 < len(spans) else len(source)
         after = source[end:next_start]
         before = source[max(prev_end, start - 16):start]
-        price = price_in_text(after)
+        price = _part_price_in_text(after)
         if price is None and index == 0:
             # Цену ПЕРЕД артикулом ищем только у первой позиции: иначе цена соседа
             # слева доставалась этой строке («… по 5200 и OP572» → OP572 за 5200).
@@ -694,7 +708,7 @@ def _single_part_in_request(text: str) -> dict[str, Any] | None:
     Нужно, чтобы такая позиция тоже попадала в общий черновик (и не ждала модель):
     человек добавляет запчасти по одной, а кнопка «Применить» должна остаться одна.
     """
-    text = _normalize_deal_slip(text or "")
+    text = parts.mark_adjacent_sku_prices(_normalize_deal_slip(text or ""))
     if _WORK_WORD.search(text) or _NOTE_WORD.search(text) or _TAG_WORD.search(text):
         return None
     spans = parts.sku_spans(text)
@@ -704,7 +718,7 @@ def _single_part_in_request(text: str) -> dict[str, Any] | None:
     if len(spans) != 1:
         return None
     raw, normalized, start, end = spans[0]
-    price = price_in_text(text[end:])
+    price = _part_price_in_text(text[end:])
     if price is None:
         price = _last_price(money_text.expand_amounts(_strip_deal(text[:start])))
     qty = _quantities_by_part(text, spans).get(0) or qty_in_text(text)
@@ -1930,7 +1944,7 @@ class BotPipeline:
         назван прямо во фразе, разбираем сами: у каждой позиции своя цена, обе строки
         готовы сразу. Подтверждение человеком остаётся — черновики те же.
         """
-        source = (text or "").strip()
+        source = parts.mark_adjacent_sku_prices((text or "").strip())
         if not source or not _ADD_VERB.search(source):
             return None
         if _TAG_WORD.search(source) or _NOTE_WORD.search(source):
@@ -3429,24 +3443,6 @@ class BotPipeline:
         if not result.drafts and not result.applied and re.search(
                 r"подготовил(?:а)? (?:добавление|черновик)|(?:заметка|работа|услуга|тег) (?:добавлен|создан|поставлен)|отменил", result.answer, re.IGNORECASE):
             result.answer = "Не могу подтвердить выполнение или отмену: инструмент не вернул подтверждённого результата. Проверьте /drafts и карточку сделки — не считайте это сообщение подтверждением записи."
-        # Списки, составленные моделью, помечаем по реальным данным текущего чтения.
-        # После записи/черновика прежний статус может быть неактуален — не размечаем.
-        if result.answer and not result.drafts and not result.applied:
-            color_rows: list[dict[str, Any]] = []
-            for key, outcome in read_results.items():
-                if key.split(":", 1)[0] not in ("find_offers", "offer_card"):
-                    continue
-                try:
-                    data = json.loads(outcome.payload)
-                except (ValueError, TypeError):
-                    continue  # обрезанный или ошибочный ответ нельзя интерпретировать
-                if isinstance(data, list):
-                    color_rows.extend(row for row in data if isinstance(row, dict))
-                elif isinstance(data, dict) and data.get("offer_id"):
-                    color_rows.append(data)
-            if color_rows:
-                colored = await asyncio.to_thread(with_status_colors, self.tools, color_rows)
-                result.answer = append_llm_colors(result.answer, colored)
         self._track_to(result, user_id)
         self._track_part(result, user_id)
         self._track_price(result, user_id)

@@ -693,6 +693,30 @@ def sku_spans(text: str) -> list[tuple[str, str, int, int]]:
     return unique
 
 
+def mark_adjacent_sku_prices(text: str) -> str:
+    """Явно отделить цену после буквенно-цифрового SKU от следующего артикула.
+
+    Только простая соседняя сумма: FK-2005 700, CR9E 1200 и т. п. Числовые
+    артикулы и числа с единицей количества остаются неоднозначными; нулевая
+    цена не подтверждается этой нормализацией. Разделители цен не угадываются.
+    """
+    source = text or ""
+    insertions = []
+    for raw, _norm, _start, end in sku_spans(source):
+        if not (re.search(r'[A-Za-zА-Яа-яЁё]', raw) and re.search(r'\d', raw)):
+            continue
+        match = re.match(r'([ \t]+)(\d+(?:[.,]\d{1,2})?)(?![\d.,])', source[end:])
+        if not match:
+            continue
+        following = source[end + match.end():]
+        if not re.match(r'^(?:\s*$|\s*[,;]|\s+и\b|\s+\d+\s*(?:шт\.?|штук\w*|компл\.?|комплект\w*|пар[аы]?)(?![а-яё]))', following, re.I):
+            continue
+        insertions.append(end + len(match.group(1)))
+    for offset in reversed(insertions):
+        source = source[:offset] + 'за ' + source[offset:]
+    return source
+
+
 def sku_in_text(text: str) -> list[str]:
     """Все похожие на артикул фрагменты в нормализованном виде: «W9142», «GDB1550»."""
     result: list[str] = []
