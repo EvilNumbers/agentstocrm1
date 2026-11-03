@@ -103,9 +103,10 @@ def test_model_tool_path_does_not_append_duplicate_color_legend(setup):
             return {'content': 'Сделка №1654 в работе, сделка №1712 в просчёте. Сумма 1730 рублей.'}
     pipeline.llm = Model()
     response = run(pipeline, 'Какие сделки?', [])
-    assert 'Сделка №1654' in response.answer and 'сделка №1712' in response.answer
+    assert '№1654' in response.answer and '№1712' in response.answer
+    assert '🟩' in response.answer and '🟨' in response.answer and 'долг:' in response.answer.lower()
     assert 'Цвета статусов по CRM' not in response.answer
-    assert '№1730 —' not in response.answer
+    assert 'Сумма 1730 рублей' not in response.answer
 
 
 def test_time_regression():

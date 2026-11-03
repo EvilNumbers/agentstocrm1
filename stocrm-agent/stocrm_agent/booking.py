@@ -122,9 +122,11 @@ class BookingMixin:
                 if not status:
                     raise ValueError("CRM не вернула название статуса сделки; выбор остановлен")
                 if key(status) not in {"успешно реализовано", "отказ", "мусор", "возврат"}:
+                    slim = self._slim_offer(row)
                     selected.append({"offer_id": ident, "status": status,
                                      "board": str(row.get("BOARD_NAME") or ""),
-                                     "car": str(self._slim_offer(row).get("car") or "")})
+                                     "board_id": slim.get("board_id"), "sum": slim.get("sum"),
+                                     "sum_known": slim.get("sum_known"), "car": str(slim.get("car") or "")})
             if not rows:
                 return selected
         raise ValueError("Список сделок клиента неполный; запись остановлена")
@@ -208,8 +210,17 @@ class BookingMixin:
             args.pop("change_status", None)
             args.pop("reason_id", None)
             args["_offered_active_ids"] = ids
+            from .bot.fastpath import with_offer_balances, _money
+            from .bot.status_colors import with_status_colors
+            active = with_status_colors(self, with_offer_balances(self, active))
             options = [{"value": "new", "label": "Создать новую сделку"}]
-            options.extend({"value": str(o["offer_id"]), "label": f"Сделка №{o['offer_id']} · {o['status']}" + (f" · {o['car']}" if o['car'] else "") + (f" · {o['board']}" if o['board'] else "")} for o in active)
+            options.extend({"value": str(o["offer_id"]), "label":
+                            (f"{o['status_marker']} " if o.get('status_marker') else "") +
+                            f"Сделка №{o['offer_id']} · {o['status']}" +
+                            (" (цвет статуса не определён)" if o.get('status_color_unknown') else "") +
+                            (f" · {o['car']}" if o['car'] else "") + (f" · {o['board']}" if o['board'] else "") +
+                            (f" · долг {_money(o['debt'])} ₽" if o.get('debt') is not None else " · долг не проверен")}
+                           for o in active)
             question = "У этого клиента есть активные сделки. Создать новую или выбрать существующую?\n" + "\n".join(f"{i}. {o['label']}" for i, o in enumerate(options, 1))
             raise BookingNeeds(question, "offer_choice", args, options)
         if not active and choice is None:

@@ -3511,6 +3511,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             method="offer/status/change",
             payload=payload,
             summary=summary,
+            extra={"status_safety_v129": {"offer_id": int(offer_id), "board_id": int(board_id), "status_id": int(status_id)}},
         )
 
     def _status_info(self, board_id: int, status_id: int) -> tuple[str, list[dict[str, Any]]]:
@@ -3520,10 +3521,14 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         except StocrmError as exc:
             log.warning("не смог прочитать статусы воронки %s: %s", board_id, exc)
             return "", []
-        for row in rows:
-            if _same_id(row.get("status_id"), status_id):
-                return str(row.get("title") or ""), list(row.get("reasons") or [])
-        return "", []
+        matches = [row for row in rows if _same_id(row.get("status_id"), status_id)]
+        if len(matches) != 1:
+            return "", []
+        row = matches[0]
+        # Даже если API проигнорировал фильтр воронки, чужой статус не подтверждаем.
+        if row.get("board_id") not in (None, "") and not _same_id(row["board_id"], board_id):
+            return "", []
+        return str(row.get("title") or ""), list(row.get("reasons") or [])
 
     def draft_update_offer_field(self, *, offer_id: int, field: str, value: str) -> dict[str, Any]:
         allowed = {
@@ -4660,6 +4665,13 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 self._invalidate_cache()
                 if self._booking_contacts(str(check.get("phone") or "")):
                     raise ValueError("Контакт с этим телефоном появился в CRM после подготовки. Создание остановлено.")
+        if current and current.get("status") == "pending" and (current.get("tool") == "change_status" or current.get("method") == "offer/status/change"):
+            safety = current.get("status_safety_v129") or {}
+            payload = current.get("payload") or {}
+            if (not isinstance(safety, dict) or current.get("steps") or
+                    any(str(safety.get(k)) != str(payload.get(p)) or safety.get(k) in (None, False, "")
+                        for k, p in (("offer_id", "OFFER_ID"), ("board_id", "BOARD_ID"), ("status_id", "STATUS_ID")))):
+                raise ValueError("Старый или неподтверждённый черновик статуса заблокирован. Если запись точно не отправлялась, отмените его и подготовьте заново с номером сделки; partial не повторяйте.")
         if current and current.get("batch_preparing"):
             raise ValueError("Заявка ещё собирается или сборка прервана; применять отдельные позиции нельзя. Отмените незавершённый черновик через /drafts.")
         if current and current.get("queue_parent"):

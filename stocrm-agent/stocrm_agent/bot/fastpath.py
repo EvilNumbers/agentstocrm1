@@ -29,7 +29,7 @@ from .status_colors import with_status_colors
 #: Слова, при которых быстрый путь НЕ вмешивается: это уже действие или сценарий.
 _ACTION_WORDS = (
     "собер", "собери", "добав", "измен", "помен", "поставь", "созда", "назнач",
-    "удал", "привяж", "привяз", "перевед", "запиш", "заметк", "задач", "цен",
+    "удал", "привяж", "привяз", "перевед", "перемест", "запиш", "заметк", "задач", "цен",
     "масл", "фильтр", "исполнител", "позвони", "отправ", "подтверд", "примен",
     "отмен", "статус", "закрой", "открой заявк",
 )
@@ -190,7 +190,8 @@ def format_offer_card(card: dict[str, Any], *, detailed: bool = False) -> str:
     )
     if status:
         marker = card.get("status_marker")
-        lines.append(f"Воронка и статус: {marker + ' ' if marker else ''}{status}")
+        lines.append(f"Воронка и статус: {marker + ' ' if marker else ''}{status}" +
+                     (" (цвет статуса не определён)" if card.get('status_color_unknown') else ""))
     sums = (f"Сумма: {_money(card.get('sum'))} ₽" if card.get('sum_known', card.get('sum') is not None)
             else "Сумма: не получена")
     parts_sum = card.get("parts_sum")
@@ -237,24 +238,41 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
             head += f" {row['contact']}"
         if row.get("car"):
             head += f" · {row['car']}"
-        if "debt" in row:
-            if row.get('sum_known'):
-                head += f" — сумма {_money_exact(row.get('sum'))} ₽"
-            else:
-                head += " — сумма не получена"
-            debt = row.get('debt')
-            if debt is None:
-                head += " · долг: не удалось проверить"
-            else:
-                head += f" · долг: {_money_exact(debt)} ₽"
+        if row.get('sum_known', row.get('sum') is not None):
+            head += f" — сумма {_money_exact(row.get('sum'))} ₽"
         else:
-            head += f" — {_money(row.get('sum'))} ₽" if row.get('sum_known', row.get('sum') is not None) else " — сумма не получена"
+            head += " — сумма не получена"
+        debt = row.get('debt')
+        head += f" · долг: {_money_exact(debt)} ₽" if debt is not None else " · долг: не удалось проверить"
         if row.get("status"):
             head += f", {row['status']}"
+            if row.get('status_color_unknown'):
+                head += " (цвет статуса не определён)"
         lines.append(head)
     lines.append("")
     lines.append("Скажите номер в списке («3 подробнее») — открою сделку.")
     return "\n".join(lines)
+
+
+def with_offer_balances(tools: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Каждой показанной сделке — собственный баланс; ошибка не означает 0."""
+    from ..client import read_budget
+
+    def one(row: dict[str, Any]) -> dict[str, Any]:
+        debt = None
+        if row.get('sum_known') is True:
+            try:
+                oid = row.get('offer_id')
+                if not isinstance(oid, bool) and str(oid).isdigit() and int(oid) > 0:
+                    debt = tools.offer_balance_for_list(int(oid), row.get('sum'))
+            except Exception as exc:
+                log.warning('Не удалось проверить баланс сделки: %s', type(exc).__name__)
+        return {**row, 'debt': debt}
+
+    with read_budget(12.0):
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix='list-balance') as pool:
+            return [future.result() for future in
+                    [pool.submit(copy_context().run, one, row) for row in rows]]
 
 
 # Только самостоятельная просьба о списке: не перехватываем изменения или другие
@@ -310,7 +328,7 @@ _STATUS_MARKERS = re.compile(
     r"\b(?:ожидают|ожидающие)\s+оплаты\b", re.I)
 _LIST_SUBJECT = re.compile(r"\b(?:сделки|сделок|заказы|заказов|наряды|заказ-наряды)\b", re.I)
 _WRITE_ACTION = re.compile(r"\b(?:добав\w*|созда\w*|измен\w*|помен\w*|удал\w*|перевед\w*|"
-                           r"перевод\w*|смени\w*|назнач\w*|запиш\w*|записать|собери\w*|собрать|отмен\w*)\b", re.I)
+                           r"перевод\w*|перемест\w*|перенес\w*|перенёс\w*|смени\w*|назнач\w*|запиш\w*|записать|собери\w*|собрать|отмен\w*|поставь\w*|отправ\w*|закрой\w*|закрыть|примен\w*|убер\w*|привяж\w*|подтверд\w*)\b", re.I)
 _READ_START = re.compile(r"^\s*(?:покажи|покажите|найди|найдите|дай|дайте|какие|что|сколько|список|выведи|выведите|сделки|сделок|заказы|собранные)\b", re.I)
 # Неизвестные состояния тоже не превращаем в список активных. Исключаем
 # формулировки с воронкой и названиями месяцев/относительными датами.
@@ -329,6 +347,15 @@ def _status_request(text: str) -> dict[str, str | None] | None:
     message = (text or "").strip()
     if not message or message.startswith("/"):
         return None
+    bare = _norm_status(message.rstrip('.!?'))
+    bare_kinds = {
+        'просчет': 'estimate', 'проценка': 'estimate',
+        'просчет запчастей': 'estimate_parts', 'проценка запчастей': 'estimate_parts',
+        'запись': 'record', 'заказ': 'order', 'заказ собран': 'assembled',
+        'ожидает оплаты': 'waiting_payment', 'в работе': 'working',
+    }
+    if bare in bare_kinds:
+        return {'kind': bare_kinds[bare], 'board': None}
     working = _working_request(message)
     if working:
         return {"kind": "working", "board": working.group("board")}
@@ -466,22 +493,10 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             label = f"«{status['title']}» · воронка «{board['name']}»"
             if not valid:
                 return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
-            # Только для «Ожидает оплаты»: отдельно читаем баланс каждой
-            # найденной сделки. Сумма сделки и долг — разные значения.
-            if _norm_status(status.get('title')) in _STATUS_TITLES['waiting_payment']:
-                def with_debt(row: dict[str, Any]) -> dict[str, Any]:
-                    debt = None
-                    if row.get('sum_known') is True:
-                        try:
-                            debt = tools.offer_balance_for_list(int(row['offer_id']), row.get('sum'))
-                        except Exception as exc:  # одна ошибка не скрывает остальные сделки
-                            log.warning('Не удалось проверить баланс сделки: %s', type(exc).__name__)
-                    return {**row, 'debt': debt}
-                with ThreadPoolExecutor(max_workers=4, thread_name_prefix='status-balance') as pool:
-                    valid = [f.result() for f in [pool.submit(copy_context().run, with_debt, row) for row in valid]]
+            valid = with_offer_balances(tools, valid)
             from .status_colors import color_marker
             marker = color_marker(status.get('front_color'))
-            result = format_offers_list([{**row, 'status_marker': marker} for row in valid])
+            result = format_offers_list([{**row, 'status_marker': marker, 'status_color_unknown': not bool(marker)} for row in valid])
             result = result.replace(f"📋 Последние сделки ({len(valid)}):", f"📋 Сделки в статусе {label}:", 1)
             return result + qualifier, [int(r["offer_id"]) for r in valid]
     except Exception as exc:
@@ -534,7 +549,7 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
             return None
         offers = rows or []
         ids = [int(row["offer_id"]) for row in offers if row.get("offer_id")]
-        answer = format_offers_list(with_status_colors(tools, offers))
+        answer = format_offers_list(with_status_colors(tools, with_offer_balances(tools, offers)))
         return (answer, ids) if answer else None
 
     # 2) карточка конкретной сделки
@@ -553,6 +568,6 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
         card = tools.offer_card(offer_id, with_items=detailed)
     except Exception:          # noqa: BLE001
         return None
-    if not isinstance(card, dict) or card.get("error") or not card.get("offer_id"):
-        return None            # пусть обычный путь объяснит, почему не нашлась
+    if not isinstance(card, dict) or card.get("error") or str(card.get("offer_id")) != str(offer_id):
+        return None            # чужую или неподтверждённую карточку не показываем
     return format_offer_card(with_status_colors(tools, [card])[0], detailed=detailed), [offer_id]

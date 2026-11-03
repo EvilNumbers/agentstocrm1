@@ -50,7 +50,7 @@ def test_plain_work_list_returns_only_confirmed_status(env, message):
     assert 'воронка «Автосервис»' in result.answer and not result.drafts and not result.applied
     reads = [c for c in session.calls if c['method'] == 'offers/get_from_filter']
     assert reads and reads[-1]['payload']['FILTER'] == {'BOARD_ID': 2}
-    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
+    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter', 'payment/get_balance'} for c in session.calls)
 
 
 def test_full_service_status_has_priority_over_generic_name(env):

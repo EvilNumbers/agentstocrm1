@@ -116,7 +116,8 @@ def test_other_statuses_and_incomplete_warning_remain_unchanged(env, monkeypatch
     session, tools, pipe = env
     answer = send(pipe, 'покажи сделки в записи').answer
     assert '№1328' in answer and 'сверены по названию' not in answer
-    assert not any(c['method'] == 'payment/get_balance' for c in session.calls)
+    assert any(c['method'] == 'payment/get_balance' for c in session.calls)
+    assert 'долг:' in answer.lower()
     monkeypatch.setattr(tools, 'find_offers', lambda **kw: [dict(offer_id=1001, board_id=2, status='Запись'),
         dict(offer_id=1002, board_id=None, status='Запись')])
     answer, ids = try_answer('покажи сделки в записи', tools)
