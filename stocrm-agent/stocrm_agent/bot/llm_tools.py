@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .. import parts
-from ..booking import BookingNeeds
+from ..booking import BookingNeeds, key
 from ..client import StocrmError
 from ..policy import ConfirmationPolicy
 from ..tools import DEFAULT_MAINTENANCE_BRAND, SupplierNeeds, Toolset
@@ -362,10 +362,13 @@ class ToolRouter:
     _batched_skus = _request_hint("_batched_skus")
     deal_hint = _request_hint("deal_hint")
     deal_explicit = _request_hint("deal_explicit")
+    status_authorized = _request_hint("status_authorized")
+    status_target_name = _request_hint("status_target_name")
+    reference_authorized = _request_hint("reference_authorized")
 
     def begin_request(self) -> Any:
         return self._request_context.set({"price_hint": None, "qty_hint": None, "parts_hint": [], "part_resolutions": {},
-                                          "_batched_skus": set(), "deal_hint": None, "deal_explicit": False})
+                                          "_batched_skus": set(), "deal_hint": None, "deal_explicit": False, "status_authorized": None, "status_target_name": None, "reference_authorized": None})
 
     def end_request(self, token: Any) -> None:
         self._fallback_hints = dict(self._request_context.get() or self._fallback_hints)
@@ -574,6 +577,29 @@ class ToolRouter:
 
         clean_args = {k: v for k, v in (arguments or {}).items() if v not in (None, "")}
 
+        if name == "draft_change_status":
+            authorized = self.status_authorized
+            if isinstance(authorized, bool) or not isinstance(authorized, int) or authorized <= 0:
+                message = "Для смены статуса укажите номер одной сделки прямо в сообщении."
+                return ToolOutcome(payload=json.dumps({"error": message}, ensure_ascii=False), meta={"status_target_blocked": message})
+            # Модель может назвать чужие сделку, воронку или статус.
+            try:
+                self.tools._invalidate_cache()
+                offer = self.tools._booking_offer(authorized)
+                board = offer.get('board_id')
+                if offer.get('error') or str(offer.get('offer_id')) != str(authorized) or isinstance(board, bool) or not str(board or '').isdigit() or int(board) <= 0:
+                    raise ValueError("не подтверждена сделка или её воронка")
+                if clean_args.get('board_id') is not None and str(clean_args['board_id']) != str(board):
+                    raise ValueError("воронка из запроса модели не совпала со сделкой")
+                clean_args['offer_id'], clean_args['board_id'] = authorized, int(board)
+                if self.status_target_name:
+                    title, _ = self.tools._status_info(int(board), int(clean_args['status_id']))
+                    if key(title) != key(self.status_target_name):
+                        raise ValueError("статус модели не совпал с названным человеком")
+            except Exception:
+                message = "Не удалось подтвердить сделку, её воронку или запрошенный статус; уточните данные в CRM."
+                return ToolOutcome(payload=json.dumps({"error": message}, ensure_ascii=False), meta={"status_target_blocked": message})
+
         if name == PART_TOOL:
             clean_args.pop("allow_zero_price", None)  # модель не может подтверждать 0 за человека
             if _confirmed_zero and clean_args.get("price") == 0:
@@ -593,6 +619,12 @@ class ToolRouter:
         if name == MAINTENANCE_TOOL:
             return self.maintenance(clean_args)
 
+        if name == "find_offers":
+            try:
+                clean_args['limit'] = max(1, min(25, int(clean_args.get('limit', 25))))
+            except (TypeError, ValueError, OverflowError):
+                clean_args['limit'] = 25
+
         if name == "offer_card" and "with_items" not in clean_args:
             # «что в сделке» — человек ждёт товары, услуги и оплаты, а не только сумму
             clean_args["with_items"] = True
@@ -600,6 +632,11 @@ class ToolRouter:
         handler: Callable[..., Any] | None = getattr(self.tools, name, None)
         if handler is None:
             return ToolOutcome(payload=json.dumps({"error": f"инструмент {name} не реализован"}, ensure_ascii=False))
+
+        # Ссылку «эта сделка» разрешает только проверенный контекст показа,
+        # а не аргумент, который могла выдумать модель.
+        if name.startswith('draft_') and self.reference_authorized and 'offer_id' in inspect.signature(handler).parameters:
+            clean_args['offer_id'] = self.reference_authorized
 
         # --- исполнитель: если не назван или назван неоднозначно, сначала спрашиваем человека
         if name in EXECUTOR_FIELD:
@@ -700,7 +737,12 @@ class ToolRouter:
             payload = json.dumps(result, ensure_ascii=False, default=str)
             if len(payload) > self.max_payload_chars:
                 payload = payload[: self.max_payload_chars] + "… (данные обрезаны, уточните фильтры)"
-            return ToolOutcome(payload=payload)
+            outcome = ToolOutcome(payload=payload)
+            if name == "find_offers" and isinstance(result, list):
+                outcome.meta['offer_rows'] = result
+            if name == "offer_card" and isinstance(result, dict) and not result.get('error'):
+                outcome.meta['offer_card'] = result
+            return outcome
 
         draft = result
         extra_drafts, extra_notes, extra_pending = self._build_extra_parts(clean_args, extra_parts)

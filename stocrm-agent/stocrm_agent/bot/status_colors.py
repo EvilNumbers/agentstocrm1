@@ -49,6 +49,7 @@ def with_status_colors(tools: Any, rows: list[dict[str, Any]]) -> list[dict[str,
     with read_budget(4.0):
         for row in result:
             row.pop("status_marker", None)
+            row['status_color_unknown'] = True
             try:
                 board_id = int(str(row.get("board_id")))
                 if board_id <= 0:
@@ -73,4 +74,5 @@ def with_status_colors(tools: Any, rows: list[dict[str, Any]]) -> list[dict[str,
             markers = boards[board_id].get(key(name), [])
             if len(markers) == 1 and markers[0]:
                 row['status_marker'] = markers[0]
+                row.pop('status_color_unknown', None)
     return result

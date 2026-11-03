@@ -19,7 +19,7 @@ from ..client import StocrmError, read_budget
 from ..human import humanize_error, payload_text, polish
 from ..policy import ConfirmationPolicy
 from ..tools import Toolset
-from .fastpath import format_offer_card, format_offers_list, is_status_offers_request, try_answer
+from .fastpath import format_offer_card, format_offers_list, is_status_offers_request, try_answer, with_offer_balances, _WRITE_ACTION
 from .status_colors import with_status_colors
 from . import quick_read, quick_parse
 from .llm import LLMClient, LLMError
@@ -950,6 +950,8 @@ class PipelineResult:
     part_notes: list[str] = field(default_factory=list)   # что из просьбы не удалось добавить
     error: str | None = None
     structured_offer_details: bool = False
+    # Только номера, действительно показанные из проверенных данных, в порядке вывода.
+    shown_offers: list[int] | None = None
 
 
 class BotPipeline:
@@ -981,6 +983,8 @@ class BotPipeline:
         #: «внеси предоплату 500» без номера: деньги относятся к той сделке, которую
         #: он только что видел, а не к числу из фразы.
         self._last_offer: dict[int, int] = {}
+        # Отдельно от модели и старого контекста: только показанные CRM-карточки.
+        self._last_shown_offer: dict[int, int] = {}
         # незакрытые вопросы сценария ТО (бренд фильтров, масло):
         # user_id → {"choice": ..., "at": время}. Через 30 минут вопрос считается
         # забытым: иначе случайное короткое сообщение через день ушло бы «в масло».
@@ -1653,6 +1657,17 @@ class BotPipeline:
         return result
 
     # ------------------------------------------------------------------ текст
+    def _remember_shown_offers(self, user_id: int | None, ids: list[int] | None) -> None:
+        if ids is None:
+            return
+        ident = user_id or 0
+        if ids and not isinstance(ids[-1], bool) and str(ids[-1]).isdigit() and int(ids[-1]) > 0:
+            self._last_shown_offer[ident] = int(ids[-1])
+            self._last_offer[ident] = int(ids[-1])
+        else:
+            self._last_shown_offer.pop(ident, None)
+            self._last_offer.pop(ident, None)
+
     def _remember_list(self, user_id: int | None, answer: str) -> None:
         """Запоминает номера сделок из ответа — чтобы «3 подробнее» работало без гадания.
 
@@ -2645,11 +2660,13 @@ class BotPipeline:
             self._contact_lookups.pop(ident, None)
             if len(rows) == 1:
                 card = self.tools.offer_card(int(rows[0]["offer_id"]))
-                if card.get("error"):
-                    return PipelineResult(answer=str(card["error"]))
-                return PipelineResult(answer=format_offer_card(with_status_colors(self.tools, [card])[0]))
+                if (card.get("error") or str(card.get('offer_id')) != str(rows[0]['offer_id'])
+                        or str(card.get('contact_id')) != str(contact['contact_id'])):
+                    return PipelineResult(answer="Не удалось подтвердить карточку сделки клиента. Укажите номер сделки для точной проверки.", shown_offers=[])
+                return PipelineResult(answer=format_offer_card(with_status_colors(self.tools, [card])[0]), shown_offers=[int(card['offer_id'])])
             if rows:
-                return PipelineResult(answer=format_offers_list(with_status_colors(self.tools, rows)))
+                return PipelineResult(answer=format_offers_list(with_status_colors(self.tools, with_offer_balances(self.tools, rows))),
+                                      shown_offers=[int(r['offer_id']) for r in rows])
             return PipelineResult(answer=f"Клиент {contact.get('title') or 'без имени'} найден (контакт №{contact['contact_id']}), но CRM не вернула его сделки в полученной выборке. Укажите номер сделки для точной проверки.")
         except Exception as exc:  # noqa: BLE001 — ошибка поиска не означает отсутствие клиента
             self._contact_lookups[ident] = {"at": time.time(), "candidates": []}
@@ -2781,7 +2798,7 @@ class BotPipeline:
                 message = 'В полученной выборке нет подтверждённых сделок в статусе «Быстрые сделки».'
                 if incomplete:
                     message += ' ⚠️ Список неполон: принадлежность некоторых сделок не удалось проверить.'
-                return PipelineResult(answer=message)
+                return PipelineResult(answer=message, shown_offers=[])
             shown = list(rows)[:10]
             details = quick_read.status_details(self.tools, status_ids, {oid: rows[oid] for oid in shown})
             note = (f"\n\nПоказаны 10 из {len(rows)} подтверждённых; остальные не показаны." if len(rows) > 10 else '')
@@ -2791,9 +2808,10 @@ class BotPipeline:
                       "contacts": {oid: rows[oid] for oid in shown}, "offers": shown,
                       "question": 'Сделки в статусе «Быстрые сделки» (все контакты):\n\n' + "\n\n".join(details) + note}
             self._quick_choices[user_id] = choice
-            return PipelineResult(choices=[choice])
+            confirmed_last = bool(details and details[-1].startswith(f"📋 Быстрая сделка №{shown[-1]}\n"))
+            return PipelineResult(choices=[choice], shown_offers=shown if confirmed_last else [])
         except Exception as exc:
-            return PipelineResult(answer=f"Не удалось подтвердить быстрые сделки: {exc}. Ничего не записано.")
+            return PipelineResult(answer=f"Не удалось подтвердить быстрые сделки: {exc}. Ничего не записано.", shown_offers=[])
 
     def _quick_continue(self, plan: dict[str, Any], user_id: int) -> PipelineResult:
         from ..quick_deal import prepare, status_reasons
@@ -2880,7 +2898,8 @@ class BotPipeline:
             choice = {"kind": "quick_select", "owner": user_id, "ids": ids, "offers": shown,
                       "snapshot": sorted(rows), "allow_new": allow_new, "plan": plan, "question": question}
             self._quick_choices[user_id] = choice
-            return PipelineResult(choices=[choice])
+            confirmed_last = bool(descriptions and descriptions[-1].startswith(f"📋 Быстрая сделка №{shown[-1]}\n"))
+            return PipelineResult(choices=[choice], shown_offers=shown if confirmed_last else [])
         except Exception as exc:
             return PipelineResult(answer=f"Не удалось подготовить составную запись: {exc}. Ничего не записано.")
 
@@ -2946,7 +2965,9 @@ class BotPipeline:
                 if status_ids[0] != choice.get('status_ids', (None,))[0]:
                     raise ValueError('Воронка статуса изменилась; повторите список')
                 oid = choice['offers'][index]
-                return PipelineResult(answer=quick_read.status_detail(self.tools, status_ids, oid), structured_offer_details=True)
+                body = quick_read.status_detail(self.tools, status_ids, oid)
+                self._remember_shown_offers(user_id, [oid])
+                return PipelineResult(answer=body, structured_offer_details=True, shown_offers=[oid])
             if choice.get("kind") == "quick_reason":
                 from ..quick_deal import status_reasons
                 ids = quick_read.identity(self.tools)
@@ -2968,8 +2989,12 @@ class BotPipeline:
                 self._part_batch[user_id] = {"token": draft["token"], "at": time.time()}
                 return PipelineResult(answer="Проверьте состав и подтвердите одним нажатием. До подтверждения ничего не записано.", drafts=[draft])
             oid = choice["offers"][index]
-            return PipelineResult(answer=quick_read.detail(self.tools, ids, oid), structured_offer_details=True)
+            body = quick_read.detail(self.tools, ids, oid)
+            self._remember_shown_offers(user_id, [oid])
+            return PipelineResult(answer=body, structured_offer_details=True, shown_offers=[oid])
         except Exception as exc:
+            if choice.get('kind') == 'quick_read':
+                self._remember_shown_offers(user_id, [])
             return PipelineResult(answer=f"Не удалось подтвердить сделку: {exc}. Ничего не записано.")
 
     async def handle_text(self, text: str, history: list[dict[str, Any]],
@@ -2992,6 +3017,14 @@ class BotPipeline:
                 self.tools.audit.write("bot.request.start", input_chars=len(text), category=category)
                 try:
                     result = await self._handle_text(text, history, user_id)
+                    self._remember_shown_offers(user_id, result.shown_offers)
+                    if result.pending_booking and result.pending_booking.get('field') == 'offer_choice':
+                        options = result.pending_booking.get('options') or []
+                        shown = [int(o['value']) for o in options if isinstance(o, dict)
+                                 and str(o.get('value', '')).isdigit() and int(o['value']) > 0
+                                 and re.search(r'Сделка\s*№\s*' + re.escape(str(o['value'])) + r'\b', str(o.get('label') or ''), re.I)]
+                        if shown:
+                            self._remember_shown_offers(user_id, shown)
                     self.tools.audit.write("bot.request.finish", ms=round((time.monotonic()-started)*1000), draft_count=len(result.drafts), choice_count=len(result.choices), applied_count=len(result.applied), outcome="error" if result.error else "reply", category=category)
                     for draft in result.drafts:
                         if isinstance(draft, dict) and draft.get('token'):
@@ -3034,7 +3067,29 @@ class BotPipeline:
                 action = 'yes' if answer == 'да' else 'no'
                 return await self._price_button(f"__price_button__:{choice['_price_nonce']}:{action}", user_id)
         text = _normalize_deal_slip(text)
-        if quick_read.is_quick_request(text):
+        reference_pattern = re.compile(r"\b(?:эта|эту|этой|данную|данная|данной|текущую|текущая|текущей)\s+(?:быстр\w+\s+)?сделк\w*\b", re.I)
+        reference_match = reference_pattern.search(text)
+        explicit_number = money_text.deal_in_text(text)
+        if reference_match and not explicit_number:
+            shown = self._last_shown_offer.get(user_id or 0)
+            if not shown:
+                return PipelineResult(answer="Не удалось определить последнюю показанную сделку. Откройте её карточку или укажите номер; ничего не записано.")
+            self.router.reference_authorized = shown
+            self._last_offer[user_id or 0] = shown
+            text = reference_pattern.sub(lambda m: f"{m.group(0)} №{shown}", text, count=1)
+        # Явный номер имеет приоритет; «эта сделка» — последняя действительно
+        # показанная CRM-сделка этого сотрудника, а не номер, придуманный моделью.
+        status_action = bool(re.search(r"\b(?:перемест\w*|перевед\w*|перевести|поменя\w*|смени\w*|сменить|измен\w*|отправ\w*|убер\w*|закро\w*)\b", text, re.I)
+                             and re.search(r"\b(?:статус\w*|мусор\w*|отказ\w*|запис\w*|воронк\w*|работ\w*|заказ\w*|просч[её]т\w*|проценк\w*)\b", text, re.I))
+        named = {int(m.group(1)) for m in money_text.DEAL_NUMBER.finditer(text)}
+        numbers = {int(n) for n in re.findall(r"(?<!\d)\d+(?!\d)", text)}
+        is_this_deal = bool(re.search(r"\b(?:эта|эту|этой|данную|данная|данной|текущую|текущая|текущей)\s+(?:быстр\w+\s+)?сделк\w*\b", text, re.I))
+        self.router.status_authorized = (next(iter(named)) if status_action and len(named) == 1 and named == numbers
+                                         else self._last_shown_offer.get(user_id or 0) if status_action and is_this_deal and not numbers else None)
+        self.router.status_target_name = 'мусор' if status_action and re.search(r"\bмусор\w*\b", text, re.I) else None
+        if status_action and self.router.status_authorized is None:
+            return PipelineResult(answer="Не удалось определить сделку. Откройте её карточку или укажите номер одной сделки в сообщении; ничего не записано.")
+        if quick_read.is_quick_request(text) and not status_action:
             self._quick_pending.pop(user_id or 0, None)
             return await asyncio.to_thread(self._quick_read, text, user_id or 0)
         # Статусный список никогда не отдаём предыдущим незавершённым сценариям
@@ -3047,7 +3102,7 @@ class BotPipeline:
             self._remember_list(user_id, body)
             history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': body}])
             del history[:max(0, len(history) - self.s.max_history_messages)]
-            return PipelineResult(answer=body)
+            return PipelineResult(answer=body, shown_offers=answer[1] if answer else [])
         if _ADD_VERB.search(text):
             try:
                 parts.check_sku_tokens(text)
@@ -3226,7 +3281,8 @@ class BotPipeline:
                 history.append({"role": "user", "content": text})
                 history.append({"role": "assistant", "content": answer})
                 del history[: max(0, len(history) - self.s.max_history_messages)]
-                return PipelineResult(answer=answer, structured_offer_details=(
+                shown = _ids if answer.startswith(("📋 Сделка №", "📋 Последние сделки")) else None
+                return PipelineResult(answer=answer, shown_offers=shown, structured_offer_details=(
                     answer.startswith("📋 Сделка №") and "🧩 Товары" in answer))
 
         # Пока модель читает просьбу и «думает», карточка названной сделки уже
@@ -3240,6 +3296,7 @@ class BotPipeline:
         ]
         result = PipelineResult()
         repeated: dict[str, int] = {}
+        status_attempted = False
         read_results: dict[str, ToolOutcome] = {}
         max_calls = max(12, self.s.llm_max_steps * 3)
 
@@ -3334,6 +3391,14 @@ class BotPipeline:
                     read_results[key] = outcome
 
             for call, name, args in prepared:
+                # Одна команда пользователя — не более одной попытки смены статуса,
+                # даже если модель повторила вызов с другими аргументами.
+                if name == 'draft_change_status':
+                    if status_attempted:
+                        messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "name": name,
+                                         "content": json.dumps({"error": "Повторная смена статуса в этой просьбе запрещена; проверьте первый результат."}, ensure_ascii=False)})
+                        continue
+                    status_attempted = True
                 # Один и тот же вызов повторять бессмысленно: результат уже есть выше.
                 # Без этого модель крутилась по кругу до «Не успел разобраться».
                 signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
@@ -3359,6 +3424,9 @@ class BotPipeline:
                         outcome = ToolOutcome(payload=json.dumps({"error": str(exc)},
                                                                  ensure_ascii=False))
                 result.tool_calls.append(name)
+                if outcome.meta.get("status_target_blocked"):
+                    result.answer = str(outcome.meta['status_target_blocked']) + " Ничего не записано."
+                    return result
                 if outcome.draft is not None:
                     result.drafts.append(outcome.draft)
                 result.drafts.extend(outcome.extra_drafts)
@@ -3436,6 +3504,44 @@ class BotPipeline:
             if missing:
                 extra = "Не удалось добавить: " + "; ".join(missing)
                 result.answer = f"{result.answer}\n\n{extra}".strip() if result.answer else extra
+
+        # Модель не должна пересказывать список сделок, теряя долг или цвет.
+        # Используем только структурированный результат единственного чтения; если
+        # чтений несколько, просим уточнить вместо объединения разных фильтров.
+        if (not result.drafts and not result.applied and not result.choices and not result.pending_booking
+                and not result.pending_price and not _WRITE_ACTION.search(text)
+                and (re.search(r"\b(?:сделки|сделок|заказы|заказов|наряды)\b", text, re.I)
+                     or len(re.findall(r"(?:№|#)\s*\d+", result.answer or '')) >= 2)):
+            offer_reads = [outcome.meta['offer_rows'] for key, outcome in read_results.items()
+                           if key.startswith('find_offers:') and 'offer_rows' in outcome.meta]
+            if len(offer_reads) == 1:
+                rows = offer_reads[0][:25]
+                if rows:
+                    colored = await asyncio.to_thread(with_status_colors, self.tools,
+                                 await asyncio.to_thread(with_offer_balances, self.tools, rows))
+                    result.answer = format_offers_list(colored).replace('📋 Последние сделки', '📋 Полученная выборка сделок', 1)
+                    result.answer += "\n⚠️ Показаны не более 25 сделок из полученной выборки; список может быть неполным."
+                    last_id = rows[-1].get('offer_id')
+                    result.shown_offers = [int(last_id)] if str(last_id or '').isdigit() and int(last_id) > 0 else []
+                else:
+                    result.answer = "В полученной выборке сделок нет. Полнота поиска не подтверждена."
+                    result.shown_offers = []
+            elif len(offer_reads) > 1:
+                result.answer = "Не удалось однозначно объединить разные выборки сделок. Уточните один запрос."
+                result.shown_offers = []
+            elif re.search(r"(?:№|#)\s*\d+", result.answer or ''):
+                result.answer = "Не удалось подтвердить список сделок данными CRM. Уточните запрос или проверьте CRM."
+                result.shown_offers = []
+
+        if (result.shown_offers is None and not result.drafts and not result.applied
+                and not result.choices and not result.pending_booking and not result.pending_price):
+            displayed = re.findall(r"(?:№|#)\s*(\d+)\b|\bсделк(?:а|у|е|и|ой)\s+(\d+)\b", result.answer or '', re.I)
+            displayed = [number or plain for number, plain in displayed]
+            cards = [outcome.meta['offer_card'] for k, outcome in read_results.items()
+                     if k.startswith('offer_card:') and 'offer_card' in outcome.meta]
+            if displayed:
+                valid_ids = {str(card.get('offer_id')) for card in cards if isinstance(card, dict)}
+                result.shown_offers = [int(displayed[-1])] if displayed[-1] in valid_ids else []
 
         # Последнее слово не отдаём модели, если факты инструмента ей противоречат.
         if any(a.get("warning") for a in result.applied):

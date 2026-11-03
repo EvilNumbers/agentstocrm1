@@ -11,6 +11,7 @@ from ..calendar import _positive, _rows
 from ..contact_search import phone_key, detail_phones
 from .fastpath import format_offer_items, format_offer_vehicle
 from .status_view import match_name as match_view_status_name
+from .status_colors import with_status_colors
 
 PHONE = "81111111110"
 NAME = "1111 быстрые сделки"
@@ -175,7 +176,13 @@ def status_detail(tools: Any, status_ids: tuple[int, int], oid: int, contact_id:
     contact = str(card.get('contact') or 'имя не получено')
     current_contact = card.get('contact_id')
     contact_note = f' · контакт №{current_contact}' if str(current_contact or '').isdigit() else ''
-    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + '\n'.join(format_offer_vehicle(card)) + '\n' + format_offer_items(card)
+    marked = with_status_colors(tools, [card])[0]
+    marker = (marked.get('status_marker') or '') + (' ' if marked.get('status_marker') else '')
+    status = f"Воронка и статус: {marker}{card.get('board') or ''} · {card.get('status') or ''}"
+    if marked.get('status_color_unknown'):
+        status += " (цвет статуса не определён)"
+    status += "\n"
+    return f'📋 Быстрая сделка №{oid}\nКлиент: {contact}{contact_note}\n' + '\n'.join(format_offer_vehicle(card)) + '\n' + status + format_offer_items(card)
 
 
 def status_details(tools: Any, status_ids: tuple[int, int], offers: dict[int, int | None]) -> list[str]:

@@ -57,7 +57,7 @@ def test_status_lists_are_not_interchangeable(env, message, expected, status_id,
     call = next(c for c in session.calls if c['method'] == 'offers/get_from_filter')
     assert call['payload']['FILTER'] == {'BOARD_ID': 2}
     assert not result.drafts and not result.applied
-    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
+    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter', 'payment/get_balance'} for c in session.calls)
 
 
 def test_service_status_still_resolved_before_others(env):
@@ -162,7 +162,7 @@ def test_no_match_clears_previous_list_and_does_not_write(env):
     session.data['offers/get_from_filter'] = [x for x in session.data['offers/get_from_filter'] if x['STATUS_ID'] != 42]
     assert 'не найдено подтверждённых' in send(pipe, 'Покажи сделки в заказе', history).answer
     assert 19 not in pipe._lists
-    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter'} for c in session.calls)
+    assert all(c['method'] in {'boards/get_all', 'offer/all_statuses', 'offers/get_from_filter', 'payment/get_balance'} for c in session.calls)
 
 
 @pytest.mark.parametrize('message', ['Переведи сделку 1327 в заказ', 'Создай заказ', 'Собери заказ 1327',
