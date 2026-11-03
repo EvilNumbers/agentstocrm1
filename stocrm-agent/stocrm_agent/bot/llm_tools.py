@@ -569,6 +569,13 @@ class ToolRouter:
     def execute(self, name: str, arguments: dict[str, Any], *, _confirmed_zero: bool = False) -> ToolOutcome:
         from ..diagnostics import safe_record
         self.tools.audit.write("bot.tool.request", tool=name, payload=safe_record(arguments))
+        try:
+            diagnostic = getattr(self.tools.client, 'diagnostic', None)
+            known = {entry.get('function', {}).get('name') for entry in TOOL_SPEC}
+            if diagnostic is not None and name in known:
+                diagnostic.emit('bot.tool.detail', tool=name, request=arguments)
+        except Exception:
+            pass
         if name == "draft_create_calendar_entry":
             # Старое имя из истории модели не должно обходить вопрос о статусе.
             name = "draft_book_existing_offer"

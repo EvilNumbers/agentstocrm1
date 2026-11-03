@@ -105,7 +105,7 @@ def test_ambiguous_status_numbers_never_write(env):
     session, _, pipe = env
     send(pipe, 'покажи сделку 1654')
     status_model(session, pipe)
-    result = send(pipe, 'перемести эту сделку как сделку 1320 и сделку 1712 в мусор')
+    result = send(pipe, 'перемести эту сделку как сделку 71120 и сделку 1712 в мусор')
     assert not result.applied and not result.drafts and not writes(session)
 
 

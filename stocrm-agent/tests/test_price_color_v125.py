@@ -10,14 +10,14 @@ from test_quick_deal_v100 import env, existing, send, writes  # noqa: F401
 @pytest.mark.parametrize('amount,expected', [('700', 700), ('1200', 1200), ('700,50', 700.5), ('5', 5)])
 def test_screenshot_quick_command_keeps_work_and_article_prices(env, amount, expected):
     session, _, pipe = env
-    result = send(pipe, f'Добавь быструю сделку диагностика 950 и артикул fk-2005 {amount}')
+    result = send(pipe, f'Добавь быструю сделку диагностика 950 и артикул xt-9988 {amount}')
     assert not result.drafts and not writes(session)
     assert 'бренд' in result.answer.lower(), result.answer
     result = send(pipe, 'ZEKKERT')
     assert len(result.drafts) == 1 and not writes(session), result.answer
     payload = result.drafts[0]['payload']
     assert payload['work']['price'] == 950
-    assert payload['articles'][0]['sku'] == 'FK-2005'
+    assert payload['articles'][0]['sku'] == 'XT-9988'
     assert payload['articles'][0]['price'] == expected
     assert payload['articles'][0]['brand'] == 'ZEKKERT'
 

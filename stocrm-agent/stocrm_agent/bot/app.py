@@ -227,6 +227,25 @@ def quick_choice_keyboard(token: str, choice: dict[str, Any]) -> InlineKeyboardM
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+OFFER_CHOICES_PER_PAGE = 6
+
+
+def offer_list_keyboard(token: str, offers: list[int], *, page: int = 0) -> InlineKeyboardMarkup:
+    pages = max(1, (len(offers) + OFFER_CHOICES_PER_PAGE - 1) // OFFER_CHOICES_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    start = page * OFFER_CHOICES_PER_PAGE
+    rows = [[InlineKeyboardButton(text=f"📋 {i + 1}. Сделка №{oid}", callback_data=f"ol:{token}:s:{i}")]
+            for i, oid in enumerate(offers[start:start + OFFER_CHOICES_PER_PAGE], start)]
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text="← Назад", callback_data=f"ol:{token}:p:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="Дальше →", callback_data=f"ol:{token}:p:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 CHOICES_PER_PAGE = 6
 
 
@@ -740,9 +759,12 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         text_out = polish(raw_out, limit=max(3800, len(raw_out) + 1),
                           preserve_numbered=result.structured_offer_details)
         pieces = chunk(text_out)
-        await message.answer(pieces[0], reply_markup=drafts_keyboard(result.drafts))
-        for extra in pieces[1:]:
-            await message.answer(extra)
+        list_keyboard = None
+        if result.offer_choice:
+            list_keyboard = offer_list_keyboard(remember_choice(result.offer_choice), result.offer_choice['offers'])
+        for index, piece in enumerate(pieces):
+            keyboard = list_keyboard if index == len(pieces) - 1 and list_keyboard else (drafts_keyboard(result.drafts) if index == 0 else None)
+            await message.answer(piece, reply_markup=keyboard)
 
     def is_admin(user: User | None) -> bool:
         """Администратор — из .env или назначенный через меню /users."""
@@ -1205,6 +1227,42 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         if await _pending_access_add(message, actor_of(message.from_user)):
             return
         await message.answer("Пришлите голосовое сообщение, аудиофайл или текст.")
+
+    @router.callback_query(F.data.startswith("ol:"))
+    async def on_offer_list_choice(callback: CallbackQuery) -> None:
+        bits = (callback.data or '').split(':')
+        entry = pending_choices.get(bits[1]) if len(bits) == 4 else None
+        choice = (entry or {}).get('choice') or {}
+        user_id = callback.from_user.id
+        if (not entry or choice.get('kind') != 'offer_list' or choice.get('owner') != user_id
+                or pipeline._offer_choices.get(user_id) is not choice
+                or time.time() - entry['created_at'] > 1800):
+            await callback.answer('Список устарел или принадлежит другому сотруднику.', show_alert=True)
+            return
+        if bits[2] not in ('p', 's') or not bits[3].isdigit():
+            await callback.answer('Некорректная кнопка', show_alert=True)
+            return
+        index = int(bits[3])
+        offers = choice.get('offers') or []
+        if bits[2] == 'p':
+            if index >= max(1, (len(offers) + OFFER_CHOICES_PER_PAGE - 1) // OFFER_CHOICES_PER_PAGE):
+                await callback.answer('Страница устарела', show_alert=True)
+                return
+            if callback.message is not None:
+                await callback.message.edit_reply_markup(reply_markup=offer_list_keyboard(bits[1], offers, page=index))
+            await callback.answer()
+            return
+        if index >= len(offers):
+            await callback.answer('Некорректная сделка', show_alert=True)
+            return
+        pending_choices.pop(bits[1], None)
+        await callback.answer()
+        result = await asyncio.to_thread(pipeline.offer_list_choice, choice, user_id, index)
+        if isinstance(callback.message, Message):
+            with contextlib.suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            for piece in chunk(result.answer or 'Не удалось открыть сделку.'):
+                await callback.message.answer(piece)
 
     @router.callback_query(F.data.startswith("quick:"))
     async def on_quick_choice(callback: CallbackQuery) -> None:
