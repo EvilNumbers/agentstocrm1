@@ -152,7 +152,21 @@ class CalendarMixin:
             raise ValueError("Укажите дату календаря в формате ГГГГ-ММ-ДД") from exc
         stamp = int(dt.datetime.combine(day, dt.time(), zone).timestamp())
         raw = self._read("calendar_entries", "calendar/card/get", {"CUSTOMER_ID": int(customer_id), "DATE": stamp})
-        rows = [_entry(r, zone) for r in _calendar_rows(raw)]
+        raw_rows = _calendar_rows(raw)
+        rows = [_entry(r, zone) for r in raw_rows]
+        # Поля панели из календаря — только для просмотра, без дополнительной
+        # загрузки карточек сделок и без подстановки неизвестных данных.
+        for source, row in zip(raw_rows, rows):
+            note = source.get('COMMENT')
+            note_data = note if isinstance(note, dict) else {}
+            comment = note_data.get('comment') if note_data else note
+            row['comment'] = str(comment).strip() if isinstance(comment, str) else ''
+            profile = source.get('CLIENT_PROFILE') if isinstance(source.get('CLIENT_PROFILE'), dict) else {}
+            car = source.get('CAR_PROFILE') if isinstance(source.get('CAR_PROFILE'), dict) else {}
+            name = profile.get('TITLE') or note_data.get('fullName')
+            auto = car.get('CAR_TITLE') or note_data.get('brandAuto')
+            row['client_name'] = name.strip() if isinstance(name, str) else ''
+            row['car_title'] = auto.strip() if isinstance(auto, str) else ''
         if any(not r["card_id"] or not r["customer_id"] or not r["post_id"] for r in rows):
             raise ValueError("В ответе календаря нет ID записей — не могу подтвердить расписание")
         rows = [r for r in rows if r["customer_id"] == int(customer_id)

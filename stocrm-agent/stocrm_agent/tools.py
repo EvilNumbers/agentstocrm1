@@ -1130,13 +1130,64 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         result['wrong_entity'] = sum(isinstance(v, dict) and ((v.get('ENTITY_ID') not in (None, False, '') and not _same_id(v.get('ENTITY_ID'), offer_id)) or (v.get('ENTITY_TYPE') not in (None, False, '', 'OFFER'))) for v in rub)
         return result
 
+    @staticmethod
+    def _balance_diagnostic_reason(balance: Any, offer_id: int, total: Any, debt: float | None) -> str:
+        if debt is not None:
+            return 'rub_prefixed' if isinstance(balance, dict) and any(str(k).startswith('RUB_') for k in balance) else 'empty_currency_rub'
+        if _known_work_sum(total) is None:
+            return 'sum_missing'
+        if not isinstance(balance, dict):
+            return 'invalid_shape'
+        rub = {k: v for k, v in balance.items() if isinstance(k, str) and k.startswith('RUB_')}
+        if rub:
+            if any(k in balance for k in _UNNAMED_BALANCE_ALLOWED):
+                return 'mixed_currency'
+            for row in rub.values():
+                if not isinstance(row, dict):
+                    return 'invalid_row'
+                if row.get('ENTITY_ID') not in (None, False, '') and str(row['ENTITY_ID']) != str(offer_id):
+                    return 'entity_mismatch'
+                if row.get('ENTITY_TYPE') not in (None, False, '', 'OFFER'):
+                    return 'entity_mismatch'
+                if _known_work_sum(row.get('CURRENCY_VALUE')) is None:
+                    return 'invalid_value'
+            return 'rub_invalid'
+        if os.getenv('STOCRM_BALANCE_EMPTY_CURRENCY', 'RUB').strip().upper() != 'RUB':
+            return 'currency_strict'
+        if not _UNNAMED_BALANCE_REQUIRED <= set(balance):
+            return 'missing_fields'
+        if not set(balance) <= _UNNAMED_BALANCE_ALLOWED:
+            return 'extra_fields'
+        for key, row in balance.items():
+            if not isinstance(row, dict):
+                return 'invalid_row'
+            if row.get('CURRENCY_NAME') != '':
+                return 'currency_name'
+            if row.get('CURRENCY_TYPE') != key:
+                return 'payment_type'
+            if isinstance(row.get('ENTITY_ID'), bool) or not _same_id(row.get('ENTITY_ID'), offer_id) or row.get('ENTITY_TYPE') != 'OFFER':
+                return 'entity_mismatch'
+            if _known_work_sum(row.get('CURRENCY_VALUE')) is None:
+                return 'invalid_value'
+        return 'invalid_row'
+
     def offer_balance_for_list(self, offer_id: int, total: float | None) -> float | None:
         """Только чтение баланса одной сделки; при непригодном ответе возвращается None."""
         if total is None:
             return None
         balance = self._read("offer_balance", "payment/get_balance",
                              {"ENTITY_ID": int(offer_id), "ENTITY_TYPE": "OFFER"})
-        return _offer_balance_values(balance, int(offer_id), total)[1]
+        debt = _offer_balance_values(balance, int(offer_id), total)[1]
+        try:
+            diagnostic = getattr(self.client, 'diagnostic', None)
+            if diagnostic is not None:
+                diagnostic.emit('balance.validate', offer_id=int(offer_id),
+                                rows=len(balance) if isinstance(balance, dict) else 0,
+                                reason=self._balance_diagnostic_reason(balance, int(offer_id), total, debt),
+                                status='ok' if debt is not None else 'failed')
+        except Exception:
+            pass
+        return debt
 
     def _fill_offer_car(self, offer: dict[str, Any]) -> None:
         """Название из сделки; иначе читаем только связанный профиль по его ID."""

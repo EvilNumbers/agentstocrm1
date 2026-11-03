@@ -27,27 +27,35 @@ from .diagnostics import TRACE_ID
 
 FILE_NAME = 'support-diagnostic.txt'
 LEGACY_FILE_NAME = 'support-diagnostic.jsonl'
-MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_FILE_BYTES = 10 * 1024 * 1024
 BACKUPS = 9
-MAX_LINE_BYTES = 64 * 1024
+MAX_LINE_BYTES = 2 * 1024 * 1024
 _FIELDS = frozenset({
     'OFFER_ID', 'WORK_ID', 'ORDER_ID', 'REQUIRE_ID', 'BOARD_ID', 'STATUS_ID',
     'CONTACT_ID', 'STATUS_NAME', 'TITLE', 'DOCUMENT_TITLE', 'DESCRIPTION', 'NAME', 'SKU', 'BRAND',
     'PRICE', 'SUM', 'PRICE_OF_HOUR', 'WORKING_HOUR', 'AMOUNT', 'CURRENT_VOLUME', 'QUANTITY_CURRENT', 'QUANTITY', 'NEED_MARKUP',
     'PAGE', 'LIMIT', 'COUNT', 'CODE', 'ACTIVE', 'TYPE', 'DATA', 'ITEMS', 'LIST', 'ROWS', 'WORKS',
     'WORK', 'ORDERS', 'RESPONSE', 'FILTER', 'SORT', 'REQUIRED_FIELDS', 'FORMATTED_STOCK',
+    'OFFER_STATUS_ID', 'OFFER_SUM', 'WORKS_SUM', 'ORDERS_SUM', 'PAYMENT_STATUS',
+    'ENTITY_ID', 'ENTITY_TYPE', 'CURRENCY_VALUE', 'CURRENCY_NAME', 'CURRENCY_TYPE',
+    'TOTAL_COUNT', 'CALC_ROWS_NOT_AVAILABLE_FOR_CURRENT_LIMIT', 'CUSTOMER_ID', 'POST_ID', 'CARD_ID', 'CAR_PROFILE_ID',
+    'RUB_CASH', 'RUB_BANK_CARD', 'RUB_BLACK_CASH', 'RUB_BLACK_BANK_CARD', 'RUB_CASHLESS', 'RUB_SBP', 'RUB_TRANSFER',
+    'CASH', 'BANK_CARD', 'BLACK_CASH', 'BLACK_BANK_CARD', 'CASHLESS', 'SBP', 'TRANSFER',
 })
 _NUMERIC = frozenset({'OFFER_ID', 'WORK_ID', 'ORDER_ID', 'REQUIRE_ID', 'BOARD_ID', 'STATUS_ID',
                       'PRICE', 'SUM', 'PRICE_OF_HOUR', 'WORKING_HOUR', 'AMOUNT', 'CURRENT_VOLUME', 'QUANTITY_CURRENT', 'QUANTITY',
-                      'PAGE', 'LIMIT', 'COUNT', 'CODE'})
+                      'PAGE', 'LIMIT', 'COUNT', 'CODE', 'OFFER_STATUS_ID', 'OFFER_SUM', 'WORKS_SUM', 'ORDERS_SUM',
+                      'ENTITY_ID', 'CURRENCY_VALUE', 'TOTAL_COUNT', 'CUSTOMER_ID', 'POST_ID', 'CARD_ID', 'CAR_PROFILE_ID'})
 _FINGERPRINTED = frozenset({'STATUS_NAME', 'TITLE', 'DOCUMENT_TITLE', 'DESCRIPTION', 'NAME', 'SKU', 'BRAND'})
 _SCALARS = frozenset({'ms', 'rows', 'wave', 'pid', 'input_chars', 'draft_count', 'choice_count',
                       'applied_count', 'step_index', 'failed_index', 'position_index', 'http_status',
                       'response_bytes', 'offer_id', 'OFFER_ID', 'REQUIRE_ID', 'ORDER_ID', 'WORK_ID',
                       'page', 'limit', 'attempt', 'code', 'completed_count', 'file_size', 'before_count', 'after_count',
-                      'added_count', 'removed_count', 'problem_count'})
+                      'added_count', 'removed_count', 'problem_count', 'budget_ms', 'budget_after_ms',
+                      'matched_count', 'seen_count', 'verified_count', 'failed_count', 'unknown_count',
+                      'duplicate_count', 'filtered_count', 'board_id', 'status_id', 'wait_ms', 'retry_count'})
 _SAFE_STRINGS = frozenset({'status', 'outcome', 'phase', 'category', 'kind', 'severity', 'verb',
-                           'error_kind', 'error_class', 'cause_class', 'method', 'tool', 'source'})
+                           'error_kind', 'error_class', 'cause_class', 'method', 'tool', 'source', 'reason'})
 _TRACE = re.compile(r'^(?:req|apply)_[0-9a-f]{12}$')
 _SESSION = re.compile(r'^[0-9a-f]{16}$')
 _HASH = re.compile(r'^[0-9a-f]{12}$')
@@ -65,7 +73,7 @@ tags/unlink tags/unlink_link task/create task/get_filtered task/mark_member_as_r
 wms/get_filtered_stocks wms/get_supplier_ids wms/get_warehouses wms/product_cards/get_filtered wms/warehouses/get_filtered
 work/add work/get_filtered""".split())
 _EVENTS = frozenset("""bot.access bot.access_view bot.apply bot.auto_apply bot.discard bot.draft bot.drop_position
-bot.lifecycle.start bot.lifecycle.stop bot.part.needs_supplier bot.policy bot.quick_manual_review bot.request.cancelled
+bot.lifecycle.start bot.lifecycle.stop bot.tool.detail bot.tool.result status.list.page status.list.search balance.list.item balance.list.finish balance.validate bot.part.needs_supplier bot.policy bot.quick_manual_review bot.request.cancelled
 bot.request.error bot.request.finish bot.request.start bot.tool.error bot.tool.request bot.voice.start bot.voice.finish bot.voice.error
 read read.error runtime.warning runtime.start runtime.start_error runtime.stop runtime.poll_error crm.call.start crm.call.finish crm.call.error crm.http crm.http.request crm.http.error_body crm.response.invalid
 quick.draft quick.stage quick.check quick.partial quick.success write.applied write.applied_after_break write.broken write.confirmed_by_uid
@@ -74,7 +82,14 @@ write.request write.step.finish write.step.start write.uncertain.readback write.
 _TOOLS = frozenset("""quick_deal quick_offers quick_status_offers quick_work_snapshot offer_card offer_works offer_parts
 quick_prior_offers quick_contacts booking_existing_offers find_offers boards statuses add_offer_part add_offer_work
 book_existing_offer book_new_offer create_offer create_contact change_status calendar search_parts resolve_part
-find_contacts offer_balance quick_contact_phones _apply_draft _handle_text handle_text main""".split())
+find_contacts offer_balance quick_contact_phones _apply_draft _handle_text handle_text main
+calendar_customers draft_book_existing_offer draft_book_new_offer calendar_posts calendar_entries calendar_entry
+draft_create_calendar_entry draft_edit_calendar_entry offer_contact_phones offer_history offer_requires cars
+draft_update_contact draft_update_car draft_add_maintenance find_part_online suppliers contact_card stock users tasks
+cashflow balances tags offer_tags tag_links offer_notes makers_report draft_create_offer draft_change_status
+draft_update_offer_field draft_create_contact draft_create_task draft_add_offer_work draft_change_part_price
+draft_remove_offer_part draft_add_offer_part draft_assign_task_responsible draft_add_offer_note draft_update_offer_note
+draft_add_tag draft_remove_tag""".split())
 _ERROR_CLASSES = frozenset("""StocrmError ValueError KeyError TypeError OSError TimeoutError Timeout HTTPError
 ConnectionError ReadTimeout ConnectTimeout RequestException RuntimeError CancelledError TelegramNetworkError
 TelegramUnauthorizedError JSONDecodeError AttributeError AssertionError PermissionError FileNotFoundError SystemExit STTError""".split())
@@ -88,7 +103,7 @@ def _method(value: Any) -> str:
 
 
 _REDACTED = '[СКРЫТО]'
-_DETAIL_EVENTS = frozenset({'crm.http.request', 'crm.http', 'crm.http.error_body', 'crm.response.invalid'})
+_DETAIL_EVENTS = frozenset({'crm.http.request', 'crm.http', 'crm.http.error_body', 'crm.response.invalid', 'bot.tool.detail', 'bot.tool.result'})
 _SECRET_ASSIGNMENT = re.compile(
     r"(?is)([\"']?(?:sid|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|passwd|secret|token|cookie)[\"']?\s*[:=]\s*)([\"'])(.*?)(\2)")
 _SECRET_BARE = re.compile(
@@ -100,6 +115,9 @@ _COMMON_TOKENS = re.compile(r'\b(?:\d{6,}:[A-Za-z0-9_-]{20,}|(?:sk|pk|ghp|github
 
 def _sensitive_key(value: Any) -> bool:
     original = str(value).casefold()
+    # STATUS_ID заканчивается на «sid» после нормализации, но не является SID-секретом.
+    if original in {'status_id', 'offer_status_id'}:
+        return False
     key = re.sub(r'[^a-z0-9]+', '', original)
     if re.search(r'(?:^|[^a-z0-9])(?:sid|api[_-]?key|access[_-]?token|password|passwd|secret|token|authorization|cookie)(?:$|[^a-z0-9])', original):
         return True
@@ -129,7 +147,8 @@ def redact_detail(value: Any, known_secrets: set[str] | None = None) -> tuple[An
     результат и любой файл перед отправкой нужно проверить вручную.
     """
     known = sorted({x for x in (known_secrets or set()) if isinstance(x, str) and x}, key=len, reverse=True)
-    budget = [9000, 600]
+    # Большие ответы списков сохраняем подробнее, сохраняя жёсткий предел памяти.
+    budget = [180000, 24000]
     truncated = [False]
 
     def clean_text(text: str, limit: int = 4000) -> str:
@@ -191,7 +210,14 @@ def redact_detail(value: Any, known_secrets: set[str] | None = None) -> tuple[An
                     break
                 name = clean_text(str(field), 120)
                 budget[0] -= len(name) + 8
-                result[name] = _REDACTED if _sensitive_key(field) else walk(item, depth + 1)
+                # Исключение для ID статуса не должно раскрывать произвольный текст вместо ID.
+                status_id = str(field).casefold() in {'status_id', 'offer_status_id'}
+                status_valid = (item is None or item is False or
+                                (not isinstance(item, bool) and re.fullmatch(r'\d{1,15}', str(item)) is not None))
+                if status_id and not status_valid:
+                    result[name] = '[некорректный ID скрыт]'
+                else:
+                    result[name] = _REDACTED if _sensitive_key(field) else walk(item, depth + 1)
             return result
         truncated[0] = True
         return '[неподдерживаемый тип]'
@@ -231,7 +257,7 @@ def _number(value: Any) -> int | float | None:
     return value
 
 
-def shape(value: Any, key: bytes, *, limit: int = 400) -> dict[str, Any]:
+def shape(value: Any, key: bytes, *, limit: int = 4000) -> dict[str, Any]:
     """Имена известных полей, типы, счётчики и обезличенные отпечатки; без текстов."""
     fields: dict[str, dict[str, Any]] = {}
     count = 0
@@ -289,6 +315,14 @@ def _safe_str(name: str, value: Any) -> str | None:
         return None
     if name == 'method':
         return _method(value)
+    if name == 'reason':
+        allowed = {'ok', 'sum_missing', 'invalid_offer_id', 'balance_unusable', 'read_error',
+                   'invalid_shape', 'currency_strict', 'missing_fields', 'extra_fields',
+                   'invalid_row', 'rub_invalid', 'rub_prefixed', 'empty_currency_rub', 'mixed_currency',
+                   'entity_mismatch', 'invalid_value', 'currency_name', 'payment_type',
+                   'lookup_error', 'board_missing', 'status_unverified', 'status_missing', 'ambiguous_status',
+                   'page_error', 'repeated_page', 'row_limit', 'empty_page', 'page_limit'}
+        return value if value in allowed else 'other'
     if name == 'error_kind':
         return value if value in {'locked', 'timeout', 'ambiguous', 'incomplete', 'mismatch', 'missing', 'network', 'other'} else 'other'
     if name == 'tool':
@@ -306,7 +340,8 @@ def _safe_str(name: str, value: Any) -> str | None:
                    'warning', 'info', 'critical', 'post', 'get', 'new', 'existing',
                    'create_sent', 'created', 'status_sent', 'status_confirmed', 'status_response', 'work_sent', 'work_check',
                    'work_confirmed', 'work_before', 'require_sent', 'require_received', 'require_confirmed', 'order_sent',
-                   'order_check', 'order_confirmed', 'prepare', 'start', 'finish', 'empty', 'failed', 'html', 'server_error', 'unstructured'}
+                   'order_check', 'order_confirmed', 'prepare', 'start', 'finish', 'empty', 'failed', 'html', 'server_error', 'unstructured',
+                   'before_search_end', 'after_search_end'}
         return value if value.lower() in allowed else 'other'
     # Имена исключений и инструментов — только короткие идентификаторы.
     return value
@@ -323,7 +358,7 @@ def safe_fields(fields: dict[str, Any]) -> dict[str, Any]:
             s = _safe_str(name, value)
             if s is not None:
                 out[name] = s
-        elif name in {'verified', 'idempotent', 'mock'} and isinstance(value, bool):
+        elif name in {'verified', 'idempotent', 'mock', 'complete'} and isinstance(value, bool):
             out[name] = value
         elif name in {'draft_fingerprint', 'code_hash'} and isinstance(value, str) and _HASH.fullmatch(value):
             out[name] = value
@@ -574,7 +609,8 @@ def write_text_log(state: Path, target: Path) -> dict[str, Any]:
                          'Тексты в данных CRM могут содержать секреты или личную информацию: проверьте их вручную.\n'
                          'Сбор локальный, ничего в CRM не отправляет. При работающем боте это не атомарный снимок.\n'
                          'История ограничена размером и начинается с версии 114; подробные запросы и ответы записываются только с версии 116.\n'
-                         'Длинные значения и большие ответы могут быть сокращены: признак truncated=true.\n\n'
+                         'Ответы и аргументы инструментов сохраняются подробнее, но ограничены; truncated=true означает сокращение.\n'
+                         'Тексты диалога целиком и аудиозаписи не собираются; аргументы инструментов могут содержать данные клиента.\n\n'
                          '=== СОБЫТИЯ (JSON, по одному на строку) ===\n')
             for path in files:
                 try:

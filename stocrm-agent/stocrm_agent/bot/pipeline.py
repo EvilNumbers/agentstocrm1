@@ -952,6 +952,7 @@ class PipelineResult:
     structured_offer_details: bool = False
     # Только номера, действительно показанные из проверенных данных, в порядке вывода.
     shown_offers: list[int] | None = None
+    offer_choice: dict[str, Any] | None = None
 
 
 class BotPipeline:
@@ -973,6 +974,8 @@ class BotPipeline:
         self._lists: dict[int, list[int]] = {}
         self._bookings: dict[int, dict[str, Any]] = {}
         self._quick_choices: dict[int, dict[str, Any]] = {}
+        self._offer_choices: dict[int, dict[str, Any]] = {}
+        self._offer_choices_lock = threading.RLock()
         self._quick_pending: dict[int, dict[str, Any]] = {}
         self._contact_lookups: dict[int, dict[str, Any]] = {}
         self._contact_create_pending: dict[int, dict[str, Any]] = {}
@@ -2997,6 +3000,27 @@ class BotPipeline:
                 self._remember_shown_offers(user_id, [])
             return PipelineResult(answer=f"Не удалось подтвердить сделку: {exc}. Ничего не записано.")
 
+    def offer_list_choice(self, choice: dict[str, Any], user_id: int, index: int) -> PipelineResult:
+        """Открыть выбранную сделку: кнопки не пишут в CRM и проверяются заново."""
+        with self._offer_choices_lock:
+            offers = choice.get('offers') or []
+            if (choice.get('owner') != user_id or self._offer_choices.get(user_id) is not choice
+                    or time.time() - float(choice.get('at') or 0) > 1800
+                    or not isinstance(index, int) or index < 0 or index >= len(offers)):
+                return PipelineResult(answer='Этот список устарел или принадлежит другому сотруднику. Покажите сделки заново.')
+            self._offer_choices.pop(user_id, None)
+            oid = offers[index]
+        try:
+            card = self.tools.offer_card(int(oid), with_items=True)
+            if not isinstance(card, dict) or card.get('error') or str(card.get('offer_id')) != str(oid):
+                raise ValueError('номер сделки не подтверждён')
+            body = format_offer_card(with_status_colors(self.tools, [card])[0], detailed=True)
+            self._remember_shown_offers(user_id, [oid])
+            return PipelineResult(answer=body, shown_offers=[oid], structured_offer_details=True)
+        except Exception:
+            self._remember_shown_offers(user_id, [])
+            return PipelineResult(answer='Не удалось подтвердить выбранную сделку. Проверьте номер в CRM; ничего не записано.', shown_offers=[])
+
     async def handle_text(self, text: str, history: list[dict[str, Any]],
                           user_id: int | None = None) -> PipelineResult:
         ident = (asyncio.get_running_loop(), user_id or 0)
@@ -3018,6 +3042,17 @@ class BotPipeline:
                 try:
                     result = await self._handle_text(text, history, user_id)
                     self._remember_shown_offers(user_id, result.shown_offers)
+                    if (result.shown_offers and not result.choices and not result.pending_booking
+                            and not result.drafts and not result.applied and not result.error
+                            and result.answer.startswith(('📋 Сделки в статусе', '📋 Последние сделки', '📋 Полученная выборка сделок'))):
+                        offer_choice = {'kind': 'offer_list', 'owner': user_id or 0,
+                                        'offers': list(result.shown_offers), 'at': time.time()}
+                        with self._offer_choices_lock:
+                            self._offer_choices[user_id or 0] = offer_choice
+                        result.offer_choice = offer_choice
+                    elif category == 'status_list':
+                        with self._offer_choices_lock:
+                            self._offer_choices.pop(user_id or 0, None)
                     if result.pending_booking and result.pending_booking.get('field') == 'offer_choice':
                         options = result.pending_booking.get('options') or []
                         shown = [int(o['value']) for o in options if isinstance(o, dict)
@@ -3067,6 +3102,13 @@ class BotPipeline:
                 action = 'yes' if answer == 'да' else 'no'
                 return await self._price_button(f"__price_button__:{choice['_price_nonce']}:{action}", user_id)
         text = _normalize_deal_slip(text)
+        from . import calendar_read
+        calendar_day = calendar_read.request(text)
+        if calendar_day:
+            answer = await asyncio.to_thread(calendar_read.render, self.tools, calendar_day)
+            history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': answer}])
+            del history[:max(0, len(history) - self.s.max_history_messages)]
+            return PipelineResult(answer=answer)
         reference_pattern = re.compile(r"\b(?:эта|эту|этой|данную|данная|данной|текущую|текущая|текущей)\s+(?:быстр\w+\s+)?сделк\w*\b", re.I)
         reference_match = reference_pattern.search(text)
         explicit_number = money_text.deal_in_text(text)
@@ -3424,6 +3466,19 @@ class BotPipeline:
                         outcome = ToolOutcome(payload=json.dumps({"error": str(exc)},
                                                                  ensure_ascii=False))
                 result.tool_calls.append(name)
+                try:
+                    diagnostic = getattr(self.tools.client, 'diagnostic', None)
+                    known = {entry.get('function', {}).get('name') for entry in TOOL_SPEC}
+                    if diagnostic is not None and name in known:
+                        try:
+                            tool_response = json.loads(outcome.payload)
+                        except (TypeError, ValueError):
+                            # Произвольный текст и обрезанный JSON могут содержать неизвестные секреты.
+                            tool_response = {'notice': 'unstructured_or_truncated', 'chars': len(str(outcome.payload or ''))}
+                        diagnostic.emit('bot.tool.result', tool=name, response=tool_response,
+                                        status='failed' if outcome.meta.get('status_target_blocked') else 'ok')
+                except Exception:
+                    pass
                 if outcome.meta.get("status_target_blocked"):
                     result.answer = str(outcome.meta['status_target_blocked']) + " Ничего не записано."
                     return result
@@ -3510,6 +3565,8 @@ class BotPipeline:
         # чтений несколько, просим уточнить вместо объединения разных фильтров.
         if (not result.drafts and not result.applied and not result.choices and not result.pending_booking
                 and not result.pending_price and not _WRITE_ACTION.search(text)
+                and not any(k.startswith(('calendar_entries:', 'calendar_entry:')) for k in read_results)
+                and not re.search(r"\b(?:календар\w*|расписани\w*)\b", text, re.I)
                 and (re.search(r"\b(?:сделки|сделок|заказы|заказов|наряды)\b", text, re.I)
                      or len(re.findall(r"(?:№|#)\s*\d+", result.answer or '')) >= 2)):
             offer_reads = [outcome.meta['offer_rows'] for key, outcome in read_results.items()
@@ -3521,8 +3578,8 @@ class BotPipeline:
                                  await asyncio.to_thread(with_offer_balances, self.tools, rows))
                     result.answer = format_offers_list(colored).replace('📋 Последние сделки', '📋 Полученная выборка сделок', 1)
                     result.answer += "\n⚠️ Показаны не более 25 сделок из полученной выборки; список может быть неполным."
-                    last_id = rows[-1].get('offer_id')
-                    result.shown_offers = [int(last_id)] if str(last_id or '').isdigit() and int(last_id) > 0 else []
+                    ids = [r.get('offer_id') for r in rows]
+                    result.shown_offers = [int(oid) for oid in ids] if all(str(oid or '').isdigit() and int(oid) > 0 for oid in ids) else []
                 else:
                     result.answer = "В полученной выборке сделок нет. Полнота поиска не подтверждена."
                     result.shown_offers = []
@@ -3534,7 +3591,8 @@ class BotPipeline:
                 result.shown_offers = []
 
         if (result.shown_offers is None and not result.drafts and not result.applied
-                and not result.choices and not result.pending_booking and not result.pending_price):
+                and not result.choices and not result.pending_booking and not result.pending_price
+                and not any(k.startswith(('calendar_entries:', 'calendar_entry:')) for k in read_results)):
             displayed = re.findall(r"(?:№|#)\s*(\d+)\b|\bсделк(?:а|у|е|и|ой)\s+(\d+)\b", result.answer or '', re.I)
             displayed = [number or plain for number, plain in displayed]
             cards = [outcome.meta['offer_card'] for k, outcome in read_results.items()

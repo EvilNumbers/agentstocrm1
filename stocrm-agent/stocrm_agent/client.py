@@ -41,6 +41,11 @@ def read_budget(seconds: float):
         _READ_DEADLINE.reset(token)
 
 
+def read_budget_remaining_ms() -> int | None:
+    deadline = _READ_DEADLINE.get()
+    return max(0, round((deadline - time.monotonic()) * 1000)) if deadline is not None else None
+
+
 log = logging.getLogger("stocrm.client")
 
 
@@ -369,7 +374,8 @@ class StocrmClient:
         call_token = _CRM_CALL_ID.set('call_' + secrets.token_hex(6))
         start = time.monotonic()
         try:
-            self._diagnostic_emit('crm.call.start', method=method, request=data, idempotent=idempotent, verb=verb)
+            self._diagnostic_emit('crm.call.start', method=method, request=data, idempotent=idempotent, verb=verb,
+                                  budget_ms=read_budget_remaining_ms())
             try:
                 result = operation(method, data, idempotent=idempotent)
             except BaseException as exc:
@@ -378,12 +384,14 @@ class StocrmClient:
                                           ms=round((time.monotonic() - start) * 1000),
                                           error_class=type(exc).__name__,
                                           cause_class=type(exc.__cause__).__name__ if exc.__cause__ else '',
-                                          error_kind=error_kind(exc), code=getattr(exc, 'code', None))
+                                          error_kind=error_kind(exc), code=getattr(exc, 'code', None),
+                                          budget_after_ms=read_budget_remaining_ms())
                 except Exception:
                     pass
                 raise
             self._diagnostic_emit('crm.call.finish', method=method, idempotent=idempotent, verb=verb,
-                                  ms=round((time.monotonic() - start) * 1000), response=result)
+                                  ms=round((time.monotonic() - start) * 1000), response=result,
+                                  budget_after_ms=read_budget_remaining_ms())
             return result
         finally:
             _CRM_CALL_ID.reset(call_token)

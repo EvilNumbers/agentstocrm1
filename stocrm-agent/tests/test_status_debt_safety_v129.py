@@ -24,12 +24,12 @@ class StatusModel:
 
 @pytest.mark.parametrize('text', [
     'Перемести эту сделку в мусор', 'Переведи в мусор', 'смени статус сделки',
-    'перемести эту быструю сделку в мусор', 'перемести из сделки 1320 в сделку 1348 в мусор',
-    'перемести как у сделки 1320 номер 1348 в мусор',
+    'перемести эту быструю сделку в мусор', 'перемести из сделки 71120 в сделку 71148 в мусор',
+    'перемести как у сделки 71120 номер 71148 в мусор',
 ])
 def test_no_single_explicit_deal_never_uses_stale_context(env, text):
     session, tools, pipe = env
-    pipe._last_offer[19] = 1320
+    pipe._last_offer[19] = 71120
     pipe.llm = StatusModel()
     result = send(pipe, text)
     assert not result.drafts and not result.applied and 'номер' in result.answer.lower()

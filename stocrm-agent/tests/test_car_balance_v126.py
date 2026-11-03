@@ -131,12 +131,12 @@ def test_older_panel_rejecting_car_fields_still_returns_card(env, monkeypatch):
     ({'RUB_CASH': {'CURRENCY_VALUE': 1}}, None, (None, None, None)),
 ])
 def test_wave_80_balance_examples(balance, total, expected):
-    assert _offer_balance_values(balance, 1329, total) == expected
+    assert _offer_balance_values(balance, 71129, total) == expected
 
 
 def test_balance_diagnostic_reports_only_count_of_object_keys(env, monkeypatch):
     _, tools = tools_for(env)
     monkeypatch.setattr(tools, '_read', lambda *a, **kw: {'private arbitrary field': 'secret'})
-    diagnostic = tools.balance_diagnostic(1329)
+    diagnostic = tools.balance_diagnostic(71129)
     assert diagnostic['field_count'] == 1 and diagnostic['rub_count'] == 0
     assert 'private arbitrary field' not in str(diagnostic) and 'secret' not in str(diagnostic)

@@ -18,7 +18,9 @@ from __future__ import annotations
 import logging
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from typing import Any
 
@@ -250,29 +252,138 @@ def format_offers_list(rows: list[dict[str, Any]]) -> str:
                 head += " (цвет статуса не определён)"
         lines.append(head)
     lines.append("")
-    lines.append("Скажите номер в списке («3 подробнее») — открою сделку.")
+    lines.append("Выберите сделку кнопкой в Telegram или скажите номер в списке («3 подробнее»).")
     return "\n".join(lines)
+
+
+def _diagnostic(tools: Any, event: str, **fields: Any) -> None:
+    try:
+        journal = getattr(getattr(tools, 'client', None), 'diagnostic', None)
+        if journal is not None:
+            journal.emit(event, **fields)
+    except Exception:
+        pass  # диагностика не должна мешать просмотру или записи
+
+
+def _check_list_balance(tools: Any, row: dict[str, Any], *, phase: str, attempt: int) -> tuple[dict[str, Any], bool]:
+    from ..client import read_budget_remaining_ms
+    from ..diagnostic_journal import error_kind
+    started = time.monotonic()
+    budget_before = read_budget_remaining_ms()
+    debt = None
+    oid = row.get('offer_id')
+    reason = 'sum_missing'
+    failure_kind = None
+    failure_class = None
+    failure_code = None
+    if row.get('sum_known') is True:
+        reason = 'invalid_offer_id'
+        if not isinstance(oid, bool) and str(oid).isdigit() and int(oid) > 0:
+            try:
+                debt = tools.offer_balance_for_list(int(oid), row.get('sum'))
+                reason = 'ok' if debt is not None else 'balance_unusable'
+            except Exception as exc:
+                reason = 'read_error'
+                failure_kind = error_kind(exc)
+                failure_class = type(exc).__name__
+                failure_code = getattr(exc, 'code', None)
+                log.warning('Не удалось проверить баланс сделки: %s', failure_class)
+    _diagnostic(tools, 'balance.list.item', offer_id=oid, reason=reason, phase=phase, attempt=attempt,
+                status='ok' if debt is not None else 'failed', error_kind=failure_kind,
+                error_class=failure_class, ms=round((time.monotonic() - started) * 1000),
+                budget_ms=budget_before, budget_after_ms=read_budget_remaining_ms())
+    # Ранняя попытка могла истечь до конца поиска. Одна новая попытка чтения
+    # после поиска не лишает её отдельного временного этапа версии 132.
+    retryable = (phase == 'before_search_end' and reason == 'read_error' and failure_kind == 'timeout'
+                 and failure_code not in (401, 403, 429))
+    return {**row, 'debt': debt}, retryable
+
+
+class _StatusBalanceBatch:
+    """Баланс проверенных строк параллельно со следующими страницами поиска.
+
+    Контекст передан до входа в бюджет поиска, чтобы сохранить внешний срок,
+    но не наследовать внутренние 20 секунд. После поиска оставшимся задачам
+    выделяется общий этап до 12 секунд; ранее начатые задачи ограничены теми же
+    12 секундами с момента старта и поэтому не могут получить больше времени.
+    """
+    def __init__(self, tools: Any, parent_context: Any) -> None:
+        self.tools = tools
+        self.parent_context = parent_context
+        self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='list-balance')
+        self.lock = threading.Lock()
+        self.deadline: float | None = None
+        self.futures: list[Any] = []
+        self.started = time.monotonic()
+
+    def _one(self, row: dict[str, Any], attempt: int) -> tuple[dict[str, Any], bool]:
+        from ..client import read_budget
+        with self.lock:
+            deadline = self.deadline
+        phase = 'before_search_end' if deadline is None else 'after_search_end'
+        seconds = 12.0 if deadline is None else max(0.0, min(12.0, deadline - time.monotonic()))
+        with read_budget(seconds):
+            return _check_list_balance(self.tools, row, phase=phase, attempt=attempt)
+
+    def submit(self, row: dict[str, Any], attempt: int = 1) -> Any:
+        # Каждый вызов получает отдельную копию: один Context нельзя выполнять
+        # одновременно в нескольких потоках.
+        return self.pool.submit(self.parent_context.copy().run, self._one, row, attempt)
+
+    def add(self, row: dict[str, Any]) -> None:
+        self.futures.append(self.submit(row))
+
+    def finish(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        from ..client import read_budget_remaining_ms
+        wait_started = time.monotonic()
+        with self.lock:
+            self.deadline = wait_started + 12.0
+        if len(rows) != len(self.futures):
+            raise RuntimeError('Число проверенных строк и задач баланса не совпало')
+        pending = {future: (idx, 1) for idx, future in enumerate(self.futures)}
+        result: list[dict[str, Any] | None] = [None] * len(rows)
+        retry_count = 0
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                index, attempt = pending.pop(future)
+                item, retryable = future.result()
+                outer_budget = read_budget_remaining_ms()
+                if (retryable and attempt == 1 and time.monotonic() < self.deadline
+                        and (outer_budget is None or outer_budget > 0)):
+                    pending[self.submit(rows[index], attempt=2)] = (index, 2)
+                    retry_count += 1
+                else:
+                    result[index] = item
+        # В результате именно исходные проверенные строки и их порядок, даже если
+        # баланс одной сделки прочитался быстрее другой.
+        if any(item is None for item in result):
+            raise RuntimeError('Не получен результат проверки баланса')
+        finished = [item for item in result if item is not None]
+        _diagnostic(self.tools, 'balance.list.finish', ms=round((time.monotonic() - self.started) * 1000),
+                    wait_ms=round((time.monotonic() - wait_started) * 1000), rows=len(rows),
+                    retry_count=retry_count, verified_count=sum(r.get('debt') is not None for r in finished),
+                    failed_count=sum(r.get('debt') is None for r in finished))
+        return finished
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 def with_offer_balances(tools: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Каждой показанной сделке — собственный баланс; ошибка не означает 0."""
     from ..client import read_budget
-
-    def one(row: dict[str, Any]) -> dict[str, Any]:
-        debt = None
-        if row.get('sum_known') is True:
-            try:
-                oid = row.get('offer_id')
-                if not isinstance(oid, bool) and str(oid).isdigit() and int(oid) > 0:
-                    debt = tools.offer_balance_for_list(int(oid), row.get('sum'))
-            except Exception as exc:
-                log.warning('Не удалось проверить баланс сделки: %s', type(exc).__name__)
-        return {**row, 'debt': debt}
-
+    started = time.monotonic()
     with read_budget(12.0):
+        def one(row: dict[str, Any]) -> dict[str, Any]:
+            return _check_list_balance(tools, row, phase='after_search_end', attempt=1)[0]
         with ThreadPoolExecutor(max_workers=4, thread_name_prefix='list-balance') as pool:
-            return [future.result() for future in
-                    [pool.submit(copy_context().run, one, row) for row in rows]]
+            result = [future.result() for future in
+                      [pool.submit(copy_context().run, one, row) for row in rows]]
+    _diagnostic(tools, 'balance.list.finish', ms=round((time.monotonic() - started) * 1000),
+                rows=len(rows), verified_count=sum(r.get('debt') is not None for r in result),
+                failed_count=sum(r.get('debt') is None for r in result))
+    return result
 
 
 # Только самостоятельная просьба о списке: не перехватываем изменения или другие
@@ -352,8 +463,10 @@ def _status_request(text: str) -> dict[str, str | None] | None:
         'просчет': 'estimate', 'проценка': 'estimate',
         'просчет запчастей': 'estimate_parts', 'проценка запчастей': 'estimate_parts',
         'запись': 'record', 'заказ': 'order', 'заказ собран': 'assembled',
-        'ожидает оплаты': 'waiting_payment', 'в работе': 'working',
+        'ожидает оплаты': 'waiting_payment', 'ожидание оплаты': 'waiting_payment',
+        'в ожидании оплаты': 'waiting_payment', 'в работе': 'working',
     }
+    bare = re.sub(r"^(?:покажи|покажите|дай|дайте|выведи|выведите)\s+(?:(?:мне|нам|все|всё)\s+)*", "", bare)
     if bare in bare_kinds:
         return {'kind': bare_kinds[bare], 'board': None}
     working = _working_request(message)
@@ -393,7 +506,7 @@ def is_status_offers_request(text: str) -> bool:
 
 def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, list[int]]:
     """Список только для проверенной пары (воронка, точный статус)."""
-    from ..client import read_budget
+    from ..client import read_budget, read_budget_remaining_ms
     from .status_view import match_name as match_view_status_name
 
     kind = str(request.get("kind") or "")
@@ -405,7 +518,10 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
     else:
         specific, generic = _STATUS_TITLES[kind], set()
     targets = specific | generic
+    batch: _StatusBalanceBatch | None = None
+    parent_context = copy_context()
     try:
+        search_started = time.monotonic()
         with read_budget(20.0):
             tools._invalidate_quick_identity_cache()
             boards = tools.boards()
@@ -414,10 +530,12 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                 boards = [b for b in boards if _norm_status(b.get("name")) == name
                           or (name.lstrip("№#").strip().isdigit() and str(b.get("board_id")) == name.lstrip("№#").strip())]
                 if len(boards) != 1:
+                    _diagnostic(tools, 'status.list.search', status='failed', reason='board_missing', ms=round((time.monotonic() - search_started) * 1000))
                     return "Не удалось однозначно найти указанную воронку в CRM. Уточните её название или номер.", []
             precise: list[tuple[dict[str, Any], dict[str, Any]]] = []
             fallback: list[tuple[dict[str, Any], dict[str, Any]]] = []
             unresolved = False
+            usable_boards: list[tuple[dict[str, Any], int]] = []
             for board in boards:
                 try:
                     board_id = int(str(board.get("board_id")))
@@ -426,7 +544,12 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                 except (TypeError, ValueError):
                     unresolved = True
                     continue
-                for status in tools.statuses(board_id):
+                usable_boards.append((board, board_id))
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(usable_boards))), thread_name_prefix='status-boards') as pool:
+                futures = [pool.submit(copy_context().run, tools.statuses, board_id) for _, board_id in usable_boards]
+                statuses_by_board = [future.result() for future in futures]
+            for (board, board_id), statuses in zip(usable_boards, statuses_by_board):
+                for status in statuses:
                     title = _norm_status(status.get("title"))
                     if title not in targets:
                         if not title:
@@ -440,50 +563,84 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
                         continue
                     (precise if title in specific else fallback).append((board, status))
             if unresolved:
+                _diagnostic(tools, 'status.list.search', status='failed', reason='status_unverified', ms=round((time.monotonic() - search_started) * 1000))
                 return "Не удалось надёжно проверить справочник воронок или статусов. Список сделок не подтверждён.", []
             matches = precise or fallback
             if not matches:
+                _diagnostic(tools, 'status.list.search', status='failed', reason='status_missing', ms=round((time.monotonic() - search_started) * 1000))
                 if kind == "working":
                     return "В CRM не найден точный статус «В работе на сервисе» или «В работе». Проверьте название статуса в воронке.", []
                 return "В CRM не найден подходящий точный статус. Уточните название из CRM: «покажи сделки в статусе НАЗВАНИЕ».", []
             if len(matches) > 1:
+                _diagnostic(tools, 'status.list.search', status='failed', reason='ambiguous_status', matched_count=len(matches), ms=round((time.monotonic() - search_started) * 1000))
                 labels = "\n".join(f"• {b['name']} (№{b['board_id']}) · {s['title']}" for b, s in matches)
                 return ("Нашлось несколько подходящих статусов. Уточните статус и воронку:\n" + labels +
                         "\nНапример: «покажи сделки в статусе НАЗВАНИЕ в воронке НАЗВАНИЕ».", [])
             board, status = matches[0]
+            batch = _StatusBalanceBatch(tools, parent_context)
             valid: list[dict[str, Any]] = []
             seen: set[str] = set()
             complete = False
             uncertain = False
             page_size = 100
+            stop_reason = 'page_limit'
             for page in range(1, 21):
+                page_started = time.monotonic()
+                page_budget = read_budget_remaining_ms()
                 try:
                     rows = tools.find_offers(board_id=int(board["board_id"]),
                         limit=page_size, page=page, fresh=True)
-                except Exception:
+                except Exception as exc:
+                    from ..diagnostic_journal import error_kind
+                    stop_reason = 'page_error'
+                    _diagnostic(tools, 'status.list.page', page=page, status='failed', reason=stop_reason,
+                                error_kind=error_kind(exc), error_class=type(exc).__name__,
+                                ms=round((time.monotonic() - page_started) * 1000),
+                                budget_ms=page_budget, budget_after_ms=read_budget_remaining_ms())
                     uncertain = True
                     break
                 if rows and all(str(r.get("offer_id") or "") in seen for r in rows):
+                    stop_reason = 'repeated_page'
+                    _diagnostic(tools, 'status.list.page', page=page, rows=len(rows), status='failed', reason=stop_reason,
+                                ms=round((time.monotonic() - page_started) * 1000),
+                                budget_ms=page_budget, budget_after_ms=read_budget_remaining_ms())
                     uncertain = True
                     break
+                before_count = len(valid)
+                unknown_count = duplicate_count = filtered_count = 0
                 for row in rows:
                     ident = str(row.get("offer_id") or "")
                     if not ident.isdigit() or int(ident) <= 0:
+                        unknown_count += 1
                         uncertain = True
                         continue
                     if ident in seen:
+                        duplicate_count += 1
                         continue
                     seen.add(ident)
                     matched = match_view_status_name(tools, board=row.get('board_id'), status_name=row.get('status'),
                         expected_board=int(board['board_id']), expected_name=status['title'])
                     if matched == 'unknown':
+                        unknown_count += 1
                         uncertain = True
                     elif matched in ('id', 'name'):
                         valid.append({**row, "status": status["title"]})
+                        if len(valid) <= 25:
+                            batch.add(valid[-1])
+                    else:
+                        filtered_count += 1
+                _diagnostic(tools, 'status.list.page', page=page, rows=len(rows), status='ok',
+                            matched_count=len(valid) - before_count, seen_count=len(seen),
+                            unknown_count=unknown_count, duplicate_count=duplicate_count, filtered_count=filtered_count,
+                            board_id=board.get('board_id'), status_id=status.get('status_id'),
+                            budget_ms=page_budget, budget_after_ms=read_budget_remaining_ms(),
+                            ms=round((time.monotonic() - page_started) * 1000))
                 if len(valid) > 25:
+                    stop_reason = 'row_limit'
                     uncertain = True
                     break
                 if not rows:
+                    stop_reason = 'empty_page'
                     complete = True
                     break
             if not complete:
@@ -491,17 +648,30 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             valid = valid[:25]
             qualifier = "\n⚠️ Проверка не завершена или список ограничен; он может быть неполным." if uncertain else ""
             label = f"«{status['title']}» · воронка «{board['name']}»"
-            if not valid:
-                return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
-            valid = with_offer_balances(tools, valid)
-            from .status_colors import color_marker
-            marker = color_marker(status.get('front_color'))
-            result = format_offers_list([{**row, 'status_marker': marker, 'status_color_unknown': not bool(marker)} for row in valid])
-            result = result.replace(f"📋 Последние сделки ({len(valid)}):", f"📋 Сделки в статусе {label}:", 1)
-            return result + qualifier, [int(r["offer_id"]) for r in valid]
+            _diagnostic(tools, 'status.list.search', ms=round((time.monotonic() - search_started) * 1000),
+                        rows=len(valid), seen_count=len(seen), page=page, reason=stop_reason, complete=complete,
+                        board_id=board.get('board_id'), status_id=status.get('status_id'),
+                        budget_after_ms=read_budget_remaining_ms(), status='failed' if uncertain else 'ok')
+        # Уже проверенные строки проверяются параллельно с другими страницами;
+        # после поиска оставшиеся и ранние истёкшие попытки получают отдельный этап.
+        if not valid:
+            return f"В полученной выдаче среди просмотренных сделок не найдено подтверждённых сделок со статусом {label}." + qualifier, []
+        valid = batch.finish(valid)
+        from .status_colors import color_marker
+        marker = color_marker(status.get('front_color'))
+        result = format_offers_list([{**row, 'status_marker': marker, 'status_color_unknown': not bool(marker)} for row in valid])
+        result = result.replace(f"📋 Последние сделки ({len(valid)}):", f"📋 Сделки в статусе {label}:", 1)
+        return result + qualifier, [int(r["offer_id"]) for r in valid]
     except Exception as exc:
+        from ..diagnostic_journal import error_kind
+        _diagnostic(tools, 'status.list.search', status='failed', reason='lookup_error',
+                    ms=round((time.monotonic() - search_started) * 1000),
+                    error_kind=error_kind(exc), error_class=type(exc).__name__)
         log.warning('Чтение статусного списка не удалось: %s', type(exc).__name__)
         return "Не удалось прочитать воронки или статусы CRM. Список сделок не подтверждён. Проверьте связь командой /crm_test и повторите чтение.", []
+    finally:
+        if batch is not None:
+            batch.close()
 
 
 def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
