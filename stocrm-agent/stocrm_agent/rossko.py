@@ -94,7 +94,43 @@ def _parse(content: bytes, sku: str) -> list[dict[str, str]]:
     return found
 
 
+def _parse_names(content: bytes, sku: str, brand: str, secrets: tuple[str, ...]) -> tuple[list[dict[str, str]], bool]:
+    # Сначала общая проверка SOAP, success, запрет DTD/ENTITY.
+    _parse(content, sku)
+    root = ET.fromstring(content.decode("utf-8-sig"))
+    body = _child(root, "Body")
+    response = _child(body, "GetSearchResponse") if body is not None else None
+    result = _child(response, "SearchResult") if response is not None else None
+    collection = _child(result, "PartsList") if result is not None else None
+    rows: list[dict[str, str]] = []
+    incomplete = False
+    for item in collection if collection is not None else []:
+        if _local(item.tag) != "part":
+            continue
+        item_brand, number = _text(item, "brand"), _text(item, "partnumber")
+        if not item_brand or not number:
+            incomplete = True
+            continue
+        if parts.sku_exact(number) != parts.sku_exact(sku) or not parts.exact_brand_match(item_brand, brand):
+            continue
+        name = _text(item, "name")
+        if (not name or len(name) > 200 or any(ord(c) < 32 for c in name)
+                or any(secret and secret in name for secret in secrets)):
+            incomplete = True
+            continue
+        rows.append({"brand": item_brand, "sku": sku, "name": name, "source": "Росско"})
+    return rows, incomplete
+
+
 def search_brands(sku: str) -> dict[str, Any]:
+    return _search(sku)
+
+
+def search_names(sku: str, brand: str) -> dict[str, Any]:
+    return _search(sku, name_for_brand=brand)
+
+
+def _search(sku: str, *, name_for_brand: str | None = None) -> dict[str, Any]:
     """Вход — только артикул. Возвращаются исключительно бренд и артикул.
 
     Доступен только при явном включении в локальном окружении. При ошибках не
@@ -154,7 +190,10 @@ def search_brands(sku: str) -> dict[str, Any]:
                         return unavailable("Истёк тайм-аут ответа.")
                     if len(content) > _MAX_RESPONSE:
                         return unavailable("Ответ слишком большой.")
-        rows = _parse(bytes(content), sku)
+        if name_for_brand is not None:
+            rows, incomplete = _parse_names(bytes(content), sku, name_for_brand, (key1, key2))
+        else:
+            rows, incomplete = _parse(bytes(content), sku), False
     except requests.exceptions.SSLError:
         return unavailable("Ошибка защищённого соединения TLS с Росско; соединение не подтверждено.")
     except requests.exceptions.Timeout:
@@ -175,4 +214,4 @@ def search_brands(sku: str) -> dict[str, Any]:
         return unavailable("Ответ Росско имеет неожиданный формат; поиск не подтверждён.")
     except OSError:
         return unavailable("Системная ошибка при запросе к Росско.")
-    return {"status": "ok" if rows else "empty", "brands": rows}
+    return {"status": "partial" if incomplete else ("ok" if rows else "empty"), "brands": rows}

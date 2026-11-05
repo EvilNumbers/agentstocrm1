@@ -138,6 +138,26 @@ class DraftStore:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 if reload:  # подхватываем изменения, сделанные другим процессом
                     self._data = self._load()
+                    # Старые версии после потери ответа ошибочно возвращали такой
+                    # черновик в pending. Не разрешать повтор только из-за обновления.
+                    changed = False
+                    for draft in self._data.values():
+                        if not isinstance(draft, dict):
+                            continue
+                        if (draft.get("status") in (PENDING, EXPIRED)
+                                and draft.get("last_error") in (
+                                    "связь прервалась, запись не подтверждена",
+                                    "применение прервано, ничего не записано")):
+                            draft.update(status=PARTIAL, uncertain_network=True,
+                                         check_warning="Старая попытка могла попасть в CRM; проверьте вручную, повтор заблокирован.")
+                            changed = True
+                        if (draft.get("tool") == "add_offer_work" and draft.get("status") == APPLIED
+                                and draft.get("check_warning") and not draft.get("manually_reviewed_at")
+                                and not (draft.get("review") or {}).get("verified")):
+                            draft.update(status=PARTIAL, uncertain_network=True)
+                            changed = True
+                    if changed:
+                        self._save()
                 yield
             finally:
                 if handle is not None:
@@ -346,8 +366,8 @@ class DraftStore:
             token for token, draft in self._data.items()
             if draft.get("status") not in (PENDING, PARTIAL, APPLYING)
             and not draft.get("archived_partial")
-            and not (draft.get("check_warning") and not (draft.get("review") or {}).get("verified"))
-            and not (draft.get("status") == DISCARDED and draft.get("done_steps"))
+            and not (draft.get("check_warning") and not (draft.get("review") or {}).get("verified") and not draft.get("manually_reviewed_at"))
+            and not (draft.get("status") == DISCARDED and draft.get("done_steps") and not draft.get("manually_reviewed_at"))
             and float(draft.get("created_at") or 0) < cutoff
         ]
         for token in drop:
@@ -401,7 +421,7 @@ class DraftStore:
             return
         items = self._part_items(draft)
         for token, other in self._data.items():
-            if token in {draft.get("token"), draft.get("queue_parent"), draft.get("recovery_parent")} or other.get("queue_parent"):
+            if token in {draft.get("token"), draft.get("queue_parent"), draft.get("recovery_parent")} or other.get("queue_parent") or other.get("manually_reviewed_at"):
                 continue
             status = other.get("status")
             legacy_warning = bool(other.get("check_warning") and not (other.get("review") or {}).get("verified"))
@@ -421,6 +441,47 @@ class DraftStore:
     def assert_part_unblocked(self, check: dict[str, Any]) -> None:
         with self._locked():
             self._assert_part_unblocked_unlocked({"tool": "add_offer_part", "check": check})
+
+    def _assert_uncertain_unblocked_unlocked(self, draft: dict[str, Any]) -> None:
+        """Не обходить неопределённую запись новым или заранее созданным черновиком."""
+        check = draft.get("check") or {}
+        for other in self._data.values():
+            if other.get("token") in {draft.get("token"), draft.get("queue_parent"), draft.get("recovery_parent")}:
+                continue
+            if other.get("manually_reviewed_at"):
+                continue
+            if not (other.get("status") in (APPLYING, PARTIAL) or other.get("archived_partial")):
+                continue
+            same = (draft.get("tool") == other.get("tool") and draft.get("fingerprint")
+                    and draft.get("fingerprint") == other.get("fingerprint"))
+            old_check = other.get("check") or {}
+            if draft.get("tool") == other.get("tool") == "add_offer_work":
+                offer, old_offer = str(check.get("offer_id") or ""), str(old_check.get("offer_id") or "")
+                # Формулировку услуги легко изменить. До проверки не отправляем
+                # никакую другую услугу в ту же сделку через отдельный черновик.
+                same = bool(offer and old_offer and offer == old_offer)
+            if same:
+                raise ValueError("Такая запись уже выполняется или её результат неизвестен. Проверьте CRM и /drafts; повтор заблокирован.")
+
+    def assert_work_unblocked(self, check: dict[str, Any]) -> None:
+        with self._locked():
+            self._assert_uncertain_unblocked_unlocked({"tool": "add_offer_work", "check": check})
+
+    def resolve_uncertain_manually(self, token: str, *, user_id: int) -> dict[str, Any]:
+        """Только явная проверка администратором; никаких повторных запросов CRM."""
+        with self._locked():
+            draft = self._get_unlocked(token)
+            active = draft.get("status") == APPLYING
+            if not (draft.get("uncertain_network") or (active and draft.get("sent_step_started"))):
+                raise ValueError("Эта запись не является непроверенной сетевой попыткой")
+            if not (draft.get("status") in (PARTIAL, APPLYING) or draft.get("archived_partial")):
+                raise ValueError("Черновик уже закрыт")
+            if active and time.time() - float(draft.get("claimed_at") or time.time()) < 3600:
+                raise ValueError("Запись может ещё выполняться. Дождитесь завершения и проверьте CRM.")
+            draft.update(status=DISCARDED, archived_partial=False,
+                         manually_reviewed_at=time.time(), manually_reviewed_by=user_id)
+            self._save()
+            return dict(draft)
 
     def archive(self, token: str) -> dict[str, Any]:
         """Убрать из списка, не отменяя и не удаляя ничего в CRM."""
@@ -506,7 +567,7 @@ class DraftStore:
             return
         for other in self._data.values():
             other_tool = other.get('tool')
-            if other.get('token') == draft.get('token'):
+            if other.get('token') == draft.get('token') or other.get('manually_reviewed_at'):
                 continue
             if tool == 'quick_deal':
                 relevant = other_tool in {'add_offer_part', 'add_offer_work'}
@@ -565,6 +626,7 @@ class DraftStore:
                             and (other.get("status") in (APPLYING, PARTIAL) or other.get("archived_partial")
                                  or (other.get("status") == APPLIED and float(other.get("applied_at") or 0) >= float(draft.get("created_at") or 0)))):
                         raise ValueError("Создание сделки с этим телефоном уже выполняется или требует проверки. Повтор запрещён.")
+            self._assert_uncertain_unblocked_unlocked(draft)
             draft["status"] = APPLYING
             draft["claimed_at"] = time.time()
             self._save()
@@ -582,6 +644,8 @@ class DraftStore:
             if draft["status"] == APPLYING:
                 draft["status"] = PENDING
                 draft.pop("claimed_at", None)
+                draft.pop("sent_step_started", None)
+                draft.pop("sent_step_index", None)
                 if reason:
                     draft["last_error"] = reason
                     draft["last_error_at"] = time.time()
@@ -601,12 +665,12 @@ class DraftStore:
             done = ", ".join((draft.get("done_steps") or {}).get("methods", []))
             raise ValueError(
                 f"Черновик {token} выполнен частично ({done}). Повторное применение создаст "
-                "дубликаты — проверьте сделку в STOCRM и создайте новый черновик при необходимости"
+                "дубликаты — сначала проверьте сделку в STOCRM и /drafts"
             )
         if draft["status"] == APPLYING:
             raise ValueError(
                 f"Черновик {token} уже применяется (возможно, в другом окне бота или в CLI). "
-                "Если действие не появилось в STOCRM — проверьте сделку и создайте черновик заново"
+                "Дождитесь завершения и проверьте сделку; не создавайте повторный черновик вслепую"
             )
         if draft["status"] != PENDING:
             raise ValueError(f"Черновик {token} в статусе «{draft['status']}», применять нельзя")

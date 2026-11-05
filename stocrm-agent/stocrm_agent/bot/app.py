@@ -143,6 +143,10 @@ def drafts_keyboard(drafts: list[dict[str, Any]], *, quick_page: int = 0) -> Inl
         if draft.get("batch_preparing"):
             rows.append([InlineKeyboardButton(text="❌ Отменить незавершённую сборку", callback_data=f"dr:{token}")])
             continue
+        if draft.get("status") == "partial" and draft.get("uncertain_network"):
+            rows.append([InlineKeyboardButton(text="🔎 Проверил CRM: снять блокировку", callback_data=f"wm:{token}")])
+            rows.append([InlineKeyboardButton(text="🗑 Убрать из списка (блокировка останется)", callback_data=f"ra:{token}")])
+            continue
         if draft.get("status") == "partial" and draft.get("tool") == "quick_deal":
             rows.append([InlineKeyboardButton(text="🔎 Проверил CRM: снять блокировку", callback_data=f"qm:{token}")])
             rows.append([InlineKeyboardButton(text="🗑 Убрать из списка (блокировка останется)", callback_data=f"ra:{token}")])
@@ -1039,11 +1043,12 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
         pending = tools.drafts.list("pending")
         partial = tools.drafts.list("partial")
         applying_quick = [d for d in tools.drafts.list("applying") if d.get("tool") == "quick_deal"]
+        applying_uncertain = [d for d in tools.drafts.list("applying") if d.get("tool") != "quick_deal" and d.get("sent_step_started")]
         archived = [d for d in tools.drafts.list("all") if d.get("archived_partial") or (
             d.get("tool") == "add_offer_part" and d.get("status") in {"applied", "discarded"}
             and not (d.get("review") or {}).get("verified") and not d.get("merged_into")
             and (d.get("check_warning") or (d.get("status") == "discarded" and d.get("done_steps"))))]
-        if not pending and not partial and not archived and not applying_quick:
+        if not pending and not partial and not archived and not applying_quick and not applying_uncertain:
             await message.answer("Черновиков нет.")
             return
         if pending:
@@ -1056,6 +1061,11 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             lines = [f"{i}. {d['summary']} — этап: {d.get('quick_stage') or 'выполняется'}" for i, d in enumerate(applying_quick, 1)]
             await message.answer("Заявки выполняются или прервались. Не повторяйте; после часа без обновлений проверьте CRM вручную:\n" + "\n".join(lines),
                                  reply_markup=drafts_keyboard([{**d, "status": "partial"} for d in stale]))
+        if applying_uncertain:
+            stale = [d for d in applying_uncertain if time.time() - float(d.get("claimed_at") or time.time()) >= 3600]
+            lines = [f"{i}. {d['summary']}" for i, d in enumerate(applying_uncertain, 1)]
+            await message.answer("Записи выполняются или прервались. Не повторяйте; после часа без завершения проверьте CRM вручную:\n" + "\n".join(lines),
+                                 reply_markup=drafts_keyboard([{**d, "status": "partial", "uncertain_network": True} for d in stale]))
         if partial:
             lines = [f"{number}. ⚠️ {d['summary']} — требует проверки; целиком повторять нельзя" for number, d in enumerate(partial, 1)]
             await message.answer("Требуют проверки в STOCRM:\n" + "\n".join(lines), reply_markup=drafts_keyboard(partial))
@@ -1673,12 +1683,32 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
             await callback.message.answer(f"Позиции черновика: страница {page + 1} из {pages}. Нажмите ✂️ для удаления, затем проверьте новый состав.", reply_markup=drafts_keyboard([draft], quick_page=page))
 
     # ---------------------------------------------------------- подтверждение
-    @router.callback_query(F.data.startswith(("ap:", "dr:", "dp:", "rv:", "rc:", "rp:", "ra:", "rx:", "qm:", "qc:")))
+    @router.callback_query(F.data.startswith(("ap:", "dr:", "dp:", "rv:", "rc:", "rp:", "ra:", "rx:", "qm:", "qc:", "wm:", "wc:")))
     async def on_callback(callback: CallbackQuery) -> None:
         action, _, token = (callback.data or "").partition(":")
         actor = callback.from_user
         try:
-            if action == "qm" and token == "cancel":
+            if action == "wm" and token == "cancel":
+                await callback.answer("Блокировка сохранена")
+                return
+            if action in ("wm", "wc"):
+                if not is_admin(actor):
+                    await callback.answer("Снять блокировку может только администратор после проверки CRM.", show_alert=True)
+                    return
+                draft = tools.drafts.get(token)
+                if not (draft.get("uncertain_network") or (draft.get("status") == "applying" and draft.get("sent_step_started"))):
+                    raise ValueError("Этот черновик больше не требует ручной проверки")
+                if draft.get("status") == "applying" and time.time() - float(draft.get("claimed_at") or time.time()) < 3600:
+                    raise ValueError("Запись может ещё выполняться; дождитесь завершения")
+                if action == "wm":
+                    await safe_edit(_cb_msg(callback), "Запись могла выполниться после потери ответа. Дождитесь окончания операции, проверьте сделку и все шаги в CRM. Это не автоматическая проверка. Только после этого снять блокировку? Старую запись бот не повторит.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="Да, CRM проверена — снять блокировку", callback_data=f"wc:{token}"),
+                        InlineKeyboardButton(text="Оставить блокировку", callback_data="wm:cancel")]]))
+                else:
+                    tools.drafts.resolve_uncertain_manually(token, user_id=actor.id)
+                    tools.audit.write("bot.uncertain_manual_review", token=token, user_id=actor.id)
+                    await safe_edit(_cb_msg(callback), "Блокировка снята по вашему подтверждению. Старую запись бот не повторял. Новую создавайте только если убедились, что её нет в CRM.")
+            elif action == "qm" and token == "cancel":
                 await callback.answer("Блокировка сохранена")
                 return
             if action in ("qm", "qc"):

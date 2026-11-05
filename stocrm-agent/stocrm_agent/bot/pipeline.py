@@ -10,7 +10,7 @@ import re
 import time
 import threading
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .. import money as money_text
@@ -31,7 +31,7 @@ from .llm_tools import (
     ToolOutcome,
     ToolRouter,
 )
-from .settings import BotSettings
+from .settings import BotSettings, LLM_PRESETS
 from .stt import STTError, Transcriber
 
 log = logging.getLogger("stocrm.bot.pipeline")
@@ -1857,7 +1857,10 @@ class BotPipeline:
                     warning = "; ".join(x for x in (str(draft.get('warning') or ''), "Склад использован только для поиска; свободная позиция не привязана к складскому остатку. Применяемость требует проверки.") if x)
                     draft = self.tools.drafts.mark(draft['token'], 'pending', warning=warning)
                 if chosen.get('source') in ('вручную по данным человека', 'указано человеком'):
-                    warning = "; ".join(x for x in (str(draft.get('warning') or ''), "Данные указаны человеком; каталог и применяемость не подтверждены.") if x)
+                    manual_note = ("Бренд и артикул указаны человеком; применяемость не подтверждена."
+                                   if draft.get('check', {}).get('name_source')
+                                   else "Данные указаны человеком; каталог и применяемость не подтверждены.")
+                    warning = "; ".join(x for x in (str(draft.get('warning') or ''), manual_note) if x)
                     draft = self.tools.drafts.mark(draft['token'], 'pending', warning=warning)
                 drafts.append(draft)
             merged = self.tools.merge_part_drafts(drafts)
@@ -2199,6 +2202,9 @@ class BotPipeline:
             log.debug("прямой разбор услуги не удался: %s", exc)
             return None
         if not outcome.draft and not outcome.applied and not outcome.choice:
+            error = self._outcome_error(outcome, "Не удалось подготовить услугу")
+            if error:
+                return PipelineResult(answer=error + " Проверьте /drafts и CRM; не повторяйте неизвестную запись.")
             return None
         result = self._from_outcome(outcome, default="Готово — проверьте и подтвердите.",
                                     user_key=key)
@@ -3342,29 +3348,65 @@ class BotPipeline:
         read_results: dict[str, ToolOutcome] = {}
         max_calls = max(12, self.s.llm_max_steps * 3)
 
+        fallback_used = False
+        fallback_settings = replace(self.s, llm_provider="groq", llm_base_url=LLM_PRESETS["groq"][0],
+                                    llm_api_key=self.s.llm_fallback_api_key,
+                                    llm_model=self.s.llm_fallback_model, llm_reasoning_effort="")
+
+        async def fallback_chat() -> dict[str, Any]:
+            # Отдельный клиент/ключ/схемы. Закрываем даже при отмене или таймауте.
+            client = LLMClient(fallback_settings)
+            try:
+                return await asyncio.wait_for(client.chat(messages, tools=TOOL_SPEC),
+                                              timeout=min(60.0, self.s.llm_timeout * 2))
+            finally:
+                await client.aclose()
+
         for _step in range(self.s.llm_max_steps):
             try:
-                message = await asyncio.wait_for(self.llm.chat(messages, tools=TOOL_SPEC), timeout=min(60.0, self.s.llm_timeout * 2))
+                if fallback_used:
+                    message = await fallback_chat()
+                else:
+                    message = await asyncio.wait_for(self.llm.chat(messages, tools=TOOL_SPEC), timeout=min(60.0, self.s.llm_timeout * 2))
             except (LLMError, asyncio.TimeoutError) as exc:
-                if result.drafts or result.applied:
-                    # Ошибка финальной формулировки не должна прятать уже готовый
-                    # черновик и вынуждать повторять изменение с риском дубля.
+                # Только самый первый вызов: никаких уже выполненных инструментов,
+                # черновиков или неопределённых записей в этом запросе. История не
+                # перезапускается, инструменты не повторяются.
+                eligible = (not fallback_used and _step == 0 and not result.tool_calls
+                            and not result.drafts and not result.applied
+                            and self.s.llm_fallback_provider == "groq"
+                            and bool(self.s.llm_fallback_api_key)
+                            and (isinstance(exc, asyncio.TimeoutError)
+                                 or getattr(exc, "retryable", False)
+                                 or getattr(exc, "status_code", None) == 429))
+                if eligible:
+                    try:
+                        message = await fallback_chat()
+                        fallback_used = True
+                    except (LLMError, asyncio.TimeoutError):
+                        result.error = "Основная модель и резервная модель Groq недоступны. Инструменты не запускались; попробуйте позже."
+                        return result
+                else:
+                    message = None
+                if message is not None:
+                    pass
+                elif result.drafts or result.applied:
                     result.answer = "Модель не смогла завершить пояснение. Подготовленные действия и результаты показаны ниже — не повторяйте их вслепую."
                     break
-                if isinstance(exc, asyncio.TimeoutError):
+                elif result.tool_calls:
+                    result.error = ("Резервная модель Groq была использована. " if fallback_used else "") + "Модель не смогла закончить запрос после вызова инструментов. Проверьте CRM и /drafts; не повторяйте действия вслепую."
+                    return result
+                elif isinstance(exc, asyncio.TimeoutError):
                     result.error = "Модель не завершила ответ за отведённое время. Запись не повторяйте вслепую; подготовленные карточки нужно проверить перед подтверждением."
                     return result
-                if getattr(exc, "status_code", None) == 429:
+                elif getattr(exc, "status_code", None) == 429:
                     result.error = "Модель ограничила частоту запросов или исчерпала квоту. Подождите восстановления лимита; это не ошибка подключения к CRM."
                     return result
-                # «мозг» (модель) недоступен — говорим это по-человечески, с шагом
-                result.error = (
-                    "Не получилось связаться с моделью, которая понимает просьбы.\n\n"
-                    "Что сделать: подождите минуту и повторите. Если не помогает — "
-                    "запустите check_network.bat для диагностики провайдера; "
-                    f"подробность для администратора: {str(exc)[:200]}"
-                )
-                return result
+                else:
+                    result.error = ("Не получилось связаться с моделью, которая понимает просьбы.\n\n"
+                                    "Подождите минуту или запустите check_network.bat для диагностики; "
+                                    f"подробность для администратора: {str(exc)[:200]}")
+                    return result
 
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
@@ -3607,6 +3649,8 @@ class BotPipeline:
         if not result.drafts and not result.applied and re.search(
                 r"подготовил(?:а)? (?:добавление|черновик)|(?:заметка|работа|услуга|тег) (?:добавлен|создан|поставлен)|отменил", result.answer, re.IGNORECASE):
             result.answer = "Не могу подтвердить выполнение или отмену: инструмент не вернул подтверждённого результата. Проверьте /drafts и карточку сделки — не считайте это сообщение подтверждением записи."
+        if fallback_used:
+            result.answer = "ℹ️ Основная модель недоступна; запрос обработан резервной моделью Groq.\n\n" + (result.answer or "")
         self._track_to(result, user_id)
         self._track_part(result, user_id)
         self._track_price(result, user_id)
