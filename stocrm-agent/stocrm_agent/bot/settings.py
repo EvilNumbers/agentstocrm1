@@ -73,6 +73,10 @@ class BotSettings:
     llm_max_steps: int = 10
     llm_reasoning_effort: str = ""        # только для моделей, которые это умеют (Gemini 3.x, gpt-oss)
     llm_timeout: float = 45.0
+    # Резерв выключен, пока администратор явно не разрешит передачу контекста Groq.
+    llm_fallback_provider: str = ""
+    llm_fallback_api_key: str = ""
+    llm_fallback_model: str = "openai/gpt-oss-120b"
 
     # --- сеть: прокси и свой сервер Bot API ---
     proxy_url: str = ""                   # socks5://user:pass@host:1080 или http://host:8080
@@ -123,6 +127,9 @@ class BotSettings:
             llm_max_steps=env_int("LLM_MAX_STEPS", 10, minimum=1, maximum=40),
             llm_reasoning_effort=(os.getenv("LLM_REASONING_EFFORT", "") or "").strip().lower(),
             llm_timeout=env_float("LLM_TIMEOUT", 45.0, minimum=5.0, maximum=600.0),
+            llm_fallback_provider=_env("LLM_FALLBACK_PROVIDER").lower(),
+            llm_fallback_api_key=_env("LLM_FALLBACK_API_KEY"),
+            llm_fallback_model=_env("LLM_FALLBACK_MODEL", LLM_PRESETS["groq"][1]),
             proxy_url=detect_proxy(_env("TG_PROXY_URL"), use_system=False)[0],
             api_server=_env("TG_API_SERVER"),
             confirm_required=_bool(os.getenv("TG_CONFIRM_REQUIRED"), True),

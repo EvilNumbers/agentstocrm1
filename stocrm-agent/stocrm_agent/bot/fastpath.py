@@ -674,6 +674,24 @@ def _status_offers(tools: Any, request: dict[str, str | None]) -> tuple[str, lis
             batch.close()
 
 
+def _plain_detail_with_prices(message: str) -> bool:
+    """Узкий запрос карточки, а не изменение цены/статуса/исполнителя."""
+    if _WRITE_ACTION.search(message) or _TO_WORD.search(message):
+        return False
+    words = re.findall(r"[а-яёa-z]+|\d+", message.casefold())
+    if sum(word.isdigit() for word in words) != 1:
+        return False
+    allowed = {"покажи", "покажите", "открой", "откройте", "дай", "дайте", "мне", "нам", "пожалуйста",
+               "подробно", "подробнее", "подробности", "карточку", "карточка", "информацию",
+               "сделка", "сделку", "сделки", "сделке", "сделкой", "эта", "эту", "этой", "данную", "текущую", "номер", "с", "и", "все", "всё",
+               "товары", "товарами", "позиции", "позициями", "работы", "работами", "услуги", "услугами",
+               "цена", "цену", "цены", "ценами", "стоимость", "стоимостью", "суммы", "суммами", "оплаты", "оплатами", "долгом",
+               "статус", "статусом", "исполнители", "исполнителями"}
+    return (all(word.isdigit() or word in allowed for word in words)
+            and any(word in {"подробно", "подробнее", "подробности", "карточку", "карточка"} for word in words)
+            and any(word.startswith("сделк") for word in words))
+
+
 def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
     """Пытается ответить без модели.
 
@@ -690,7 +708,7 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
                     "Клиента или дату в таком запросе пока нельзя надёжно совместить: отправьте запросы отдельно. "
                     "Общий список активных сделок не подменяю.", [])
         return _status_offers(tools, status_request)
-    if _is_action(message):
+    if _is_action(message) and not _plain_detail_with_prices(message):
         return None
 
     low = message.lower().replace("ё", "е")
@@ -736,8 +754,8 @@ def try_answer(text: str, tools: Any) -> tuple[str, list[int]] | None:
     detailed = _has_any(message, _DETAIL_WORDS)
     try:
         card = tools.offer_card(offer_id, with_items=detailed)
-    except Exception:          # noqa: BLE001
-        return None
+    except Exception:          # noqa: BLE001 — без повторного поиска через модель
+        return f"Не удалось получить подробности сделки №{offer_id} из CRM. Повторите позже; отсутствие сделки не подтверждено.", []
     if not isinstance(card, dict) or card.get("error") or str(card.get("offer_id")) != str(offer_id):
-        return None            # чужую или неподтверждённую карточку не показываем
+        return f"Не удалось подтвердить сделку №{offer_id} в CRM. Проверьте номер или повторите позже; отсутствие не доказано.", []
     return format_offer_card(with_status_colors(tools, [card])[0], detailed=detailed), [offer_id]

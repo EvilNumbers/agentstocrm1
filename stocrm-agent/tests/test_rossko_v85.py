@@ -145,7 +145,7 @@ def test_choice_adds_only_free_line_with_user_price(env, fake_rossko):
     payload = draft['steps'][-1]['payload']
     assert not ({'SUPPLIER_ID', 'STOCK', 'PRICE_SUPP_HUM', 'WAREHOUSE_ID'} & payload.keys())
     assert all(c['method'] not in ('offer/require/add', 'offer/order/add', 'offer/order/add_free_order') for c in session.calls)
-    assert len(fake_rossko) == 1
+    assert len(fake_rossko) == 2  # отдельно поиск бренда и название после выбора
 
 def test_supplier_order_is_blocked_including_legacy_draft(env):
     session, tools, _ = env
@@ -180,6 +180,7 @@ def test_apply_selected_rossko_brand_only_free_order_and_no_repeat_search(env, f
     result = asyncio.run(pipe.handle_text('Добавь в сделку 1313 товар ZZ99123 за 5000', [], 19))
     chosen = next(c for c in result.choices[0]['candidates'] if c['brand'] == 'OTHERCO')
     result = pipe.resume_choice(result.choices[0], chosen['index'], user_key=19)
+    assert len(fake_rossko) == 2  # поиск названия при подготовке
     original = session._add_order
     def add(method, payload):
         response = original(method, payload)
@@ -191,7 +192,7 @@ def test_apply_selected_rossko_brand_only_free_order_and_no_repeat_search(env, f
     writes = [c for c in session.calls if c['method'] in ('offer/require/add', 'offer/order/add', 'offer/order/add_free_order')]
     assert [c['method'] for c in writes] == ['offer/require/add', 'offer/order/add_free_order']
     assert not ({'SUPPLIER_ID', 'WAREHOUSE_ID', 'STOCK', 'PRICE_SUPP_HUM'} & writes[-1]['payload'].keys())
-    assert len(fake_rossko) == 1
+    assert len(fake_rossko) == 2  # применение не повторяет поиск
 
 
 def test_legacy_fallback_and_execution_guard_blocked(env):

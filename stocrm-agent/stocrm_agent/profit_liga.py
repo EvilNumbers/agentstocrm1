@@ -139,3 +139,14 @@ def search_brands(sku: str) -> dict[str, Any]:
         return _failed(trace, key, "Некоторые строки ответа не удалось проверить; список может быть неполным.",
                        status="partial", brands=rows)
     return {"status": "ok" if rows else "empty", "brands": rows}
+
+
+def search_names(sku: str, brand: str) -> dict[str, Any]:
+    """Поиск сделан, но контракт поля названия пока не подтверждён.
+
+    Из search/products установлены только article и brand; не угадываем имя
+    по непроверенному JSON-полю. Результат не подтверждает отсутствие названия.
+    """
+    result = search_brands(sku)
+    status = result.get("status")
+    return {"status": "unsupported" if status in {"ok", "empty"} else status, "brands": []}

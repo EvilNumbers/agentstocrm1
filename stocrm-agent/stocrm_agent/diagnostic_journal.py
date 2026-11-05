@@ -73,12 +73,12 @@ tags/unlink tags/unlink_link task/create task/get_filtered task/mark_member_as_r
 wms/get_filtered_stocks wms/get_supplier_ids wms/get_warehouses wms/product_cards/get_filtered wms/warehouses/get_filtered
 work/add work/get_filtered""".split())
 _EVENTS = frozenset("""bot.access bot.access_view bot.apply bot.auto_apply bot.discard bot.draft bot.drop_position
-bot.lifecycle.start bot.lifecycle.stop bot.tool.detail bot.tool.result status.list.page status.list.search balance.list.item balance.list.finish balance.validate bot.part.needs_supplier bot.policy bot.quick_manual_review bot.request.cancelled
+bot.lifecycle.start bot.lifecycle.stop bot.tool.detail bot.tool.result status.list.page status.list.search balance.list.item balance.list.finish balance.validate bot.part.needs_supplier bot.policy bot.quick_manual_review bot.uncertain_manual_review bot.request.cancelled
 bot.request.error bot.request.finish bot.request.start bot.tool.error bot.tool.request bot.voice.start bot.voice.finish bot.voice.error
 read read.error runtime.warning runtime.start runtime.start_error runtime.stop runtime.poll_error crm.call.start crm.call.finish crm.call.error crm.http crm.http.request crm.http.error_body crm.response.invalid
 quick.draft quick.stage quick.check quick.partial quick.success write.applied write.applied_after_break write.broken write.confirmed_by_uid
 write.error write.finish write.partial write.queue.position.start write.queue.position.verified write.queue.stopped write.rejected
-write.request write.step.finish write.step.start write.uncertain.readback write.unexpected write.unverified""".split())
+write.request write.step.finish write.step.start write.uncertain write.uncertain.readback write.unexpected write.unverified""".split())
 _TOOLS = frozenset("""quick_deal quick_offers quick_status_offers quick_work_snapshot offer_card offer_works offer_parts
 quick_prior_offers quick_contacts booking_existing_offers find_offers boards statuses add_offer_part add_offer_work
 book_existing_offer book_new_offer create_offer create_contact change_status calendar search_parts resolve_part

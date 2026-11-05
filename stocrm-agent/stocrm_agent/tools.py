@@ -324,20 +324,6 @@ def _is_transport_error(exc: Exception) -> bool:
     return bool(_BREAK_RE.search(str(exc)))
 
 
-def _human_break_error(method: str, tool: str = "") -> str:
-    """Что сказать человеку, когда связь оборвалась во время записи."""
-    what = f" ({METHOD_TITLES.get(method, method)})" if method else ""
-    return (
-        f"Связь с STOCRM оборвалась ровно в момент записи{what}, и панель не успела "
-        "ответить.\n"
-        "Что сделать: 1) откройте сделку в панели и посмотрите, появилось ли изменение; "
-        "2) если изменения нет — нажмите «Применить» ещё раз (дубликата не будет: "
-        "я перечитал сделку и записи нет); 3) если изменение есть — нажмите «Отмена», "
-        "второй раз применять не нужно.\n"
-        "Это не ваша ошибка и не блокировка карточки — просто не дошёл ответ."
-    )
-
-
 def _resolve_refs(payload: Any, results: list[Any]) -> Any:
     """Подставляет {"$from_step": N} реальным ID из результата шага N.
 
@@ -441,6 +427,8 @@ def _part_line(check: dict[str, Any]) -> str:
     head = title or code or "позиция"
     if code and code.lower() not in head.lower():
         head = f"{head} · {code}"
+    if check.get("name_source"):
+        head += f" (название: {check['name_source']})"
     qty = check.get("qty") or 1
     line = f"{head} × {_num(qty)}"
     price = _money(check.get("price") or 0)
@@ -1260,8 +1248,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
     def _offer_card(self, offer_id: int, with_items: bool = False) -> dict[str, Any]:
         offer_id = int(offer_id)
 
-        # Баланс и карточка независимы. Как только найдена сделка, начинаем
-        # чтение товаров/работ, не дожидаясь баланса: без дополнительных запросов.
+        # Эти независимые чтения можно начать вместе; результаты показываются
+        # только после свежего подтверждения номера сделки.
         balance: Any = None
         balance_error: str | None = None
         items: dict[str, Any] = {"parts": [], "works": []}
@@ -1284,15 +1272,21 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 items["works_error"] = str(exc) or type(exc).__name__
                 errors.append(f"услуги: {items['works_error']}")
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stocrm-balance") as pool:
-            future = pool.submit(copy_context().run, self._read, "offer_balance", "payment/get_balance",
-                                 {"ENTITY_ID": offer_id, "ENTITY_TYPE": "OFFER"})
-            # Полная карточка должна отражать и изменения, сделанные вне бота.
-            row, seen = self._search_offer_row(offer_id) if with_items else self._find_offer_row(offer_id)
-            if with_items and row is not None and _same_id(row.get("OFFER_ID"), offer_id):
-                self._run_parallel([read_parts, read_works])
+        # Все вызовы только читают. Позиции и работы запрашиваются параллельно
+        # с подтверждением номера; показывать их разрешено только после проверки ID.
+        workers = 4 if with_items else 2
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stocrm-card") as pool:
+            balance_future = pool.submit(copy_context().run, self._read, "offer_balance", "payment/get_balance",
+                                         {"ENTITY_ID": offer_id, "ENTITY_TYPE": "OFFER"})
+            row_future = pool.submit(copy_context().run,
+                                     self._search_offer_row if with_items else self._find_offer_row, offer_id)
+            item_futures = ([pool.submit(copy_context().run, fn) for fn in (read_parts, read_works)]
+                            if with_items else [])
+            row, seen = row_future.result()
+            for future in item_futures:
+                future.result()
             try:
-                balance = future.result()
+                balance = balance_future.result()
             except Exception as exc:  # noqa: BLE001 — баланс не критичен
                 balance_error = str(exc) or type(exc).__name__
 
@@ -1647,6 +1641,61 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             out = [{"supplier_id": r.get("SUPPLIER_ID") or r.get("ID"), "name": r.get("NAME")} for r in raw]
         return out
 
+    def lookup_part_name(self, sku: str, brand: str) -> dict[str, Any]:
+        """Только чтение; точные артикул/бренд, без цен и применяемости."""
+        attempts: list[str] = []
+        def evaluate(rows: list[dict[str, Any]], source: str, status: str) -> dict[str, Any] | None:
+            names: dict[str, str] = {}
+            for row in rows:
+                if not isinstance(row, dict) or parts.sku_exact(row.get("sku")) != parts.sku_exact(sku):
+                    continue
+                if not parts.exact_brand_match(brand, row.get("brand")):
+                    continue
+                name = row.get("name")
+                if not isinstance(name, str):
+                    continue
+                name = name.strip()
+                if (not name or len(name) > 200 or any(ord(c) < 32 for c in name)
+                        or not _clean_part_title(name, brand, sku)):
+                    continue
+                names.setdefault(" ".join(name.casefold().split()), name)
+            if len(names) > 1:
+                return {"status": "ambiguous", "source": source, "names": list(names.values())[:5], "attempts": attempts}
+            if len(names) == 1 and status == "ok":
+                return {"status": "found", "source": source, "name": next(iter(names.values())), "attempts": attempts}
+            return None
+
+        for source, search in (("Росско", rossko.search_names), ("Профит Лига", profit_liga.search_names)):
+            try:
+                response = search(sku, brand)
+                status = response.get("status", "unavailable")
+                rows = response.get("brands") or []
+                if not isinstance(rows, list):
+                    status, rows = "unavailable", []
+                attempts.append(f"{source}: {status}")
+                result = evaluate(rows, source, status)
+                if result:
+                    return result
+            except Exception:  # noqa: BLE001 — без секретов из исключений поставщика
+                attempts.append(f"{source}: unavailable")
+        panel_rows: list[dict[str, Any]] = []
+        panel_ok = True
+        for read in (lambda: self.product_cards(query=sku, limit=100),
+                     lambda: self.stock(sku=sku, brand=brand, limit=100)):
+            try:
+                rows = read()
+                if not isinstance(rows, list) or len(rows) >= 100:
+                    panel_ok = False
+                if isinstance(rows, list):
+                    panel_rows.extend(rows)
+            except (StocrmError, ValueError, TypeError):
+                panel_ok = False
+        attempts.append("STOCRM: " + ("ok" if panel_ok else "partial"))
+        result = evaluate(panel_rows, "STOCRM", "ok" if panel_ok else "partial")
+        if result:
+            return result
+        return {"status": "unverified", "attempts": attempts}
+
     def draft_add_offer_part(
         self,
         *,
@@ -1732,6 +1781,26 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         brand = (brand or "").strip()
         sku = (sku or "").strip()
 
+        name_warning = None
+        name_source = None
+        if sku:
+            lookup = self.lookup_part_name(sku, brand)
+            if lookup.get("status") == "ambiguous":
+                choices = "; ".join(str(value) for value in lookup.get("names", []))
+                raise ValueError(f"{lookup.get('source')} вернул несколько названий для {brand} {sku}: {choices}. Проверьте варианты в панели и добавьте вручную; запись ботом не начата")
+            if lookup.get("status") == "found":
+                found_name = lookup["name"]
+                # Не затирать осмысленное название, которое мог назвать человек.
+                if not _clean_part_title(name, brand, sku):
+                    name = found_name
+                    name_source = lookup["source"]
+                elif " ".join(name.casefold().split()) == " ".join(found_name.casefold().split()):
+                    name_source = lookup["source"]
+                else:
+                    name_warning = f"В позиции сохранено указанное название; {lookup['source']} для {brand} {sku} вернул: {found_name}. Сверьте вручную."
+            else:
+                name_warning = f"Название {brand} {sku} не удалось подтвердить по доступным источникам. Проверьте вручную; применяемость не подтверждена."
+
         steps: list[dict[str, Any]] = []
         if require_id:
             require_ref: Any = int(require_id)
@@ -1769,6 +1838,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             "qty": qty,
             "where": where,
         }
+        if name_source:
+            check["name_source"] = name_source
         summary = f"Добавить в сделку {offer_id}: {_part_line(check)}"
         if supplier_price:
             summary += f" · закупка {_num(supplier_price)} ₽"
@@ -1780,7 +1851,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # Блокировка переживает /drafts, перезапуск и изменение бренда в новой просьбе.
         self.drafts.assert_part_unblocked(check)
         extra: dict[str, Any] = {"check": check}
-        messages = [duplicate_warning] if duplicate_warning else []
+        messages = [warning for warning in (duplicate_warning, name_warning) if warning]
         if messages:
             extra["warning"] = "; ".join(messages)
         return self.drafts.create(
@@ -2438,6 +2509,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         target = self._find_work(check)
         if target is None:
             return "Не удалось однозначно проверить услугу в STOCRM. Что сделать: откройте сделку → «Работы» и проверьте наличие и сумму; не добавляйте повторно до проверки."
+        wanted_title = parts.normalize_text(str(check.get("title") or ""))
+        actual_title = parts.normalize_text(str(target.get("title") or ""))
+        if not wanted_title or not actual_title or wanted_title != actual_title:
+            return "Название созданной услуги не подтверждено или отличается от запроса. Проверьте сделку и не повторяйте добавление."
         wanted = check.get("sum")
         if wanted is None:
             return None
@@ -2531,6 +2606,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                                  "sum": float(sum_value) if sum_value is not None else (
                                      float(price_of_hour) * float(hours or 1)
                                      if price_of_hour is not None else None)}
+        self.drafts.assert_work_unblocked(check)
         return self.drafts.create(
             tool="add_offer_work", method="work/add", payload={"DATA": data}, summary=summary,
             steps=steps, extra={"check": check},
@@ -5049,7 +5125,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 # отправлять то же изменение под другим именем.
                 if lock_refusal(exc):
                     raise
-                if not _no_such_method(exc) and (exc.code is None or exc.code in (401, 403, 429) or exc.code >= 500):
+                if exc.code is None or exc.code in (401, 403, 429) or exc.code >= 500:
                     raise
                 first = first or exc
                 if index == 0:
@@ -5088,7 +5164,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             try:
                 return self.client.call(method, cleaned)
             except StocrmError as exc:
-                if _is_transport_error(exc) or exc.code is None or exc.code in (401, 403, 429):
+                if _is_transport_error(exc) or exc.code is None or exc.code in (401, 403, 429) or exc.code >= 500:
                     raise
                 text = str(exc).upper()
                 # Одно упоминание поля во внутренней ошибке не доказывает отказ до записи.
@@ -5262,67 +5338,17 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             current = self.drafts.get(token).get("status")
             if current in ("partial", "applied", "expired", "discarded"):
                 return                   # шаг уже сам объяснил, что произошло
-            if any(d.get("ok") for d in done):
-                self.drafts.mark(token, "partial",
+            saved = self.drafts.get(token)
+            if any(d.get("ok") for d in done) or saved.get("sent_step_started"):
+                self.drafts.mark(token, "partial", uncertain_network=True,
                                  failed_at=time.time(),
+                                 check_warning="Применение прервано после возможной отправки; проверьте CRM, повтор заблокирован.",
                                  done_steps={"methods": [d["method"] for d in done if d.get("ok")],
                                              "error": "применение прервано"})
             else:
-                self.drafts.release(token, reason="применение прервано, ничего не записано")
+                self.drafts.release(token, reason="применение остановлено до отправки")
         except Exception as exc:          # noqa: BLE001 — уже в аварийном сценарии
             log.error("не удалось вернуть черновик %s в рабочее состояние: %s", token, exc)
-
-    def _verify_after_break(self, draft: dict[str, Any]) -> dict[str, Any] | None:
-        """Связь оборвалась во время записи: спрашиваем у панели, записалось ли.
-
-        None — изменений в сделке нет. Иначе — данные проверки, и черновик считается
-        выполненным: повторно применять его нельзя.
-        """
-        check = draft.get("check") or {}
-        kind = check.get("kind")
-        if kind == "calendar":
-            # Создание без полученного CARD_ID нельзя подтвердить по одному совпадению времени.
-            if self._verify_calendar(check):
-                return None
-            return {"kind": "calendar", "verified": True}
-        if kind in ("added_note", "updated_note", "tagged", "untagged"):
-            verifier = {
-                "added_note": self._verify_added_note,
-                "updated_note": self._verify_updated_note,
-                "tagged": self._verify_tagged,
-                "untagged": self._verify_untagged,
-            }[str(kind)]
-            if verifier(check):
-                return None                    # в панели ничего не изменилось
-            return {"kind": kind, "verified": True}
-        if kind == "added_work":
-            try:
-                resolved = _resolve_refs(check, [])
-            except ValueError:
-                resolved = dict(check)
-            if self._verify_work_exists(resolved):
-                return None                    # работы в сделке не видно — считать записанным нельзя
-            return {"kind": "added_work", "verified": True}
-        if kind == "added_lines":
-            found = [c for c in (check.get("items") or [])
-                     if not self._check_added_line(c).get("error")]
-            if not found:
-                return None                    # ни одной позиции в сделке не видно
-            return {"kind": "added_lines", "verified": len(found), "of": len(check.get("items") or [])}
-        if kind == "added_line":
-            info = self._check_added_line(check)
-            if info.get("error"):
-                return None                    # позиции в сделке не видно
-            return {"kind": "added_line", **info}
-        if kind == "removed_line":
-            if self._verify_removed_line(check):
-                return None                    # строка на месте — удаление не прошло
-            return {"kind": "removed_line", "verified": True}
-        if kind == "order_price":
-            if self._verify_price_change(check):
-                return None                    # цена прежняя — изменения нет
-            return {"kind": "order_price", "verified": True}
-        return None
 
     PART_WRITE_INTERVAL = 0.25
 
@@ -5345,6 +5371,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     if remaining > 0:
                         time.sleep(remaining)
                 self.audit.write("write.step.start", token=token, method=step["method"], step_index=index)
+                # Фиксируем возможную отправку ДО вызова сети: при падении процесса
+                # состояние не станет безопасным для повторного применения.
+                self.drafts.mark(token, "applying", sent_step_started=True, sent_step_index=index)
                 step_started = time.monotonic()
                 try:
                     results.append(self._call_step(step, payload, results))
@@ -5371,59 +5400,26 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                         continue
                 done.append({"index": index, "method": step["method"], "payload": payload, "ok": False,
                              "error": str(exc)})
-                if step.get("optional"):
-                    # Необязательный шаг (например «пометить строку неактивной» после
-                    # удаления): его отказ не должен превращать черновик в «частично
-                    # выполненный» — итог всё равно проверяется перечитыванием сделки.
-                    log.info("необязательный шаг %s не выполнился: %s", step["method"], exc)
+                # 429/5xx, обрыв и нечитаемый ответ не доказывают отказ до записи.
+                refused = (isinstance(exc, StocrmError) and isinstance(exc.code, int)
+                           and 400 <= exc.code < 500 and exc.code != 429)
+                if step.get("optional") and refused:
+                    # Только явный отказ допустимо пропустить. После потери ответа
+                    # даже необязательный шаг мог выполнить запись: останавливаемся.
+                    log.info("необязательный шаг %s отклонён", step["method"])
                     continue
                 nothing_done = not any(d["ok"] for d in done)
-                # Повторить можно только если панель ЯВНО отказала (ответила с кодом):
-                # при таймауте неизвестно, записалось ли действие, и повтор дал бы дубликат.
-                refused = isinstance(exc, StocrmError) and (bool(exc.code) or lock_refusal(exc))
-                if nothing_done and step["method"] == "contact/create" and (not isinstance(exc, StocrmError) or exc.code is None or exc.code in (429,) or exc.code >= 500):
-                    self.drafts.mark(token, "partial", failed_at=time.time(), done_steps={"failed": "contact/create", "error": str(exc)})
-                    raise StocrmError("Результат создания контакта неизвестен. Проверьте CRM и /drafts; повтор заблокирован.") from exc
-                if nothing_done and not refused and _is_transport_error(exc):
-                    # Ответа нет: панель могла успеть записать. Спрашиваем её, а не гадаем.
-                    if draft.get("tool") == "add_offer_part":
-                        self.drafts.mark(token, "partial", failed_at=time.time(), result=list(results),
-                            done_steps={"methods": [d["method"] for d in done if d.get("ok")],
-                                        "failed": step["method"], "failed_index": index, "error": str(exc)})
-                        raise StocrmError("Связь с STOCRM оборвалась при записи. Результат неизвестен; старое совпадение в сделке не подтверждает новое добавление. Откройте /drafts → «Проверить CRM». Повторное «Применить» запрещено.") from exc
-                    landed = self._verify_after_break(draft)
-                    if landed:
-                        note = (
-                            "Связь с STOCRM оборвалась во время записи, но изменение в панели "
-                            "УЖЕ ЕСТЬ — я перечитал сделку и подтверждаю. Повторно применять "
-                            "не нужно."
-                        )
-                        self.drafts.mark(token, "applied", applied_at=time.time(),
-                                         result=landed, check_warning=note)
-                        self.audit.write("write.applied_after_break", tool=draft["tool"],
-                                         method=step["method"], payload=payload,
-                                         step_index=index, token=token)
-                        return {
-                            "status": "applied",
-                            "token": token,
-                            "method": step["method"],
-                            "methods": [step["method"]],
-                            "result": landed,
-                            "warning": note,
-                        }
-                    if draft.get("check", {}).get("kind") == "calendar":
-                        self.drafts.mark(token, "partial", failed_at=time.time(),
-                                         done_steps={"error": "Результат календаря неизвестен после обрыва связи"})
-                        raise StocrmError("Результат записи в календарь неизвестен. Проверьте STOCRM вручную; повторное применение заблокировано, чтобы не создать дубль.") from exc
-                    # Изменений в сделке нет — черновик освобождаем, «Применить» можно снова.
-                    self.drafts.release(token, reason="связь прервалась, запись не подтверждена")
-                    self.audit.write("write.broken", tool=draft["tool"], method=step["method"],
-                                     payload=payload, error=str(exc), step_index=index,
-                                     token=token)
-                    raise StocrmError(
-                        _human_break_error(step["method"], draft.get("tool", "")),
-                        method=step["method"],
-                    ) from exc
+                if nothing_done and not refused:
+                    note = ("Ответ на запись не получен или не подтверждает отказ. "
+                            "Результат неизвестен: проверьте CRM и /drafts. Повтор заблокирован; "
+                            "после проверки администратор может снять блокировку без повторной записи.")
+                    self.drafts.mark(token, "partial", failed_at=time.time(), uncertain_network=True,
+                                     check_warning=note, result=list(results),
+                                     done_steps={"methods": [], "failed": step["method"],
+                                                 "failed_index": index, "error": str(exc)})
+                    self.audit.write("write.uncertain", tool=draft["tool"], method=step["method"],
+                                     step_index=index, token=token, error=type(exc).__name__)
+                    raise StocrmError(note, method=step["method"]) from exc
                 if nothing_done and refused:
                     # Ни один шаг не выполнился — в STOCRM ничего не изменилось.
                     # Черновик не «сжигаем»: после снятия блокировки человек спокойно
@@ -5441,7 +5437,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 # чтобы повторное нажатие «Применить» не создало дубликаты.
                 self.drafts.mark(
                     token, "partial",
-                    failed_at=time.time(),
+                    failed_at=time.time(), uncertain_network=not refused,
                     done_steps={"methods": [d["method"] for d in done if d["ok"]],
                                 "failed": step["method"], "error": str(exc), "failed_index": index},
                     result=results,
@@ -5456,7 +5452,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     if any(d["ok"] for d in done) else ""
                 )
                 raise StocrmError(
-                    f"Шаг {index + 1} из {len(steps)} ({step['method']}) не выполнен: {exc}. "
+                    f"Шаг {index + 1} из {len(steps)} ({step['method']}) {'отклонён' if refused else 'не подтверждён'}: {exc}. "
                     f"{applied_note}Проверьте результат в STOCRM — повторное применение "
                     "этого черновика заблокировано, чтобы не создать дубликаты",
                     method=step["method"],
@@ -5537,7 +5533,9 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 }
         if check.get("kind") == "added_work":
             resolved = _resolve_refs(check, results)
-            created_work_id = _named_value(result, "WORK_ID")
+            created_work_id = result.get("WORK_ID") if isinstance(result, dict) else None
+            if isinstance(created_work_id, bool) or not str(created_work_id or "").isdigit() or int(created_work_id) <= 0:
+                created_work_id = None
             if created_work_id:
                 resolved["work_id"] = created_work_id
             if isinstance(result, dict):
@@ -5546,7 +5544,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 if resolved.get("title"):
                     result.setdefault("TITLE", resolved["title"])
             # Сначала сумма: если панель записала другую, человек должен узнать об этом.
-            problem = self._verify_work_sum(resolved)
+            problem = (self._verify_work_sum(resolved) if created_work_id else
+                       "CRM не вернула номер созданной услуги. Старая строка с тем же названием не подтверждает новую запись; проверьте CRM, повтор заблокирован.")
             if isinstance(result, dict) and resolved.get("actual_sum") is not None:
                 result["SUM"] = resolved["actual_sum"]
                 if resolved.get("rounding_note"):
@@ -5554,10 +5553,10 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             if problem:
                 self.audit.write("write.unexpected", tool=draft["tool"], method=methods[0],
                                  payload=draft["payload"], error=problem, token=token)
-                self.drafts.mark(token, "partial" if "offer/order/add_free_order" in methods else "applied", applied_at=time.time(), result=result,
-                                 check_warning=problem)
+                self.drafts.mark(token, "partial", applied_at=time.time(), result=result,
+                                 uncertain_network=True, check_warning=problem)
                 return {
-                    "status": "partial" if "offer/order/add_free_order" in methods else "applied",
+                    "status": "partial",
                     "verified": False,
                     "token": token,
                     "method": methods[0],

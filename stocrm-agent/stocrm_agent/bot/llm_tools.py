@@ -1648,10 +1648,12 @@ class ToolRouter:
         try:
             result = self.tools.apply_draft(draft["token"])
             applied = {"ok": True, "method": result["method"], "result": result["result"]}
-            if result.get("warning"):
-                applied["warning"] = result["warning"]
-            elif result.get("verified") is False:
-                applied["warning"] = "API принял запрос, но результат в карточке не перечитан. Проверьте его в STOCRM — подтверждённый успех не заявляю."
+            warning = result.get("warning")
+            if not warning and result.get("verified") is False:
+                warning = "API принял запрос, но результат в карточке не перечитан. Проверьте его в STOCRM — подтверждённый успех не заявляю."
+            combined = "; ".join(dict.fromkeys(str(w) for w in (draft.get("warning"), warning) if w))
+            if combined:
+                applied["warning"] = combined
             return applied
         except Exception as exc:  # лучше отдать человеку черновик, чем потерять действие
             log.warning("auto-apply не удался для %s: %s", tool, exc)
