@@ -34,8 +34,12 @@ def send(pipe, text):
 def test_voice_service_number_and_two_work_prices(env):
     session, _, pipe = env
     result = send(pipe, 'В сделку 13.25 добавь услугу замена масла ДВС 300 рублей, диагностика и замена катушки 1200.')
-    assert not result.choices and len(result.drafts) == 2
-    assert [(d['check']['offer_id'], d['check']['title'], d['check']['sum']) for d in result.drafts] == [
+    # Волна 138: две услуги из одной просьбы — одна заявка (один черновик), иначе
+    # второе «Применить» упиралось в «такая запись уже выполняется».
+    assert not result.choices and len(result.drafts) == 1
+    check = result.drafts[0]['check']
+    assert check['kind'] == 'added_works'
+    assert [(i['offer_id'], i['title'], i['sum']) for i in check['items']] == [
         (1325, 'замена масла ДВС', 300.0), (1325, 'диагностика и замена катушки', 1200.0)]
     assert not any(x['method'] in ('work/add', 'offer/require/add', 'offer/order/add_free_order') for x in session.calls)
 

@@ -442,9 +442,19 @@ class DraftStore:
         with self._locked():
             self._assert_part_unblocked_unlocked({"tool": "add_offer_part", "check": check})
 
+    #: Сколько секунд «применяемая» запись считается идущей, а не зависшей.
+    BUSY_SECONDS = 120
+
     def _assert_uncertain_unblocked_unlocked(self, draft: dict[str, Any]) -> None:
-        """Не обходить неопределённую запись новым или заранее созданным черновиком."""
+        """Не обходить неопределённую запись новым или заранее созданным черновиком.
+
+        Отдельно различаем две ситуации, потому что человеку нужно разное:
+        * другая запись прямо сейчас применяется (нажали две кнопки подряд) — надо
+          просто подождать и повторить, эта попытка ничего не отправила;
+        * у другой записи результат неизвестен (partial/зависла) — сначала проверка CRM.
+        """
         check = draft.get("check") or {}
+        busy = False
         for other in self._data.values():
             if other.get("token") in {draft.get("token"), draft.get("queue_parent"), draft.get("recovery_parent")}:
                 continue
@@ -461,7 +471,18 @@ class DraftStore:
                 # никакую другую услугу в ту же сделку через отдельный черновик.
                 same = bool(offer and old_offer and offer == old_offer)
             if same:
+                if other.get("status") == APPLYING and other.get("claimed_at"):
+                    age = time.time() - float(other.get("claimed_at") or 0)
+                    # Молодая запись почти наверняка ещё выполняется в другом потоке.
+                    if not other.get("sent_step_started") or age < self.BUSY_SECONDS:
+                        busy = True
+                        continue
                 raise ValueError("Такая запись уже выполняется или её результат неизвестен. Проверьте CRM и /drafts; повтор заблокирован.")
+        if busy:
+            raise ValueError(
+                "Сейчас в этой сделке уже применяется другая запись. Подождите пару секунд и "
+                "нажмите «Применить» ещё раз — эта попытка ещё ничего не отправила."
+            )
 
     def assert_work_unblocked(self, check: dict[str, Any]) -> None:
         with self._locked():

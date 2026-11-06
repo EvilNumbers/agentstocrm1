@@ -228,6 +228,45 @@ def _note_matches(text: str, needle: str) -> bool:
     return bool(stem) and stem in haystack
 
 
+def _multi_work_note(draft: dict[str, Any], failed_index: int, exc: Exception, *,
+                     refused: bool, lock: bool) -> str:
+    """Что именно произошло с каждой услугой заявки (панель пишет их по одной).
+
+    Панель STOCRM не принимает несколько работ одним запросом, поэтому заявка идёт
+    отдельными `work/add` по порядку. Если какой-то из них отказал, человеку нужно
+    видеть по каждой услуге: добавлена, не добавлена, результат неизвестен или ещё
+    не отправлялась — а не «шаг 2 из 2».
+    """
+    check = draft.get("check") or {}
+    items = [item for item in (check.get("items") or []) if isinstance(item, dict)]
+    lines: list[str] = []
+    for position, item in enumerate(items):
+        title = str(item.get("title") or "услуга")
+        total = _known_work_sum(item.get("sum"))
+        label = f"«{title}»" + (f" — {_thousands(total)} ₽" if total is not None else "")
+        if position < failed_index:
+            state = "добавлена"
+        elif position == failed_index:
+            state = "не добавлена" if refused else "результат неизвестен"
+        else:
+            state = "не отправлялась"
+        lines.append(f"• {label}: {state}")
+    if lock:
+        head = "STOCRM не дал записать: карточка сделки заблокирована." + _lock_holder(exc)
+    elif refused:
+        head = f"Заявка выполнена не полностью: панель отклонила запись ({exc})."
+    else:
+        head = "Заявка выполнена не полностью: ответ на запись не получен или не подтверждает отказ."
+    tail = (
+        f"\nЧто сделать: откройте сделку {check.get('offer_id')} → «Работы» и сверьте строки. "
+        "Недостающую услугу добавьте отдельной просьбой или в панели. "
+        "Повтор этой заявки заблокирован, чтобы не создать дубликаты."
+    )
+    if lock:
+        tail += " Блокировку бот не обходит: сначала сотрудник должен закрыть карточку."
+    return head + "\n" + "\n".join(lines) + tail
+
+
 def _lock_holder(exc: Exception) -> str:
     """« Карточку держит открытой: <сотрудник>.» — если панель назвала виновника."""
     text = " ".join(clean_html(str(exc)).split())
@@ -2614,7 +2653,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         считаются: только сравнение с фактическим состоянием сделки.
         """
         check = draft.get("check") or {}
-        if check.get("kind") == "added_work":
+        if check.get("kind") in ("added_work", "added_works"):
             baseline = draft.get("work_baseline")
             if not isinstance(baseline, list):
                 return False, "снимок работ до записи не сохранился"
@@ -2670,6 +2709,8 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         строку. Поэтому совпадение со старой строкой успехом не считается, а
         неполные данные и неоднозначность оставляют результат на ручную проверку.
         """
+        if check.get("kind") == "added_works" or check.get("items"):
+            return self._verify_added_works(check, baseline)
         offer_id = int(check.get("offer_id") or 0)
         title_key = parts.normalize_text(str(check.get("title") or ""))
         details: dict[str, Any] = {"offer_id": offer_id, "title": check.get("title"),
@@ -2755,6 +2796,135 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             ), details
         return None, details
 
+    def _verify_added_works(self, check: dict[str, Any],
+                            baseline: Any) -> tuple[str | None, dict[str, Any]]:
+        """Появились ли НОВЫЕ строки по всем услугам одной заявки.
+
+        Сверка та же, что и для одной услуги: название, сумма и нормо-часы по снимку
+        «до/после». Каждая позиция заявки должна дать ровно одну новую строку; лишние
+        новые строки, совпадение со старой строкой и неполные данные — повод для
+        ручной проверки, а не для повторной записи.
+        """
+        offer_id = int(check.get("offer_id") or 0)
+        items = [item for item in (check.get("items") or []) if isinstance(item, dict)]
+        details: dict[str, Any] = {
+            "offer_id": offer_id,
+            "verified_by": "снимок работ до и после записи",
+            "items": [],
+        }
+        if not items:
+            return ("В черновике нет услуг — подтвердить запись нельзя. "
+                    "Проверьте сделку → «Работы» вручную."), details
+        if not isinstance(baseline, list):
+            return ("Снимок работ до записи не сохранился, сравнивать не с чем. "
+                    "Проверьте сделку → «Работы» вручную; повторно услуги не добавляйте."), details
+        try:
+            self._invalidate_cache()
+            after = self._work_snapshot(offer_id)
+        except (StocrmError, ValueError) as exc:
+            return (f"Услуги могли добавиться, но перечитать работы сделки не удалось ({exc}). "
+                    "Проверьте сделку → «Работы» вручную; повтор блокирован."), details
+
+        before_counts: dict[tuple[str, float | None, float | None], int] = {}
+        for row in baseline:
+            key = self._work_key(row)
+            before_counts[key] = before_counts.get(key, 0) + 1
+        after_counts: dict[tuple[str, float | None, float | None], int] = {}
+        for row in after:
+            key = self._work_key(row)
+            after_counts[key] = after_counts.get(key, 0) + 1
+        added: list[tuple[str, float | None, float | None]] = []
+        for key, count in after_counts.items():
+            extra = count - before_counts.get(key, 0)
+            if extra > 0:
+                added.extend([key] * extra)
+        details["added_rows"] = len(added)
+
+        used: set[int] = set()
+        problems: list[str] = []
+        for item in items:
+            title = str(item.get("title") or "")
+            title_key = parts.normalize_text(title)
+            entry: dict[str, Any] = {"title": title, "sum": None, "hours": None,
+                                     "verified": False, "note": ""}
+            details["items"].append(entry)
+            if not title_key:
+                entry["note"] = "нет названия услуги"
+                problems.append("у позиции без названия подтверждение невозможно")
+                continue
+            candidates = [index for index, key in enumerate(added)
+                          if index not in used and key[0] == title_key]
+            if not candidates:
+                same_before = any(key[0] == title_key for key in before_counts)
+                entry["note"] = ("такая услуга в сделке уже была до записи, новой строки не появилось"
+                                 if same_before else "новой строки с этим названием не видно")
+                problems.append(f"«{title}»: {entry['note']}")
+                continue
+            wanted_sum = _known_work_sum(item.get("sum"))
+            wanted_hours = self._work_hours(item.get("hours"))
+
+            def fits(index: int) -> bool:
+                key = added[index]
+                if wanted_sum is not None and key[1] is not None:
+                    if abs(key[1] - wanted_sum) >= self.WORK_SUM_EPS:
+                        return False
+                if wanted_hours is not None and key[2] is not None:
+                    if abs(key[2] - wanted_hours) > self.WORK_HOURS_EPS:
+                        return False
+                return True
+
+            matching = [index for index in candidates if fits(index)]
+            chosen = (matching or candidates)[0]
+            used.add(chosen)
+            _title, actual_sum, actual_hours = added[chosen]
+            entry["sum"], entry["hours"] = actual_sum, actual_hours
+            if len(candidates) > 1:
+                entry["note"] = ("после записи несколько новых строк с этим названием — "
+                                 "какая создана этим запросом, доказать нельзя")
+                problems.append(f"«{title}»: {entry['note']}")
+                continue
+            entry["verified"] = True
+            if wanted_sum is not None:
+                if actual_sum is None:
+                    entry["verified"] = False
+                    entry["note"] = "STOCRM не вернул сумму услуги — сумму проверить не удалось"
+                    problems.append(f"«{title}»: {entry['note']}")
+                elif abs(actual_sum - wanted_sum) >= self.WORK_SUM_EPS:
+                    difference = abs(actual_sum - wanted_sum)
+                    rounded = (difference < self.price_rounding_step and actual_sum > 0
+                               and self.price_rounding_step > 0
+                               and abs(actual_sum / 5 - round(actual_sum / 5)) < 0.001)
+                    if rounded:
+                        entry["note"] = (f"учтено округление панели: запрошено "
+                                         f"{_thousands(wanted_sum)} ₽, фактически "
+                                         f"{_thousands(actual_sum)} ₽")
+                    else:
+                        entry["verified"] = False
+                        entry["note"] = (f"сумма в CRM {_thousands(actual_sum)} ₽ вместо "
+                                         f"{_thousands(wanted_sum)} ₽")
+                        problems.append(f"«{title}»: {entry['note']}")
+            if wanted_hours is not None:
+                if actual_hours is None:
+                    entry["verified"] = False
+                    entry["note"] = "STOCRM не вернул нормо-часы услуги — их проверить не удалось"
+                    problems.append(f"«{title}»: {entry['note']}")
+                elif abs(actual_hours - wanted_hours) > self.WORK_HOURS_EPS:
+                    entry["verified"] = False
+                    entry["note"] = f"нормо-часы в CRM {actual_hours:g} вместо {wanted_hours:g}"
+                    problems.append(f"«{title}»: {entry['note']}")
+
+        extra_rows = len(added) - len(used)
+        if extra_rows > 0:
+            details["extra_rows"] = extra_rows
+            problems.append(f"после записи появились ещё строки ({extra_rows}), которых нет в заявке")
+        if problems:
+            return (
+                "Результат требует проверки: " + "; ".join(problems)
+                + ". Проверьте сделку → «Работы» и поправьте строки в панели; "
+                "повторно услуги не добавляйте."
+            ), details
+        return None, details
+
     def _capabilities(self) -> dict[str, Any]:
         """Что бот уже выяснил про недокументированные методы (.state/capabilities.json)."""
         if not self.capabilities_path or not self.capabilities_path.exists():
@@ -2798,6 +2968,27 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         тратил время и создавал ложное «готово». Исполнитель ставится в панели, в блоке
         «Работы».
         """
+        data = self._work_data(offer_id=offer_id, title=title, hours=hours,
+                               price_of_hour=price_of_hour, sum_value=sum_value)
+        summary = f"Добавить работу «{title}» ({hours} н/ч) в сделку {offer_id}"
+        if price_of_hour is not None:
+            summary += f" по {price_of_hour} ₽/час"
+        elif sum_value is not None:
+            summary += f" на сумму {_num(sum_value)} ₽"
+
+        steps: list[dict[str, Any]] = [{"method": "work/add", "payload": {"DATA": data}}]
+        check = self._work_check(offer_id=offer_id, title=title, hours=hours,
+                                 price_of_hour=price_of_hour, sum_value=sum_value)
+        self.drafts.assert_work_unblocked(check)
+        return self.drafts.create(
+            tool="add_offer_work", method="work/add", payload={"DATA": data}, summary=summary,
+            steps=steps, extra={"check": check},
+        )
+
+    def _work_data(self, *, offer_id: int, title: str, hours: float = 1,
+                   price_of_hour: float | None = None,
+                   sum_value: float | None = None) -> dict[str, Any]:
+        """Тело работы для `work/add` (свободная форма, без ID каталога)."""
         data: dict[str, Any] = {
             "OFFER_ID": int(offer_id),
             "TYPE": self.free_form_type,
@@ -2815,23 +3006,57 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 data["PRICE_OF_HOUR"] = float(sum_value) / float(hours or 1)
         if price_of_hour is None and sum_value is None:
             raise ValueError("Назовите стоимость услуги или цену нормочаса — нулевую сумму вместо неизвестной не подставляю")
+        return data
 
-        summary = f"Добавить работу «{title}» ({hours} н/ч) в сделку {offer_id}"
-        if price_of_hour is not None:
-            summary += f" по {price_of_hour} ₽/час"
-        elif sum_value is not None:
-            summary += f" на сумму {_num(sum_value)} ₽"
+    def _work_check(self, *, offer_id: int, title: str, hours: float = 1,
+                    price_of_hour: float | None = None,
+                    sum_value: float | None = None) -> dict[str, Any]:
+        """Что должно появиться в работах сделки после записи (для сверки снимков)."""
+        return {"kind": "added_work", "offer_id": int(offer_id), "title": title,
+                "hours": float(hours or 1),
+                "sum": float(sum_value) if sum_value is not None else (
+                    float(price_of_hour) * float(hours or 1)
+                    if price_of_hour is not None else None)}
 
-        steps: list[dict[str, Any]] = [{"method": "work/add", "payload": {"DATA": data}}]
-        check: dict[str, Any] = {"kind": "added_work", "offer_id": int(offer_id), "title": title,
-                                 "hours": float(hours or 1),
-                                 "sum": float(sum_value) if sum_value is not None else (
-                                     float(price_of_hour) * float(hours or 1)
-                                     if price_of_hour is not None else None)}
+    def draft_add_offer_works(self, *, offer_id: int,
+                              items: list[dict[str, Any]]) -> dict[str, Any]:
+        """ЧЕРНОВИК: несколько услуг из одной просьбы — одной заявкой.
+
+        Раньше каждая услуга становилась отдельным черновиком. Человек видел две
+        кнопки «Применить», а нажатие подряд (или почти одновременно) упиралось в
+        защиту «такая запись уже выполняется», и вторая услуга не добавлялась вовсе
+        (журнал 06.11, сделка №1371: из двух услуг добавилась одна). Теперь все услуги
+        из одной просьбы идут одним черновиком с шагами `work/add`: одно нажатие,
+        один снимок работ «до/после», одна проверка.
+        """
+        prepared = [dict(item) for item in (items or []) if isinstance(item, dict)]
+        if not prepared:
+            raise ValueError("В просьбе нет ни одной услуги; черновик не создан")
+        steps: list[dict[str, Any]] = []
+        checks: list[dict[str, Any]] = []
+        labels: list[str] = []
+        for item in prepared:
+            title = str(item.get("title") or "").strip()
+            if len(title) < 3:
+                raise ValueError("У услуги нет названия; черновик не создан")
+            hours = float(item.get("hours") or 1)
+            data = self._work_data(offer_id=offer_id, title=title, hours=hours,
+                                   price_of_hour=item.get("price_of_hour"),
+                                   sum_value=item.get("sum_value"))
+            checks.append(self._work_check(offer_id=offer_id, title=title, hours=hours,
+                                           price_of_hour=item.get("price_of_hour"),
+                                           sum_value=item.get("sum_value")))
+            steps.append({"method": "work/add", "payload": {"DATA": data}})
+            total = checks[-1].get("sum")
+            labels.append(f"«{title}»" + (f" — {_num(total)} ₽" if total is not None else ""))
+        check: dict[str, Any] = {"kind": "added_works", "offer_id": int(offer_id),
+                                 "items": checks}
         self.drafts.assert_work_unblocked(check)
+        summary = (f"Добавить работы в сделку {offer_id}: " + "; ".join(labels)
+                   if len(labels) > 1 else f"Добавить работу {labels[0]} в сделку {offer_id}")
         return self.drafts.create(
-            tool="add_offer_work", method="work/add", payload={"DATA": data}, summary=summary,
-            steps=steps, extra={"check": check},
+            tool="add_offer_work", method="work/add", payload=steps[0]["payload"],
+            summary=summary, steps=steps, extra={"check": check},
         )
 
     def offer_history(self, offer_id: int, limit: int = 50) -> list[dict[str, Any]]:
@@ -4970,7 +5195,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             self.audit.write("write.finish", token=token, ms=round((time.monotonic()-started)*1000))
             return result
         except Exception as exc:
-            self.audit.write("write.error", token=token, error=type(exc).__name__, ms=round((time.monotonic()-started)*1000))
+            from .diagnostic_journal import write_reason
+            # error_class и reason объясняют отказ без чтения кода: ValueError с
+            # reason=write_uncertain — это отказ бота до отправки, а не ответ панели.
+            self.audit.write("write.error", token=token, error=type(exc).__name__,
+                             error_class=type(exc).__name__, reason=write_reason(exc),
+                             ms=round((time.monotonic()-started)*1000))
             raise
         finally:
             TRACE_ID.reset(context_token)
@@ -5144,7 +5374,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # а не вторую запись в CRM.
         draft = self.drafts.claim(token)
         started = time.monotonic()
-        if (draft.get("check") or {}).get("kind") == "added_work":
+        if (draft.get("check") or {}).get("kind") in ("added_work", "added_works"):
             # Снимок работ ДО записи: без него сравнивать «до/после» будет не с чем.
             # Он сохраняется в .state до сетевого вызова и переживает перезапуск.
             # Если прочитать не удалось — исключение ниже вернёт черновик в ожидание
@@ -5761,6 +5991,15 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     f"Уже выполнено: {', '.join(d['method'] for d in done if d['ok'])}. "
                     if any(d["ok"] for d in done) else ""
                 )
+                multi_note = None
+                if (draft.get("check") or {}).get("kind") == "added_works":
+                    # Несколько услуг одной заявкой: панель пишет их отдельными
+                    # запросами, поэтому показываем состояние каждой строки.
+                    multi_note = _multi_work_note(draft, index, exc, refused=refused, lock=lock)
+                    self.drafts.mark(token, "partial", check_warning=multi_note)
+                if multi_note:
+                    raise StocrmError(multi_note, method=step["method"],
+                                      code=getattr(exc, "code", None)) from exc
                 if lock:
                     # Блокировка на втором шаге: что-то уже записано, поэтому обещать
                     # «ничего не изменилось» нельзя. Повтор всей заявки запрещён.
@@ -5854,34 +6093,59 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     "result": result,
                     "warning": problem,
                 }
-        if check.get("kind") == "added_work":
+        if check.get("kind") in ("added_work", "added_works"):
             # Проверка по ID убрана: панель может ответить просто числом (в отчёте —
             # 4319), и это ничего не доказывало. Сравниваем работы сделки до и после
             # записи по названию, сумме и нормо-часам настолько, насколько они
             # достоверно доступны. Ответ API сохраняем как справку, не как доказательство.
             problem, details = self._verify_added_work(check, draft.get("work_baseline"))
-            work_result: dict[str, Any] = {
-                "OFFER_ID": check.get("offer_id"),
-                "TITLE": check.get("title"),
-                # Честная оговорка: снимок «до/после» не доказывает авторство строки,
-                # если в сделке параллельно работал другой сотрудник.
-                "VERIFICATION_NOTE": ("Проверка: сравнение работ сделки до и после записи. "
-                                      "При одновременной работе других сотрудников авторство "
-                                      "строки не гарантируется."),
-            }
-            if details.get("sum") is not None:
-                work_result["SUM"] = details["sum"]
-            if details.get("hours") is not None:
-                work_result["WORKING_HOUR"] = details["hours"]
-            if details.get("rounding_note"):
-                work_result["ROUNDING_NOTE"] = details["rounding_note"]
-            if isinstance(result, (str, int, float)) and not isinstance(result, bool):
-                # Число от панели может быть номером работы, но подтверждением не служит.
-                work_result["PANEL_RESPONSE"] = result
-            elif isinstance(result, dict):
-                work_result["PANEL_RESPONSE"] = {
-                    key: result[key] for key in ("WORK_ID", "OFFER_ID") if key in result
+            # Честная оговорка: снимок «до/после» не доказывает авторство строки,
+            # если в сделке параллельно работал другой сотрудник.
+            note = ("Проверка: сравнение работ сделки до и после записи. "
+                    "При одновременной работе других сотрудников авторство "
+                    "строки не гарантируется.")
+            if check.get("kind") == "added_works":
+                # Несколько услуг одной заявкой: показываем каждую строку отдельно.
+                works: list[dict[str, Any]] = []
+                for entry in details.get("items") or []:
+                    row: dict[str, Any] = {"TITLE": entry.get("title"),
+                                           "VERIFIED": bool(entry.get("verified"))}
+                    if entry.get("sum") is not None:
+                        row["SUM"] = entry["sum"]
+                    if entry.get("hours") is not None:
+                        row["WORKING_HOUR"] = entry["hours"]
+                    if entry.get("note"):
+                        row["NOTE"] = entry["note"]
+                    works.append(row)
+                work_result: dict[str, Any] = {
+                    "OFFER_ID": check.get("offer_id"),
+                    "WORKS": works,
+                    "VERIFICATION_NOTE": note,
                 }
+                if isinstance(result, list):
+                    panel = [item for item in result
+                             if isinstance(item, (str, int, float)) and not isinstance(item, bool)]
+                    if panel:
+                        work_result["PANEL_RESPONSE"] = panel
+            else:
+                work_result = {
+                    "OFFER_ID": check.get("offer_id"),
+                    "TITLE": check.get("title"),
+                    "VERIFICATION_NOTE": note,
+                }
+                if details.get("sum") is not None:
+                    work_result["SUM"] = details["sum"]
+                if details.get("hours") is not None:
+                    work_result["WORKING_HOUR"] = details["hours"]
+                if details.get("rounding_note"):
+                    work_result["ROUNDING_NOTE"] = details["rounding_note"]
+                if isinstance(result, (str, int, float)) and not isinstance(result, bool):
+                    # Число от панели может быть номером работы, но подтверждением не служит.
+                    work_result["PANEL_RESPONSE"] = result
+                elif isinstance(result, dict):
+                    work_result["PANEL_RESPONSE"] = {
+                        key: result[key] for key in ("WORK_ID", "OFFER_ID") if key in result
+                    }
             result = work_result
             if problem:
                 self.audit.write("write.unexpected", tool=draft["tool"], method=methods[0],

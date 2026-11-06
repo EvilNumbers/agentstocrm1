@@ -2202,16 +2202,31 @@ class BotPipeline:
             parsed = [work_in_request("добавь услугу " + chunk) for chunk in chunks]
             if any(not item or item.get("price") is None for item in parsed):
                 return PipelineResult(answer="Не удалось однозначно разделить услуги и цены. Укажите каждую услугу с ценой отдельно; ничего не записано.")
-            drafts = []
+            # Все услуги из одной просьбы — одной заявкой: раньше это были отдельные
+            # черновики, и нажатие двух «Применить» подряд блокировало вторую услугу
+            # («такая запись уже выполняется»), поэтому добавлялась только одна из двух.
             try:
-                for item in parsed:
-                    assert item is not None
-                    drafts.append(self.tools.draft_add_offer_work(offer_id=int(offer_id), title=str(item['title']), sum_value=float(item['price'])))
-            except Exception:
-                for draft in drafts:
-                    self.tools.drafts.mark(draft['token'], 'discarded', reason='подготовка остальных услуг не удалась')
-                return PipelineResult(answer="Не удалось подготовить все услуги. Ничего не записано; проверьте формулировку и повторите.")
-            return PipelineResult(answer="Подготовлены отдельные услуги. Проверьте названия, цены и номер сделки; каждую подтвердите отдельно.", drafts=drafts)
+                outcome = self.router.multi_work(
+                    offer_id=int(offer_id),
+                    items=[{"title": str(item['title']), "sum_value": float(item['price'])}
+                           for item in parsed if item],
+                )
+            except Exception as exc:              # noqa: BLE001 — не смогли, ничего не записано
+                return PipelineResult(answer=(
+                    f"Не удалось подготовить услуги одной заявкой: {exc}. "
+                    "Ничего не записано; проверьте формулировку и повторите."
+                ))
+            result = self._from_outcome(
+                outcome,
+                default="Подготовлены услуги одной заявкой. Проверьте названия, цены и номер сделки; подтвердите одной кнопкой.",
+                user_key=key,
+            )
+            self._last_work_request[key] = {"offer_id": offer_id,
+                                            "title": "; ".join(str(item['title']) for item in parsed if item),
+                                            "price": None}
+            while len(self._last_work_request) > 200:
+                self._last_work_request.pop(next(iter(self._last_work_request)))
+            return result
         offer_id = info.get("offer_id") or self._last_offer.get(key)
         title = str(info["title"])
         price = info.get("price")

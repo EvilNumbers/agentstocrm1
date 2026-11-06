@@ -63,6 +63,10 @@ def main(argv: list[str] | None = None) -> int:
         from .support import main as support_main
 
         return support_main(argv[1:])
+    if argv and argv[0] == "support-incident":
+        from .incident import main as incident_main
+
+        return incident_main(argv[1:])
 
     cfg = Config.from_env(require=False)
 
