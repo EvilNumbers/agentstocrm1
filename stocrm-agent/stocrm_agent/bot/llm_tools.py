@@ -13,6 +13,7 @@ import inspect
 from contextvars import ContextVar
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -336,6 +337,31 @@ class ToolOutcome:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+#: Служебные слова, которые не помогают узнать статус в названии.
+_TITLE_STOP_WORDS = {"для", "или", "без", "при", "под", "над", "это", "как", "the", "and"}
+
+
+def _title_stems(value: str) -> set[str]:
+    words = re.findall(r"[a-zа-я0-9]+", key(value))
+    return {word[:4] for word in words if len(word) >= 4 and word not in _TITLE_STOP_WORDS}
+
+
+def status_titles_match(wanted: str, title: str) -> bool:
+    """Совпадает ли названный человеком статус с названием из CRM.
+
+    Сравнение мягкое: «успешно реализовано» ↔ «Реализовано», «оплата» ↔
+    «Ожидает оплаты», «в работе» ↔ «В работе на сервисе». Нужно, чтобы модель не
+    подменила названный статус другим, и чтобы точное название из панели не
+    требовалось слово в слово.
+    """
+    want, got = key(wanted), key(title)
+    if not want or not got:
+        return False
+    if want == got or want in got or got in want:
+        return True
+    return bool(_title_stems(want) & _title_stems(got))
+
+
 def _request_hint(name: str) -> property:
     def get(router: Any) -> Any:
         return (router._request_context.get() or router._fallback_hints).get(name)
@@ -587,7 +613,9 @@ class ToolRouter:
         if name == "draft_change_status":
             authorized = self.status_authorized
             if isinstance(authorized, bool) or not isinstance(authorized, int) or authorized <= 0:
-                message = "Для смены статуса укажите номер одной сделки прямо в сообщении."
+                message = ("Смену статуса делаю, только если в сообщении есть номер одной сделки "
+                           "и название статуса. Например: «Сделку 1359 переведи в статус "
+                           "„Успешно реализовано“».")
                 return ToolOutcome(payload=json.dumps({"error": message}, ensure_ascii=False), meta={"status_target_blocked": message})
             # Модель может назвать чужие сделку, воронку или статус.
             try:
@@ -601,8 +629,14 @@ class ToolRouter:
                 clean_args['offer_id'], clean_args['board_id'] = authorized, int(board)
                 if self.status_target_name:
                     title, _ = self.tools._status_info(int(board), int(clean_args['status_id']))
-                    if key(title) != key(self.status_target_name):
-                        raise ValueError("статус модели не совпал с названным человеком")
+                    if not status_titles_match(self.status_target_name, title):
+                        message = (
+                            f"Не удалось подтвердить смену: выбран статус "
+                            f"«{title or 'не подтверждён'}», а в сообщении назван другой — "
+                            f"«{self.status_target_name}». Назовите статус точнее или смените его в панели."
+                        )
+                        return ToolOutcome(payload=json.dumps({"error": message}, ensure_ascii=False),
+                                           meta={"status_target_blocked": message})
             except Exception:
                 message = "Не удалось подтвердить сделку, её воронку или запрошенный статус; уточните данные в CRM."
                 return ToolOutcome(payload=json.dumps({"error": message}, ensure_ascii=False), meta={"status_target_blocked": message})
