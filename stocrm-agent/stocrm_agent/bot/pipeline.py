@@ -669,6 +669,37 @@ def tag_in_request(text: str) -> dict[str, Any] | None:
     return None
 
 
+#: Глаголы, которыми человек просит изменить состояние сделки.
+_STATUS_CHANGE_VERB = re.compile(
+    r"\b(?:перемест\w*|перевед\w*|перевести|поменя\w*|смени\w*|сменить|измен\w*|"
+    r"отправ\w*|убер\w*|закро\w*)\b", re.I)
+#: Слова-признаки статуса, которые человек называет прямо («смени статус»).
+_STATUS_WORD = re.compile(
+    r"\b(?:статус\w*|мусор\w*|отказ\w*|запис\w*|воронк\w*|работ\w*|заказ\w*|"
+    r"просч[её]т\w*|проценк\w*)\b", re.I)
+#: Основы названий статусов, которые человек пишет без слова «статус»:
+#: «Сделку 1359 переведи в успешно реализовано». Сверка с названием статуса из
+#: CRM — мягкая, по основам слов (см. status_titles_match в llm_tools).
+_STATUS_TITLE_STEMS: tuple[str, ...] = (
+    "реализован", "выполнен", "закрыт", "согласован", "доставлен", "принят", "опла",
+)
+
+
+def _status_title_in(text: str) -> str | None:
+    """Названный человеком статус («успешно реализовано») или None.
+
+    Нужно, чтобы «переведи сделку 1359 в успешно реализовано» распознавалось как
+    смена статуса: слово «статус» человек не произнёс, а намерение очевидно.
+    Возвращает то слово, которое было в сообщении, — его и показываем человеку.
+    """
+    low = (text or "").lower().replace("ё", "е")
+    for stem in _STATUS_TITLE_STEMS:
+        found = re.search(rf"\b({stem}\w*)", low)
+        if found:
+            return found.group(1)
+    return None
+
+
 def _normalize_deal_slip(text: str) -> str:
     # Только начало голосовой команды: «вилку 1313, добавь…», не название детали.
     text = re.sub(r"^\s*(?:вилку|делку|в\s+делку)\s+(\d{1,6}(?:\.\d{1,3})?)\s*[,;:]?\s*(?=добав)",
@@ -3127,16 +3158,27 @@ class BotPipeline:
             text = reference_pattern.sub(lambda m: f"{m.group(0)} №{shown}", text, count=1)
         # Явный номер имеет приоритет; «эта сделка» — последняя действительно
         # показанная CRM-сделка этого сотрудника, а не номер, придуманный моделью.
-        status_action = bool(re.search(r"\b(?:перемест\w*|перевед\w*|перевести|поменя\w*|смени\w*|сменить|измен\w*|отправ\w*|убер\w*|закро\w*)\b", text, re.I)
-                             and re.search(r"\b(?:статус\w*|мусор\w*|отказ\w*|запис\w*|воронк\w*|работ\w*|заказ\w*|просч[её]т\w*|проценк\w*)\b", text, re.I))
+        change_verb = _STATUS_CHANGE_VERB.search(text)
         named = {int(m.group(1)) for m in money_text.DEAL_NUMBER.finditer(text)}
         numbers = {int(n) for n in re.findall(r"(?<!\d)\d+(?!\d)", text)}
+        # Название статуса без слова «статус» («переведи в успешно реализовано»).
+        # Считаем это сменой статуса только вместе с номером сделки: иначе «отправь
+        # счёт на оплату» превращалось бы в отказ «укажите номер сделки».
+        status_title = _status_title_in(text) if change_verb else None
+        status_action = bool(change_verb and (_STATUS_WORD.search(text)
+                                              or (status_title and named)))
         is_this_deal = bool(re.search(r"\b(?:эта|эту|этой|данную|данная|данной|текущую|текущая|текущей)\s+(?:быстр\w+\s+)?сделк\w*\b", text, re.I))
         self.router.status_authorized = (next(iter(named)) if status_action and len(named) == 1 and named == numbers
                                          else self._last_shown_offer.get(user_id or 0) if status_action and is_this_deal and not numbers else None)
-        self.router.status_target_name = 'мусор' if status_action and re.search(r"\bмусор\w*\b", text, re.I) else None
+        if status_action and re.search(r"\bмусор\w*\b", text, re.I):
+            self.router.status_target_name = 'мусор'
+        else:
+            self.router.status_target_name = status_title if status_action else None
         if status_action and self.router.status_authorized is None:
-            return PipelineResult(answer="Не удалось определить сделку. Откройте её карточку или укажите номер одной сделки в сообщении; ничего не записано.")
+            shown = self._last_shown_offer.get(user_id or 0)
+            example = (f" Похоже, речь о сделке №{shown} — напишите: «Сделку {shown} переведи в статус „Успешно реализовано“»."
+                       if shown else " Например: «Сделку 1359 переведи в статус „Успешно реализовано“».")
+            return PipelineResult(answer="Смену статуса делаю только по номеру одной сделки в том же сообщении." + example + " Ничего не записано.")
         if quick_read.is_quick_request(text) and not status_action:
             self._quick_pending.pop(user_id or 0, None)
             return await asyncio.to_thread(self._quick_read, text, user_id or 0)
