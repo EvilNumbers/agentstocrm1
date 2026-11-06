@@ -22,6 +22,29 @@ class DraftRecoveryMixin:
         check = draft.get("check") or {}
         problem, details = self._verify_added_work(check, draft.get("work_baseline"))
         verified = problem is None
+        if check.get("kind") == "added_works":
+            # Несколько услуг одной заявкой: показываем каждую позицию отдельно.
+            rows = []
+            for entry in details.get("items") or []:
+                actual = None
+                if entry.get("sum") is not None:
+                    actual = f"{entry['sum']:g} ₽"
+                    if entry.get("hours") is not None:
+                        actual += f" · {entry['hours']:g} н/ч"
+                elif entry.get("hours") is not None:
+                    actual = f"{entry['hours']:g} н/ч"
+                rows.append({
+                    "offer_id": check.get("offer_id"),
+                    "title": entry.get("title"),
+                    "sku": "",
+                    "matches": 1 if entry.get("verified") else 0,
+                    "verified": bool(entry.get("verified")),
+                    "actual": actual,
+                    "execution": "сравнение работ сделки до и после записи",
+                    "note": entry.get("note") or "",
+                })
+            return {"verified": verified, "details": rows, "can_resume": False,
+                    "problem": problem or ""}
         actual = None
         if details.get("sum") is not None:
             actual = f"{details['sum']:g} ₽"
@@ -64,7 +87,7 @@ class DraftRecoveryMixin:
     def review_draft(self: Any, token: str) -> dict[str, Any]:
         draft = self.drafts.get(token)
         check = draft.get("check") or {}
-        if check.get("kind") == "added_work":
+        if check.get("kind") in ("added_work", "added_works"):
             return self._review_work_draft(draft)
         checks = check.get("items") if check.get("kind") == "added_lines" else [check]
         if not checks or any(

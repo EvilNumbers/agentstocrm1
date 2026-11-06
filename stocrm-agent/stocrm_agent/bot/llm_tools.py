@@ -1678,6 +1678,48 @@ class ToolRouter:
                 return item
         return candidates[wanted] if 0 <= wanted < len(candidates) else None
 
+    def multi_work(self, *, offer_id: int, items: list[dict[str, Any]]) -> ToolOutcome:
+        """Несколько услуг из одной просьбы: один черновик и одно подтверждение.
+
+        Так человек видит одну кнопку «Применить» вместо двух: раньше нажатие на две
+        карточки подряд упиралось в защиту «такая запись уже выполняется», и вторая
+        услуга в сделку не попадала (журнал 06.11, сделка №1371).
+        """
+        draft = self.tools.draft_add_offer_works(offer_id=offer_id, items=items)
+        if self.prepare_only or self.policy.requires_confirmation("draft_add_offer_work"):
+            self.tools.audit.write("bot.draft", tool="add_offer_work",
+                                   summary=draft.get("summary"), mode="confirm")
+            return ToolOutcome(
+                payload=json.dumps({"status": "черновик создан, ждёт подтверждения человеком",
+                                    "summary": draft.get("summary"), "mode": "confirm"},
+                                   ensure_ascii=False),
+                draft=draft,
+            )
+        applied = self._apply_now(draft, tool="draft_add_offer_work")
+        if applied.get("ok"):
+            self.tools.audit.write("bot.auto_apply", tool="add_offer_work",
+                                   summary=draft.get("summary"), mode="auto",
+                                   method=applied.get("method"))
+            return ToolOutcome(
+                payload=json.dumps({
+                    "status": ("результат НЕ подтверждён — сообщи предупреждение, не говори «готово»"
+                               if applied.get("warning") else
+                               "выполнено сразу (подтверждение отключено в настройках)"),
+                    "warning": applied.get("warning"),
+                    "summary": draft.get("summary"),
+                    "method": applied.get("method"),
+                    "result": applied.get("result"),
+                    "mode": "auto",
+                }, ensure_ascii=False, default=str),
+                applied={**draft, **applied, "mode": "auto"},
+            )
+        return ToolOutcome(
+            payload=json.dumps({"status": "не удалось выполнить автоматически, создан черновик",
+                                "error": applied.get("error"),
+                                "summary": draft.get("summary")}, ensure_ascii=False),
+            draft=draft,
+        )
+
     def _apply_now(self, draft: dict[str, Any], *, tool: str) -> dict[str, Any]:
         try:
             result = self.tools.apply_draft(draft["token"])

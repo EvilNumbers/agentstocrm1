@@ -160,6 +160,22 @@ def format_apply_result(method: str, result: Any, *, summary: str = "", warning:
     if where:
         lines.append("• " + ", ".join(str(w) for w in where))
 
+    # Несколько услуг одной заявкой: каждая строка отдельно, без общего «названия».
+    work_rows = next((item.get("WORKS") for item in items
+                      if isinstance(item.get("WORKS"), list)), None)
+    if work_rows:
+        for row in work_rows:
+            if not isinstance(row, dict):
+                continue
+            line = f"• {row.get('TITLE') or 'услуга'}"
+            if row.get("SUM") is not None:
+                line += f" — {_grouped(row['SUM'])} ₽"
+            if row.get("WORKING_HOUR") is not None:
+                line += f" · {row['WORKING_HOUR']:g} н/ч"
+            if row.get("NOTE"):
+                line += f" ({row['NOTE']})"
+            lines.append(line)
+        name = None
     if isinstance(name, str) and name.strip():
         lines.append(f"• {name.strip()}")
     details = []
