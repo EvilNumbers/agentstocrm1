@@ -5195,7 +5195,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             self.audit.write("write.finish", token=token, ms=round((time.monotonic()-started)*1000))
             return result
         except Exception as exc:
-            self.audit.write("write.error", token=token, error=type(exc).__name__, ms=round((time.monotonic()-started)*1000))
+            from .diagnostic_journal import write_reason
+            # error_class и reason объясняют отказ без чтения кода: ValueError с
+            # reason=write_uncertain — это отказ бота до отправки, а не ответ панели.
+            self.audit.write("write.error", token=token, error=type(exc).__name__,
+                             error_class=type(exc).__name__, reason=write_reason(exc),
+                             ms=round((time.monotonic()-started)*1000))
             raise
         finally:
             TRACE_ID.reset(context_token)

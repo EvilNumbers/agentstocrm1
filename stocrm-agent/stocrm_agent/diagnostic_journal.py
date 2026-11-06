@@ -243,6 +243,27 @@ def error_kind(exc: BaseException | str) -> str:
     return 'other'
 
 
+def write_reason(exc: BaseException | str) -> str:
+    """Короткий код причины отказа записи — чтобы журнал объяснял сам себя.
+
+    Без него `write.error` выглядит как `error_kind=other` и не отличим от сбоя CRM:
+    по коду видно, отказал бот до отправки или ответила панель.
+    """
+    text = str(exc).casefold()
+    if 'ещё собирается' in text:
+        return 'write_batch_preparing'
+    if 'уже применяется' in text or 'подождите пару секунд' in text:
+        return 'write_busy'
+    if ('результат неизвестен' in text or 'повтор заблокирован' in text
+            or 'повтор запрещён' in text or 'не повторяйте' in text):
+        return 'write_uncertain'
+    if 'заблокирован' in text or 'запрещ' in text or 'locked' in text:
+        return 'write_blocked'
+    if isinstance(exc, ValueError):
+        return 'local_refusal'
+    return 'crm_error'
+
+
 def _number(value: Any) -> int | float | None:
     if isinstance(value, bool):
         return None
@@ -321,7 +342,9 @@ def _safe_str(name: str, value: Any) -> str | None:
                    'invalid_row', 'rub_invalid', 'rub_prefixed', 'empty_currency_rub', 'mixed_currency',
                    'entity_mismatch', 'invalid_value', 'currency_name', 'payment_type',
                    'lookup_error', 'board_missing', 'status_unverified', 'status_missing', 'ambiguous_status',
-                   'page_error', 'repeated_page', 'row_limit', 'empty_page', 'page_limit'}
+                   'page_error', 'repeated_page', 'row_limit', 'empty_page', 'page_limit',
+                   'write_busy', 'write_uncertain', 'write_batch_preparing', 'write_blocked',
+                   'local_refusal', 'crm_error'}
         return value if value in allowed else 'other'
     if name == 'error_kind':
         return value if value in {'locked', 'timeout', 'ambiguous', 'incomplete', 'mismatch', 'missing', 'network', 'other'} else 'other'

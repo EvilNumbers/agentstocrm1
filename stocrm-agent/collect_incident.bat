@@ -3,6 +3,7 @@ rem ---------------------------------------------------------------
 rem  STOCRM-AGENT: short incident digest (ASCII only)
 rem  Collects only the last 45 minutes of the local journal.
 rem  Optional: collect_incident.bat --offer 1371 --minutes 20
+rem  Already got support_log.txt? collect_incident.bat --file support_log.txt --offer 1371
 rem  Result: incident.txt next to this file - small, send this one.
 rem ---------------------------------------------------------------
 setlocal

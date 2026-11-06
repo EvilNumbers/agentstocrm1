@@ -51,9 +51,14 @@ def journal_files(state: Path) -> list[Path]:
     return legacy + current
 
 
-def read_records(state: Path) -> Iterator[dict[str, Any]]:
-    """Читает журнал построчно и отдаёт уже очищенные записи (как экспорт)."""
-    for path in journal_files(state):
+def read_records(state: Path | None = None, *,
+                 files: list[Path] | None = None) -> Iterator[dict[str, Any]]:
+    """Читает журнал построчно и отдаёт уже очищенные записи (как экспорт).
+
+    `files` — готовый список файлов: так разбирается уже присланный экспорт
+    `support_log.txt`, без переименований и без доступа к папке состояния.
+    """
+    for path in (files if files is not None else journal_files(Path(state))):
         try:
             with path.open('rb') as stream:
                 for raw in stream:
@@ -70,6 +75,23 @@ def read_records(state: Path) -> Iterator[dict[str, Any]]:
             continue
         except OSError:
             continue
+
+
+def records_zone(state: Path | None = None, files: list[Path] | None = None) -> dt.tzinfo | None:
+    """Пояс времени, в котором записан журнал.
+
+    Нужен, когда выжимку собирают по чужому файлу: «15:55» в логе с компьютера
+    означает 15:55 по поясу того компьютера, а не по поясу того, кто читает файл.
+    """
+    for record in read_records(state, files=files):
+        try:
+            moment = dt.datetime.fromisoformat(str(record.get('time')))
+        except (TypeError, ValueError):
+            continue
+        if moment.tzinfo is not None and moment.utcoffset() is not None:
+            return moment.tzinfo
+        return None
+    return None
 
 
 def parse_moment(text: str, now: dt.datetime | None = None) -> dt.datetime:
@@ -116,8 +138,9 @@ def _short(record: dict[str, Any]) -> str:
     moment = _time_of(record)
     stamp = moment.strftime('%d.%m %H:%M:%S') if moment else '??'
     parts = [stamp, str(record.get('event'))]
-    for name in ('tool', 'method', 'status', 'outcome', 'error_class', 'code', 'http_status',
-                 'offer_id', 'step_index', 'failed_index', 'ms'):
+    for name in ('trace_id', 'draft_fingerprint', 'tool', 'method', 'status', 'outcome',
+                 'error_class', 'error_kind', 'reason', 'code', 'http_status', 'offer_id',
+                 'step_index', 'failed_index', 'ms'):
         value = record.get(name)
         if value is None or value == '':
             continue
@@ -125,6 +148,11 @@ def _short(record: dict[str, Any]) -> str:
             parts.append(f'{value}мс')
         elif name == 'offer_id':
             parts.append(f'сделка {value}')
+        elif name == 'trace_id':
+            # По trace_id видно, что два «Применить» — разные попытки.
+            parts.append(f'trace={value}')
+        elif name == 'draft_fingerprint':
+            parts.append(f'draft={value}')
         else:
             parts.append(f'{name}={value}')
     return '  '.join(parts)
@@ -145,10 +173,15 @@ def _mentions_offer(record: dict[str, Any], offer_id: int) -> bool:
     return False
 
 
-def build_digest(state: Path, *, since: dt.datetime, until: dt.datetime,
-                 offer_id: int | None = None) -> tuple[str, dict[str, Any]]:
-    """Текст выжимки и краткая статистика. Только чтение локальных файлов."""
-    records = [record for record in read_records(state)]
+def build_digest(state: Path | None = None, *, since: dt.datetime, until: dt.datetime,
+                 offer_id: int | None = None,
+                 files: list[Path] | None = None) -> tuple[str, dict[str, Any]]:
+    """Текст выжимки и краткая статистика. Только чтение локальных файлов.
+
+    `files` — разбирать конкретные файлы (например, присланный `support_log.txt`)
+    вместо папки состояния.
+    """
+    records = [record for record in read_records(state, files=files)]
     window = [record for record in records
               if (moment := _time_of(record)) is not None and since <= moment <= until]
     errors = [record for record in window if record.get('event') in ERROR_EVENTS]
@@ -168,8 +201,9 @@ def build_digest(state: Path, *, since: dt.datetime, until: dt.datetime,
         add(f'Сделка: №{offer_id}')
     add(f'Прочитано событий: {len(records)}; в окне: {len(window)}; '
         f'ошибок: {len(errors)}; событий записи: {len(writes)}')
-    add('Файлы: ' + (', '.join(path.name for path in journal_files(state) if path.exists())
-                     or 'журнала нет'))
+    names = ([path.name for path in files if path.exists()] if files is not None
+             else [path.name for path in journal_files(Path(state)) if path.exists()])
+    add('Файлы: ' + (', '.join(names) or 'журнала нет'))
     add('Сбор локальный: в CRM ничего не отправлялось, .env и секреты не читались.')
     add('')
 
@@ -224,9 +258,10 @@ def build_digest(state: Path, *, since: dt.datetime, until: dt.datetime,
     return '\n'.join(out), stats
 
 
-def write_digest(state: Path, target: Path, *, since: dt.datetime, until: dt.datetime,
-                 offer_id: int | None = None) -> dict[str, Any]:
-    text, stats = build_digest(state, since=since, until=until, offer_id=offer_id)
+def write_digest(state: Path | None, target: Path, *, since: dt.datetime, until: dt.datetime,
+                 offer_id: int | None = None,
+                 files: list[Path] | None = None) -> dict[str, Any]:
+    text, stats = build_digest(state, since=since, until=until, offer_id=offer_id, files=files)
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_suffix(target.suffix + '.tmp')
@@ -247,9 +282,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--from', dest='since', default='', help='начало окна: 15:55 или 06.11 15:55')
     parser.add_argument('--to', dest='until', default='', help='конец окна (по умолчанию сейчас)')
     parser.add_argument('--offer', dest='offer_id', default='', help='номер сделки')
+    parser.add_argument('--file', dest='file', default='',
+                        help='разобрать готовый экспорт support_log.txt вместо папки .state')
     args = parser.parse_args(argv)
 
-    now = dt.datetime.now().astimezone()
+    files: list[Path] | None = None
+    state: Path | None = Path(args.state)
+    if args.file:
+        source = Path(args.file)
+        if not source.exists():
+            print(f'Файл не найден: {source}. Проверьте путь к support_log.txt.', file=sys.stderr)
+            return 2
+        files, state = [source], None
+    zone = records_zone(state, files)
+    now = dt.datetime.now(zone) if zone is not None else dt.datetime.now().astimezone()
     try:
         until = parse_moment(args.until, now) if args.until else now
         since = (parse_moment(args.since, now) if args.since
@@ -262,8 +308,8 @@ def main(argv: list[str] | None = None) -> int:
         print('Начало окна позже конца: поменяйте --from и --to.', file=sys.stderr)
         return 2
     try:
-        stats = write_digest(Path(args.state), Path(args.out), since=since, until=until,
-                             offer_id=offer_id)
+        stats = write_digest(state, Path(args.out), since=since, until=until,
+                             offer_id=offer_id, files=files)
     except OSError as exc:
         print(f'Не удалось сохранить выжимку: {type(exc).__name__}. Проверьте путь и права.',
               file=sys.stderr)
