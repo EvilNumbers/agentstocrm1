@@ -1741,8 +1741,20 @@ def create_app(bot_settings: BotSettings | None = None, app_config: Config | Non
                 review = await asyncio.to_thread(tools.review_draft, token)
                 lines = ["Проверка CRM (без изменений):"]
                 for item in review["details"]:
-                    lines.append(f"Сделка №{item['offer_id']} · {item['sku']}: {item.get('execution', 'этап неизвестен')}; строк найдено {item['matches']}; " + (f"фактически {item['actual']}" if item['actual'] else "цена/количество не подтверждены"))
-                lines.append("Цена и количество совпадают — можно подтвердить результат." if review["verified"] else "Выполнение не подтверждено. Не повторяйте всё добавление; используйте продолжение только после явного отказа из-за блокировки.")
+                    name = item.get("title") or item.get("sku") or "позиция"
+                    line = (f"Сделка №{item['offer_id']} · {name}: {item.get('execution', 'этап неизвестен')}; "
+                            f"строк найдено {item['matches']}; "
+                            + (f"фактически {item['actual']}" if item["actual"]
+                               else "цена/количество не подтверждены"))
+                    if item.get("requires"):
+                        line += f"; «искомых запчастей»: {item['requires']}"
+                    if item.get("note"):
+                        line += f". {item['note']}"
+                    lines.append(line)
+                lines.append("Данные совпадают — можно подтвердить результат."
+                             if review["verified"] else
+                             "Выполнение не подтверждено. Не повторяйте всё добавление; "
+                             "продолжение доступно только после явного отказа из-за блокировки.")
                 await safe_edit(_cb_msg(callback), "\n".join(lines), reply_markup=drafts_keyboard([{**tools.drafts.get(token), "status": "partial"}]))
             elif action == "rc":
                 await asyncio.to_thread(tools.confirm_draft_result, token)

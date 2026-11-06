@@ -228,24 +228,58 @@ def _note_matches(text: str, needle: str) -> bool:
     return bool(stem) and stem in haystack
 
 
-def _human_write_error(exc: Exception, method: str, tool: str = "") -> str:
+def _lock_holder(exc: Exception) -> str:
+    """« Карточку держит открытой: <сотрудник>.» — если панель назвала виновника."""
+    text = " ".join(clean_html(str(exc)).split())
+    match = re.search(r"заблокирован\w*\s*:?\s*(.*)", text, re.IGNORECASE)
+    who = match.group(1).strip(" .") if match else ""
+    return f" Карточку держит открытой: {who}." if who else ""
+
+
+def _human_write_error(exc: Exception, method: str, tool: str = "", *,
+                       lock_proof: bool | None = None, lock_detail: str = "") -> str:
     """Переводит отказ панели на человеческий язык.
 
     Самая частая причина — «Заблокировано: <сотрудник>»: карточку в STOCRM держит
     открытой другой человек (или ваша же вкладка в браузере), и панель не даёт в неё
     писать. Раньше бот показывал это как «шаг 1 из 2 не выполнен» и навсегда
     блокировал черновик — человек не понимал ни что случилось, ни что делать.
+
+    `lock_proof` говорит, доказано ли чтением CRM, что запрос ничего не изменил:
+    только тогда человеку обещают, что дубликатов не будет. При `False` остаётся
+    ручная проверка (например, `offer/require/add` мог создать «искомую запчасть»).
     """
     text = " ".join(clean_html(str(exc)).split()) or "без пояснений от STOCRM"
     lowered = text.lower()
     if "заблокирован" in lowered or "blocked" in lowered or "locked" in lowered:
-        who = ""
-        match = re.search(r"заблокирован\w*\s*:?\s*(.*)", text, re.IGNORECASE)
-        if match:
-            who = match.group(1).strip(" .")
-        holder = f" Её держит открытой: {who}." if who else ""
+        head = "STOCRM не дал записать: карточка сделки заблокирована." + _lock_holder(exc)
+        detail = " ".join(str(lock_detail or "").split())
+        if detail and detail[-1] not in ".!?":
+            detail += "."
+        if lock_proof is True:
+            return (
+                head + "\n"
+                + ("После отказа я перечитал сделку: " + detail + "\n"
+                   if detail else "После отказа я перечитал сделку: новых строк по этой позиции нет.\n")
+                + "По этим данным эта попытка ничего не изменила: повтор после разблокировки "
+                "не создаст вторую строку от неё.\n"
+                "Что сделать: попросите этого сотрудника закрыть карточку сделки (если это вы — "
+                "закройте её в браузере) и нажмите «Применить» ещё раз. Пока карточка заблокирована, "
+                "повторять бессмысленно: блокировку бот не обходит."
+            )
+        if lock_proof is False:
+            reason = (": " + detail.rstrip(".")) if detail else "."
+            return (
+                head + "\n"
+                "Проверить, что запрос ничего не изменил, не удалось" + reason + "\n"
+                "Первый шаг мог создать «искомую запчасть» (потребность) — это не строка товара, "
+                "и список товаров её не показывает.\n"
+                "Что сделать: откройте сделку в STOCRM → «Товары» и «Искомые запчасти», проверьте "
+                "эту позицию. Если она появилась — повторно не добавляйте; отметьте проверку в /drafts. "
+                "Пока результат не проверен, повтор заблокирован."
+            )
         return (
-            "STOCRM не дал записать: карточка сейчас заблокирована." + holder + "\n"
+            head + "\n"
             "Что сделать: попросите этого сотрудника закрыть карточку сделки (если это вы — "
             "закройте её в браузере) и нажмите «Применить» ещё раз.\n"
             "Ничего не записано, черновик сохранён — дубликатов не будет."
@@ -2476,63 +2510,250 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
             return None
         return DELETE_MANUAL_HINT
 
-    def _find_work(self, check: dict[str, Any]) -> dict[str, Any] | None:
-        """Работа из черновика — в сделке (по WORK_ID, иначе по названию). None — не видно."""
-        offer_id = int(check.get("offer_id") or 0)
-        if not offer_id:
+    #: Допуски сравнения услуги: сумма в рублях, нормо-часы.
+    WORK_SUM_EPS = 0.01
+    WORK_HOURS_EPS = 0.001
+
+    @staticmethod
+    def _work_hours(value: Any) -> float | None:
+        """Нормо-часы из ответа панели; неизвестное значение не угадываем."""
+        if value is None or isinstance(value, bool):
             return None
-        self._invalidate_cache()
         try:
-            works = self.offer_works(offer_id, limit=200)
-        except StocrmError:
+            number = float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
             return None
-        work_id = check.get("work_id")
-        target = None
-        if work_id and not isinstance(work_id, dict):
-            target = next((w for w in works if _same_id(w.get("work_id"), work_id)), None)
-        if target is None and not work_id:
-            title = parts.normalize_text(str(check.get("title") or ""))
-            if title:
-                matches = [w for w in works if parts.normalize_text(str(w.get("title") or "")) == title]
-                target = matches[0] if len(matches) == 1 else None
-        return target
+        return number if math.isfinite(number) else None
 
-    def _verify_work_exists(self, check: dict[str, Any]) -> str | None:
-        if self._find_work(check) is not None:
-            return None
-        return "Не удалось подтвердить появление услуги в STOCRM. Откройте сделку → «Работы» и проверьте результат; повторно не добавляйте до проверки."
+    def _work_snapshot(self, offer_id: int) -> list[dict[str, Any]]:
+        """Снимок работ сделки для сравнения «до/после» — только чтение.
 
-    def _verify_work_sum(self, check: dict[str, Any]) -> str | None:
-        """Одно чтение проверяет и наличие работы, и её сумму."""
-        check.pop("actual_sum", None)
-        check.pop("rounding_note", None)
-        target = self._find_work(check)
-        if target is None:
-            return "Не удалось однозначно проверить услугу в STOCRM. Что сделать: откройте сделку → «Работы» и проверьте наличие и сумму; не добавляйте повторно до проверки."
-        wanted_title = parts.normalize_text(str(check.get("title") or ""))
-        actual_title = parts.normalize_text(str(target.get("title") or ""))
-        if not wanted_title or not actual_title or wanted_title != actual_title:
-            return "Название созданной услуги не подтверждено или отличается от запроса. Проверьте сделку и не повторяйте добавление."
-        wanted = check.get("sum")
-        if wanted is None:
-            return None
-        if target.get("sum") is None:
-            return "STOCRM не вернул сумму услуги. Проверьте сумму в сделке → «Работы»."
-        actual = _money(target.get("sum"))
-        difference = abs(actual - _money(wanted))
-        if difference < 0.01:
-            check["actual_sum"] = actual
-            return None
-        # Небольшая корректировка суммы панелью — не ошибка масштаба «тысяч».
-        if actual > 0 and self.price_rounding_step > 0 and difference < self.price_rounding_step and abs(actual / 5 - round(actual / 5)) < 0.001:
-            check["actual_sum"] = actual
-            check["rounding_note"] = f"Учтено округление панели: запрошено {_thousands(wanted)} ₽, фактически {_thousands(actual)} ₽."
-            return None
+        Номер работы в снимок не входит: код волны 135 ждал WORK_ID из ответа и
+        принимал числовой ответ панели за ошибку. Здесь сравниваются название,
+        сумма и нормо-часы. Ошибку чтения не глотаем: без снимка сравнивать не с чем.
+        """
+        if not offer_id or offer_id <= 0:
+            raise ValueError("Не указан номер сделки для чтения работ")
+        rows = self.offer_works(int(offer_id), limit=200)
+        snapshot: list[dict[str, Any]] = []
+        for row in rows:
+            title = " ".join(str(row.get("title") or "").split())
+            snapshot.append({
+                "title": title,
+                "title_key": parts.normalize_text(title),
+                "sum": _known_work_sum(row.get("sum")),
+                "hours": self._work_hours(row.get("hours")),
+            })
+        return snapshot
+
+    def _work_preflight(self, check: dict[str, Any]) -> list[dict[str, Any]]:
+        """Снимок работ ДО записи. Ошибка чтения останавливает запись.
+
+        Раньше при неудачном чтении после записи бот не мог отличить новую услугу от
+        старой. Если снимок получить нельзя, запись вообще не начинаем: отправлять
+        изменение, которое невозможно проверить, небезопасно.
+        """
+        offer_id = int(check.get("offer_id") or 0)
+        if offer_id <= 0:
+            raise ValueError("В черновике услуги нет номера сделки; запись не начата")
+        try:
+            return self._work_snapshot(offer_id)
+        except (StocrmError, ValueError) as exc:
+            raise ValueError(
+                "Не удалось прочитать работы сделки до записи — сравнивать результат было бы не с чем. "
+                f"Запись не начата, в CRM ничего не отправлено. Причина: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _work_key(row: dict[str, Any]) -> tuple[str, float | None, float | None]:
+        """Ключ сравнения без ID: название + сумма + нормо-часы."""
+        total = row.get("sum")
+        hours = row.get("hours")
         return (
-            f"В сделке у услуги «{check.get('title')}» сумма {_thousands(actual)} ₽, "
-            f"а просили {_thousands(wanted)} ₽ — панель записала по-своему.\n"
-            "Что сделать: откройте сделку → блок «Работы» → в строке услуги поправьте сумму."
+            str(row.get("title_key") or ""),
+            None if total is None else round(float(total), 2),
+            None if hours is None else round(float(hours), 3),
         )
+
+    @staticmethod
+    def _part_row_matches(item: dict[str, Any], row: dict[str, Any]) -> bool:
+        """Строка товара — это та же позиция? Сравнение без ID."""
+        offer = str(item.get("offer_id") or "")
+        row_offer = str(row.get("offer_id") or "")
+        if offer and row_offer and offer != row_offer:
+            return False
+        sku = parts.sku_exact(str(item.get("sku") or ""))
+        if sku:
+            return parts.sku_exact(str(row.get("sku") or "")) == sku
+        name = parts.normalize_text(str(item.get("name") or ""))
+        return bool(name) and parts.normalize_text(str(row.get("name") or "")) == name
+
+    @staticmethod
+    def _require_row_matches(item: dict[str, Any], row: dict[str, Any]) -> bool:
+        """«Искомая запчасть» — это та же позиция? Сравнение без ID."""
+        offer = str(item.get("offer_id") or "")
+        row_offer = str(row.get("offer_id") or "")
+        if offer and row_offer and offer != row_offer:
+            return False
+        sku = parts.sku_exact(str(item.get("sku") or ""))
+        brand = str(item.get("brand") or "")
+        if sku:
+            if parts.sku_exact(str(row.get("sku") or "")) != sku:
+                return False
+            return not brand or parts.brand_match(brand, row.get("brand")) == 100
+        name = parts.normalize_text(str(item.get("name") or ""))
+        return bool(name) and parts.normalize_text(
+            str(row.get("title") or row.get("name") or "")) == name
+
+    def _nothing_written_proof(self, draft: dict[str, Any],
+                               step: dict[str, Any]) -> tuple[bool, str]:
+        """Доказать чтением, что отказ CRM ничего не изменил.
+
+        Нужно потому, что `offer/require/add` мог создать «искомую запчасть» даже
+        тогда, когда товарных строк нет. Тело ответа и HTTP 200 доказательством не
+        считаются: только сравнение с фактическим состоянием сделки.
+        """
+        check = draft.get("check") or {}
+        if check.get("kind") == "added_work":
+            baseline = draft.get("work_baseline")
+            if not isinstance(baseline, list):
+                return False, "снимок работ до записи не сохранился"
+            try:
+                after = self._work_snapshot(int(check.get("offer_id") or 0))
+            except (StocrmError, ValueError) as exc:
+                return False, f"не удалось перечитать работы сделки ({exc})"
+            before_counts: dict[tuple[str, float | None, float | None], int] = {}
+            for row in baseline:
+                key = self._work_key(row)
+                before_counts[key] = before_counts.get(key, 0) + 1
+            after_counts: dict[tuple[str, float | None, float | None], int] = {}
+            for row in after:
+                key = self._work_key(row)
+                after_counts[key] = after_counts.get(key, 0) + 1
+            if after_counts == before_counts:
+                return True, ("работ в сделке не прибавилось; существующие строки не изменились "
+                              "по названию, сумме и нормо-часам")
+            return False, ("работы в сделке изменились — какая строка появилась, "
+                           "доказать нельзя")
+        if draft.get("tool") != "add_offer_part":
+            # Для прочих действий отказ панели не создаёт связанных объектов.
+            return True, ""
+        items = self._checks_of(draft) or [check]
+        labels: list[str] = []
+        try:
+            self._invalidate_cache()
+            for item in items:
+                label = str(item.get("sku") or item.get("name") or "позиции")
+                labels.append(label)
+                offer_id = int(item.get("offer_id") or 0)
+                rows = self.offer_parts(offer_id, limit=200)
+                if any(self._part_row_matches(item, row) for row in rows):
+                    return False, f"в сделке уже есть строка по {label} — её происхождение не доказано"
+                requires = self.offer_requires(offer_id)
+                if any(self._require_row_matches(item, row) for row in requires):
+                    return False, (f"в сделке есть «искомая запчасть» по {label} — возможно, "
+                                   "её создал именно этот запрос")
+        except (StocrmError, ValueError) as exc:
+            return False, f"не удалось перечитать товары и «искомые запчасти» сделки ({exc})"
+        return True, ("новых товарных строк и «искомых запчастей» по "
+                      + ", ".join(labels) + " нет")
+
+    def _verify_added_work(self, check: dict[str, Any],
+                           baseline: Any) -> tuple[str | None, dict[str, Any]]:
+        """Появилась ли НОВАЯ услуга: сравнение снимков работ до и после записи.
+
+        Возвращает (замечание | None, подробности). `None` — появление новой строки
+        доказано, и название/сумма/нормо-часы (насколько они доступны) совпали.
+
+        Гарантий здесь принципиально нет: без ID и при параллельной работе других
+        сотрудников сравнение снимков не доказывает, какая именно операция создала
+        строку. Поэтому совпадение со старой строкой успехом не считается, а
+        неполные данные и неоднозначность оставляют результат на ручную проверку.
+        """
+        offer_id = int(check.get("offer_id") or 0)
+        title_key = parts.normalize_text(str(check.get("title") or ""))
+        details: dict[str, Any] = {"offer_id": offer_id, "title": check.get("title"),
+                                   "verified_by": "снимок работ до и после записи"}
+        if not title_key:
+            return ("В черновике нет названия услуги — подтвердить запись нельзя. "
+                    "Проверьте сделку → «Работы» вручную."), details
+        if not isinstance(baseline, list):
+            return ("Снимок работ до записи не сохранился, сравнивать не с чем. "
+                    "Проверьте сделку → «Работы» вручную; повторно услугу не добавляйте."), details
+        try:
+            self._invalidate_cache()
+            after = self._work_snapshot(offer_id)
+        except (StocrmError, ValueError) as exc:
+            return (f"Услуга могла добавиться, но перечитать работы сделки не удалось ({exc}). "
+                    "Проверьте сделку → «Работы» вручную; повтор блокирован."), details
+
+        before_counts: dict[tuple[str, float | None, float | None], int] = {}
+        for row in baseline:
+            key = self._work_key(row)
+            before_counts[key] = before_counts.get(key, 0) + 1
+        after_counts: dict[tuple[str, float | None, float | None], int] = {}
+        for row in after:
+            key = self._work_key(row)
+            after_counts[key] = after_counts.get(key, 0) + 1
+        added: list[tuple[str, float | None, float | None]] = []
+        for key, count in after_counts.items():
+            extra = count - before_counts.get(key, 0)
+            if extra > 0:
+                added.extend([key] * extra)
+        added_for_title = [key for key in added if key[0] == title_key]
+        details["added_rows"] = len(added)
+        details["added_for_title"] = len(added_for_title)
+
+        if not added_for_title:
+            same_before = any(key[0] == title_key for key in before_counts)
+            if same_before:
+                return ("Такая услуга в сделке уже была до записи, а новой строки не появилось. "
+                        "Совпадение со старой строкой запись не подтверждает. "
+                        "Проверьте сделку → «Работы» вручную; повторно не добавляйте."), details
+            return ("Новой услуги с этим названием в сделке не видно: панель могла записать её "
+                    "иначе или чтение неполное. Проверьте сделку → «Работы» вручную; "
+                    "повторно не добавляйте."), details
+        if len(added) > 1 or len(added_for_title) > 1:
+            return ("После записи в сделке появилось несколько подходящих строк — какая создана "
+                    "этим запросом, доказать нельзя. Проверьте сделку → «Работы» вручную; "
+                    "повторно не добавляйте."), details
+
+        _title, actual_sum, actual_hours = added_for_title[0]
+        details["sum"] = actual_sum
+        details["hours"] = actual_hours
+        wanted_sum = check.get("sum")
+        wanted_hours = self._work_hours(check.get("hours"))
+        problems: list[str] = []
+        if wanted_sum is not None:
+            wanted = _money(wanted_sum)
+            if actual_sum is None:
+                problems.append("STOCRM не вернул сумму услуги — сумму проверить не удалось")
+            else:
+                difference = abs(actual_sum - wanted)
+                if difference >= self.WORK_SUM_EPS:
+                    rounded = (difference < self.price_rounding_step and actual_sum > 0
+                               and self.price_rounding_step > 0
+                               and abs(actual_sum / 5 - round(actual_sum / 5)) < 0.001)
+                    if rounded:
+                        details["rounding_note"] = (
+                            f"Учтено округление панели: запрошено {_thousands(wanted)} ₽, "
+                            f"фактически {_thousands(actual_sum)} ₽.")
+                    else:
+                        problems.append(
+                            f"сумма в CRM {_thousands(actual_sum)} ₽ вместо {_thousands(wanted)} ₽")
+        if wanted_hours is not None:
+            if actual_hours is None:
+                problems.append("STOCRM не вернул нормо-часы услуги — их проверить не удалось")
+            elif abs(actual_hours - wanted_hours) > self.WORK_HOURS_EPS:
+                problems.append(
+                    f"нормо-часы в CRM {actual_hours:g} вместо {wanted_hours:g}")
+        if problems:
+            return (
+                f"Услуга «{check.get('title')}» в сделке появилась, но результат требует проверки: "
+                + ", ".join(problems) + ".\n"
+                "Проверьте строку в сделке → «Работы» и поправьте её в панели; повторно не добавляйте."
+            ), details
+        return None, details
 
     def _capabilities(self) -> dict[str, Any]:
         """Что бот уже выяснил про недокументированные методы (.state/capabilities.json)."""
@@ -2603,6 +2824,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
 
         steps: list[dict[str, Any]] = [{"method": "work/add", "payload": {"DATA": data}}]
         check: dict[str, Any] = {"kind": "added_work", "offer_id": int(offer_id), "title": title,
+                                 "hours": float(hours or 1),
                                  "sum": float(sum_value) if sum_value is not None else (
                                      float(price_of_hour) * float(hours or 1)
                                      if price_of_hour is not None else None)}
@@ -4922,6 +5144,21 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
         # а не вторую запись в CRM.
         draft = self.drafts.claim(token)
         started = time.monotonic()
+        if (draft.get("check") or {}).get("kind") == "added_work":
+            # Снимок работ ДО записи: без него сравнивать «до/после» будет не с чем.
+            # Он сохраняется в .state до сетевого вызова и переживает перезапуск.
+            # Если прочитать не удалось — исключение ниже вернёт черновик в ожидание
+            # ДО отправки: в CRM ничего не уйдёт.
+            try:
+                work_baseline = self._work_preflight(draft.get("check") or {})
+            except BaseException as exc:
+                # Ничего не отправлено: возвращаем черновик в ожидание, а не «применяется».
+                self._release_after_crash(token, [])
+                if isinstance(exc, (StocrmError, ValueError, KeyError, TypeError)):
+                    raise StocrmError(str(exc), method=draft.get("method")) from exc
+                raise
+            draft = self.drafts.mark(token, "applying", work_baseline=work_baseline,
+                                     work_baseline_at=time.time())
         steps: list[dict[str, Any]] = draft.get("steps") or [
             {"method": draft["method"], "payload": draft["payload"]}
         ]
@@ -5058,22 +5295,54 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     raw = saved.get("result")
                     results.extend(raw if isinstance(raw, list) else ([raw] if raw is not None else []))
                     methods.extend(failure.get("methods") or [])
+                if (not recorded and not results and index == 0 and child
+                        and saved.get("status") == "pending"):
+                    # Дочерний черновик вернули в «ожидает подтверждения»: отказ CRM
+                    # доказан, ни одна позиция не записана. Держать всю заявку в
+                    # ручной проверке незачем — после разблокировки её можно применить.
+                    self.drafts.release(token, reason=str(exc))
+                    if child:
+                        # Внутренняя позиция ничего не записала и не показывается в
+                        # /drafts: закрываем её, чтобы не оставлять «висящий» черновик.
+                        self.drafts.mark(child["token"], "discarded",
+                                         reason="отказ CRM, запись не начиналась")
+                    self.audit.write("write.rejected", token=token, tool=draft["tool"],
+                                     method=getattr(exc, "method", None) or steps[0]["method"],
+                                     position_index=index, error=str(exc),
+                                     error_code=getattr(exc, "code", None),
+                                     lock_refused=lock_refusal(exc), nothing_written=True)
+                    if not isinstance(exc, Exception):
+                        raise
+                    raise StocrmError(str(exc),
+                                      method=getattr(exc, "method", None) or steps[0]["method"],
+                                      code=getattr(exc, "code", None)) from exc
                 default_failed_index = len(steps) - 1 if recorded or saved.get("status") == "applied" else min(len(failure.get("methods") or []), len(steps) - 1)
                 failed_index = job["offset"] + int(failure.get("failed_index", default_failed_index))
-                failed = failure.get("failed") or steps[-1]["method"]
+                # Если не отправлено ни одной строки, ошибся ПЕРВЫЙ шаг позиции,
+                # а не последний: иначе отчёт называет метод, который не вызывали.
+                failed = (failure.get("failed") or getattr(exc, "method", None)
+                          or (steps[0] if not failure.get("methods") else steps[-1])["method"])
+                # check_warning дочернего черновика — уже человеческое объяснение
+                # (причина блокировки и что делать); сырой текст CRM — запасной.
+                error_text = str(saved.get("check_warning") or failure.get("error") or exc)
                 self.drafts.mark(token, "partial", failed_at=time.time(), result=list(results),
+                    check_warning=error_text, block_reason=(error_text if lock_refusal(exc) else None),
                     queue_index=index, queue_completed=index,
                     done_steps={"methods": list(methods), "failed": failed,
-                                "failed_index": failed_index, "error": str(failure.get("error") or exc)})
+                                "failed_index": failed_index, "error": error_text,
+                                "error_code": getattr(exc, "code", None)})
                 if child and saved.get("status") not in {"applied", "partial"}:
                     self.drafts.mark(child["token"], "partial", failed_at=time.time())
                 self.audit.write("write.queue.stopped", token=token, position_index=index,
-                                 queue_completed=index, error=type(exc).__name__)
+                                 queue_completed=index, error=type(exc).__name__,
+                                 error_code=getattr(exc, "code", None),
+                                 lock_refused=lock_refusal(exc))
                 if not isinstance(exc, Exception):
                     raise
-                raise StocrmError(f"Позиция {index + 1} из {len(jobs)} ({job['check'].get('sku') or 'запчасть'}) не завершена: {exc}. "
+                raise StocrmError(f"Позиция {index + 1} из {len(jobs)} ({job['check'].get('sku') or 'запчасть'}) не завершена: {error_text} "
                     f"Подтверждено позиций: {index}. Следующие позиции не отправлены. "
-                    "Проверьте CRM через /drafts; повторное применение заявки заблокировано.") from exc
+                    "Проверьте CRM через /drafts; повторное применение заявки заблокировано.",
+                    method=failed, code=getattr(exc, "code", None)) from exc
             if index + 1 < len(jobs) and self.PART_WRITE_INTERVAL > 0:
                 time.sleep(self.PART_WRITE_INTERVAL)
         self.drafts.mark(token, "applied", applied_at=time.time(), result=list(results),
@@ -5403,12 +5672,50 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                 # 429/5xx, обрыв и нечитаемый ответ не доказывают отказ до записи.
                 refused = (isinstance(exc, StocrmError) and isinstance(exc.code, int)
                            and 400 <= exc.code < 500 and exc.code != 429)
+                # «Заблокировано: <сотрудник>» — это отказ CRM, даже если он пришёл
+                # в теле HTTP 200 с CODE 200. Раньше такой ответ считался потерей
+                # ответа, и человек видел «ответ не получен или не подтверждает отказ».
+                lock = (not _is_transport_error(exc)) and lock_refusal(exc)
                 if step.get("optional") and refused:
                     # Только явный отказ допустимо пропустить. После потери ответа
                     # даже необязательный шаг мог выполнить запись: останавливаемся.
                     log.info("необязательный шаг %s отклонён", step["method"])
                     continue
                 nothing_done = not any(d["ok"] for d in done)
+                if nothing_done and lock:
+                    # Блокировку не обходим и повтор не запускаем. Но и утверждать
+                    # «ничего не записано» без чтения нельзя: первый шаг мог создать
+                    # «искомую запчасть». Сначала пробуем это доказать.
+                    proven, proof_detail = self._nothing_written_proof(draft, step)
+                    if proven:
+                        human = _human_write_error(exc, step["method"], draft.get("tool", ""),
+                                                   lock_proof=True, lock_detail=proof_detail)
+                        self.drafts.release(token, reason=human)
+                        self.audit.write(
+                            "write.rejected", tool=draft["tool"], method=step["method"],
+                            payload=payload, error=str(exc), step_index=index, token=token,
+                            error_code=getattr(exc, "code", None), lock_refused=True,
+                            nothing_written=True,
+                        )
+                        raise StocrmError(human, method=step["method"],
+                                          code=getattr(exc, "code", None)) from exc
+                    note = _human_write_error(exc, step["method"], draft.get("tool", ""),
+                                              lock_proof=False, lock_detail=proof_detail)
+                    self.drafts.mark(token, "partial", failed_at=time.time(),
+                                     check_warning=note, result=list(results),
+                                     block_reason=str(exc), lock_refused=True,
+                                     done_steps={"methods": [d["method"] for d in done if d["ok"]],
+                                                 "failed": step["method"], "failed_index": index,
+                                                 "error": str(exc),
+                                                 "error_code": getattr(exc, "code", None)})
+                    self.audit.write(
+                        "write.rejected", tool=draft["tool"], method=step["method"],
+                        payload=payload, error=str(exc), step_index=index, token=token,
+                        error_code=getattr(exc, "code", None), lock_refused=True,
+                        nothing_written=False,
+                    )
+                    raise StocrmError(note, method=step["method"],
+                                      code=getattr(exc, "code", None)) from exc
                 if nothing_done and not refused:
                     note = ("Ответ на запись не получен или не подтверждает отказ. "
                             "Результат неизвестен: проверьте CRM и /drafts. Повтор заблокирован; "
@@ -5416,10 +5723,12 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     self.drafts.mark(token, "partial", failed_at=time.time(), uncertain_network=True,
                                      check_warning=note, result=list(results),
                                      done_steps={"methods": [], "failed": step["method"],
-                                                 "failed_index": index, "error": str(exc)})
+                                                 "failed_index": index, "error": str(exc),
+                                                 "error_code": getattr(exc, "code", None)})
                     self.audit.write("write.uncertain", tool=draft["tool"], method=step["method"],
                                      step_index=index, token=token, error=type(exc).__name__)
-                    raise StocrmError(note, method=step["method"]) from exc
+                    raise StocrmError(note, method=step["method"],
+                                      code=getattr(exc, "code", None)) from exc
                 if nothing_done and refused:
                     # Ни один шаг не выполнился — в STOCRM ничего не изменилось.
                     # Черновик не «сжигаем»: после снятия блокировки человек спокойно
@@ -5428,10 +5737,11 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     self.audit.write(
                         "write.rejected", tool=draft["tool"], method=step["method"],
                         payload=payload, error=str(exc), step_index=index, token=token,
+                        error_code=getattr(exc, "code", None),
                     )
                     raise StocrmError(
                         _human_write_error(exc, step["method"], draft.get("tool", "")),
-                        method=step["method"],
+                        method=step["method"], code=getattr(exc, "code", None),
                     ) from exc
                 # Часть изменений уже применена. Помечаем черновик «partial»,
                 # чтобы повторное нажатие «Применить» не создало дубликаты.
@@ -5451,6 +5761,19 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     f"Уже выполнено: {', '.join(d['method'] for d in done if d['ok'])}. "
                     if any(d["ok"] for d in done) else ""
                 )
+                if lock:
+                    # Блокировка на втором шаге: что-то уже записано, поэтому обещать
+                    # «ничего не изменилось» нельзя. Повтор всей заявки запрещён.
+                    raise StocrmError(
+                        "STOCRM не дал записать: карточка сделки заблокирована на шаге "
+                        f"{index + 1} из {len(steps)}." + _lock_holder(exc) + "\n"
+                        + applied_note +
+                        "Оставшуюся часть автоматически не повторяю, чтобы не создать дубликат. "
+                        "Что сделать: откройте сделку в STOCRM и проверьте уже выполненные шаги; "
+                        "после того как сотрудник закроет карточку, разберитесь с остатком через /drafts. "
+                        "Блокировку бот не обходит.",
+                        method=step["method"], code=getattr(exc, "code", None),
+                    ) from exc
                 raise StocrmError(
                     f"Шаг {index + 1} из {len(steps)} ({step['method']}) {'отклонён' if refused else 'не подтверждён'}: {exc}. "
                     f"{applied_note}Проверьте результат в STOCRM — повторное применение "
@@ -5532,29 +5855,40 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     "warning": problem,
                 }
         if check.get("kind") == "added_work":
-            resolved = _resolve_refs(check, results)
-            created_work_id = result.get("WORK_ID") if isinstance(result, dict) else None
-            if isinstance(created_work_id, bool) or not str(created_work_id or "").isdigit() or int(created_work_id) <= 0:
-                created_work_id = None
-            if created_work_id:
-                resolved["work_id"] = created_work_id
-            if isinstance(result, dict):
-                # чтобы в отчёте были видны сделка, номер работы и сумма, а не только WORK_ID
-                result.setdefault("OFFER_ID", resolved.get("offer_id"))
-                if resolved.get("title"):
-                    result.setdefault("TITLE", resolved["title"])
-            # Сначала сумма: если панель записала другую, человек должен узнать об этом.
-            problem = (self._verify_work_sum(resolved) if created_work_id else
-                       "CRM не вернула номер созданной услуги. Старая строка с тем же названием не подтверждает новую запись; проверьте CRM, повтор заблокирован.")
-            if isinstance(result, dict) and resolved.get("actual_sum") is not None:
-                result["SUM"] = resolved["actual_sum"]
-                if resolved.get("rounding_note"):
-                    result["ROUNDING_NOTE"] = resolved["rounding_note"]
+            # Проверка по ID убрана: панель может ответить просто числом (в отчёте —
+            # 4319), и это ничего не доказывало. Сравниваем работы сделки до и после
+            # записи по названию, сумме и нормо-часам настолько, насколько они
+            # достоверно доступны. Ответ API сохраняем как справку, не как доказательство.
+            problem, details = self._verify_added_work(check, draft.get("work_baseline"))
+            work_result: dict[str, Any] = {
+                "OFFER_ID": check.get("offer_id"),
+                "TITLE": check.get("title"),
+                # Честная оговорка: снимок «до/после» не доказывает авторство строки,
+                # если в сделке параллельно работал другой сотрудник.
+                "VERIFICATION_NOTE": ("Проверка: сравнение работ сделки до и после записи. "
+                                      "При одновременной работе других сотрудников авторство "
+                                      "строки не гарантируется."),
+            }
+            if details.get("sum") is not None:
+                work_result["SUM"] = details["sum"]
+            if details.get("hours") is not None:
+                work_result["WORKING_HOUR"] = details["hours"]
+            if details.get("rounding_note"):
+                work_result["ROUNDING_NOTE"] = details["rounding_note"]
+            if isinstance(result, (str, int, float)) and not isinstance(result, bool):
+                # Число от панели может быть номером работы, но подтверждением не служит.
+                work_result["PANEL_RESPONSE"] = result
+            elif isinstance(result, dict):
+                work_result["PANEL_RESPONSE"] = {
+                    key: result[key] for key in ("WORK_ID", "OFFER_ID") if key in result
+                }
+            result = work_result
             if problem:
                 self.audit.write("write.unexpected", tool=draft["tool"], method=methods[0],
                                  payload=draft["payload"], error=problem, token=token)
                 self.drafts.mark(token, "partial", applied_at=time.time(), result=result,
-                                 uncertain_network=True, check_warning=problem)
+                                 uncertain_network=True, check_warning=problem,
+                                 work_check=details)
                 return {
                     "status": "partial",
                     "verified": False,
@@ -5564,6 +5898,7 @@ class Toolset(BookingMixin, CalendarMixin, DraftRecoveryMixin):
                     "result": result,
                     "warning": problem,
                 }
+            self.drafts.mark(token, "applying", work_check=details)
         if check.get("kind") == "added_lines":
             problem, _details = self._verify_added_lines(list(check.get("items") or []))
             if problem:

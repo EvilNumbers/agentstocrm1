@@ -40,7 +40,10 @@ def test_calendar_from_structured_api_without_model(booking_env, phrase):
     pipe.llm = NoModel()
     calendar_rows(session)
     result = booking_send(pipe, phrase, [])
-    assert 'Календарь' in result.answer and 'запись №3001' in result.answer and 'запись №3002' in result.answer
+    assert 'Календарь' in result.answer
+    # Волна 136: номер календарной записи в обычном просмотре не показывается,
+    # номер сделки сохраняется (он и нужен менеджеру).
+    assert 'запись №3001' not in result.answer and 'запись №3002' not in result.answer
     assert '10:00' in result.answer and 'Андрей' in result.answer
     assert 'Тестовый клиент' in result.answer and 'Тест авто' in result.answer and 'Диагностика' in result.answer
     assert 'phoneNumber' not in result.answer and '00000000000' not in result.answer
@@ -299,7 +302,8 @@ def test_telegram_calendar_is_displayed_not_deal_error(booking_env, monkeypatch,
             'text': 'Покажи календарь на завтра'}}, context={'bot': bot})
         await dp.feed_update(bot, item)
         response = '\n'.join(fake.sent)
-        assert 'запись №3001' in response and 'запись №3002' in response
+        assert 'запись №3001' not in response and 'запись №3002' not in response
+        assert 'сделка №1654' in response
         assert 'список сделок' not in response
         await bot.session.close()
     asyncio.run(run())

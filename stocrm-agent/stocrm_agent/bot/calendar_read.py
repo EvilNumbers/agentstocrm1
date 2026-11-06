@@ -84,8 +84,11 @@ def render(tools: Any, word: str) -> str:
                         continue
                     for row in sorted(entries, key=lambda r: (r.get('start') is None, r.get('start') or 0, r['card_id'])):
                         post = names.get(str(row['post_id'])) or f"пост №{row['post_id']}"
-                        bits = [f"{_clock(row.get('start_local'))} — {_clock(row.get('end_local'))}", post,
-                                f"запись №{row['card_id']}"]
+                        # Номер календарной записи в обычном просмотре не показываем:
+                        # человеку он не нужен для решения. Номер записи остаётся в
+                        # данных и используется для действий, номер СДЕЛКИ сохранён —
+                        # по нему менеджер и открывает карточку.
+                        bits = [f"{_clock(row.get('start_local'))} — {_clock(row.get('end_local'))}", post]
                         if row.get('offer_id'):
                             bits.append(f"сделка №{row['offer_id']}")
                         for field in ('client_name', 'car_title', 'comment'):
