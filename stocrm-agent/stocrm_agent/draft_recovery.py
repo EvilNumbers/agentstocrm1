@@ -17,9 +17,55 @@ def lock_refusal(error: Any) -> bool:
 
 
 class DraftRecoveryMixin:
+    def _review_work_draft(self: Any, draft: dict[str, Any]) -> dict[str, Any]:
+        """Проверка услуги по снимкам работ до и после записи (без повторной записи)."""
+        check = draft.get("check") or {}
+        problem, details = self._verify_added_work(check, draft.get("work_baseline"))
+        verified = problem is None
+        actual = None
+        if details.get("sum") is not None:
+            actual = f"{details['sum']:g} ₽"
+            if details.get("hours") is not None:
+                actual += f" · {details['hours']:g} н/ч"
+        elif details.get("hours") is not None:
+            actual = f"{details['hours']:g} н/ч"
+        return {
+            "verified": verified,
+            "details": [{
+                "offer_id": check.get("offer_id"),
+                "title": check.get("title"),
+                "sku": "",
+                "matches": int(details.get("added_for_title") or 0),
+                "verified": verified,
+                "actual": actual,
+                "execution": "сравнение работ сделки до и после записи",
+                "note": problem or "",
+            }],
+            # Услугу повторно не добавляем никогда: даже подтверждённая проверка
+            # закрывает черновик, а не отправляет второй work/add.
+            "can_resume": False,
+            "problem": problem or "",
+        }
+
+    def _review_offer_requires(self: Any, offer_id: int, cache: dict[int, Any]) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """«Искомые запчасти» сделки для проверки. None — прочитать не удалось."""
+        if offer_id in cache:
+            value = cache[offer_id]
+            return (value, None) if isinstance(value, list) else (None, value)
+        try:
+            rows = self.offer_requires(offer_id)
+        except Exception as exc:  # noqa: BLE001 — чтение не должно ронять проверку
+            message = str(exc) or type(exc).__name__
+            cache[offer_id] = message
+            return None, message
+        cache[offer_id] = rows
+        return rows, None
+
     def review_draft(self: Any, token: str) -> dict[str, Any]:
         draft = self.drafts.get(token)
         check = draft.get("check") or {}
+        if check.get("kind") == "added_work":
+            return self._review_work_draft(draft)
         checks = check.get("items") if check.get("kind") == "added_lines" else [check]
         if not checks or any(
             c.get("kind", "added_line") != "added_line" for c in checks
@@ -29,6 +75,7 @@ class DraftRecoveryMixin:
             )
         self._invalidate_cache()
         by_offer: dict[int, list[dict[str, Any]]] = {}
+        requires_cache: dict[int, Any] = {}
         details = []
         failure = draft.get("done_steps") or {}
         failed_index = failure.get("failed_index")
@@ -133,6 +180,34 @@ class DraftRecoveryMixin:
                         actual = f"{price:g} ₽; количество не подтверждено"
                 except (ValueError, TypeError, KeyError):
                     pass
+            # «Искомая запчасть» (потребность) — отдельный объект: её может не быть в
+            # списке товаров, и тогда ноль строк ничего не доказывает. Свою потребность
+            # считаем только при наличии REQUIRE_ID из ответа шага; иначе её
+            # происхождение неизвестно и автоматическое продолжение запрещено.
+            requires, requires_error = self._review_offer_requires(offer_id, requires_cache)
+            matching_requires = ([row for row in (requires or [])
+                                  if self._require_row_matches(item, row)]
+                                 if requires is not None else [])
+            returned_require = None
+            if isinstance(results, list) and isinstance(span, list) and len(span) == 2 and isinstance(span[0], int) and 0 <= span[0] < len(results):
+                returned_require = _named_value(results[span[0]], "REQUIRE_ID")
+            documented_require = bool(
+                returned_require is not None
+                and any(str(row.get("require_id")) == str(returned_require)
+                        for row in matching_requires)
+            )
+            resume_blocked = bool(matching_requires) and not documented_require
+            require_note = ""
+            if requires_error:
+                resume_blocked = True
+                require_note = ("не удалось прочитать «искомые запчасти» сделки: "
+                                + requires_error)
+            elif matching_requires and not documented_require:
+                require_note = ("в сделке есть «искомая запчасть» по этому артикулу, но ответ "
+                                "шага не подтверждает, что её создал бот; продолжение "
+                                "автоматически не готовится")
+            elif documented_require:
+                require_note = "«искомая запчасть» подтверждена ответом шага CRM"
             details.append(
                 {
                     "offer_id": offer_id,
@@ -141,12 +216,17 @@ class DraftRecoveryMixin:
                     "verified": verified,
                     "actual": actual,
                     "execution": execution,
+                    "requires": len(matching_requires),
+                    "require_documented": documented_require,
+                    "resume_blocked": resume_blocked,
+                    "note": require_note,
                 }
             )
         return {
             "verified": all(d["verified"] for d in details),
             "details": details,
-            "can_resume": all(d["matches"] == 0 for d in details),
+            "can_resume": all(d["matches"] == 0 and not d.get("resume_blocked")
+                              for d in details),
         }
 
     def confirm_draft_result(self: Any, token: str) -> dict[str, Any]:

@@ -102,6 +102,28 @@ def _is_empty_answer(message: str) -> bool:
     return any(word in low for word in _EMPTY_ANSWERS)
 
 
+#: Ответ панели «карточку держит другой сотрудник». Это отказ CRM, а не потеря
+#: ответа: панель отвечает HTTP 200, а в MESSAGE пишет «Заблокировано: <имя>».
+_LOCK_MESSAGE_RE = re.compile(
+    r"(?<!\bне\s)заблокирован|(?<!\bне\s)блокировк|(?<!\bnot\s)\bblocked\b|(?<!\bnot\s)\blocked\b",
+    re.IGNORECASE,
+)
+
+#: Код-маркер для такого отказа. 423 — «Locked»: он попадает в диапазон явных
+#: отказов 4xx, поэтому код волны 135 не спутает его с обрывом связи.
+LOCK_REFUSAL_CODE = 423
+
+
+def lock_message(message: Any) -> bool:
+    """CRM сообщила, что карточку держит другой сотрудник?"""
+    return bool(_LOCK_MESSAGE_RE.search(" ".join(str(message or "").split())))
+
+
+def _empty_response(value: Any) -> bool:
+    """Ответ не содержит объектов: null/false/пустой список/объект."""
+    return value is None or value is False or value == {} or value == [] or value == ""
+
+
 _DIAGNOSTIC_FIELDS = frozenset({
     "REQUIRE_ID", "OFFER_ID", "DATA", "STOCK", "STOCK_TYPE", "WAREHOUSE_ID",
     "SUPPLIER_ID", "AMOUNT", "CURRENT_VOLUME", "MIN_VOLUME", "SOLID", "SKU",
@@ -336,16 +358,28 @@ class StocrmClient:
         if not isinstance(raw, dict):
             return raw
         code = raw.get("CODE")
+        response = raw.get("RESPONSE")
+        message = str(raw.get("MESSAGE") or "")
+        lock_refused = lock_message(message) and _empty_response(response)
+
+        def refused() -> StocrmError:
+            return StocrmError(message or "CRM заблокировала изменение карточки",
+                               code=LOCK_REFUSAL_CODE, method=method)
+
         if code is None:
-            # Часть методов отдаёт голый {"RESPONSE": ...}
+            # Часть методов отдаёт голый {"RESPONSE": ...}. Но «Заблокировано» с пустым
+            # ответом — это отказ, а не успех: раньше такое тело считалось записью.
+            if lock_refused:
+                raise refused()
             return raw.get("RESPONSE", raw)
         try:
             code_int = int(str(code).strip())
         except (TypeError, ValueError):
             # CODE бывает строкой («200», «ok»): не роняем бота трейсбеком
+            if lock_refused:
+                raise refused()
             return raw.get("RESPONSE", raw)
         if code_int != 200:
-            message = str(raw.get("MESSAGE") or "неизвестная ошибка API")
             if tolerate_empty and method == "contacts/get_from_filter" and code_int not in (401, 403, 429) and not 500 <= code_int <= 599 and message.lower().strip(" .!") == "контакты по запрашиваемым критериям не найдены":
                 return []
             if tolerate_empty and code_int not in (401, 403, 429) and not 500 <= code_int <= 599 and _is_empty_answer(message):
@@ -354,6 +388,10 @@ class StocrmClient:
                 # успех нельзя — иначе человеку скажут «готово», а в сделке пусто.
                 return []
             raise StocrmError(message, code=code_int, method=method)
+        if lock_refused:
+            # HTTP 200 и CODE 200 не отменяют отказа панели: карточка заблокирована,
+            # объектов в ответе нет. Молча вернуть None значило бы соврать об успехе.
+            raise refused()
         return raw.get("RESPONSE")
 
     def _diagnostic_emit(self, event: str, **fields: Any) -> None:

@@ -44,8 +44,10 @@ def test_uncertain_work_is_never_automatically_repeated(env, monkeypatch, err):
     # Второй черновик может быть подготовлен заранее; он тоже должен заблокироваться.
     second = work(tools, 'Другой текст')
     calls = []
+    calls_at_write = []
     def send(step, payload, results):
         calls.append(step['method'])
+        calls_at_write.append(len(session.calls))
         raise err
     monkeypatch.setattr(tools, '_call_step', send)
     with pytest.raises(StocrmError, match='Результат неизвестен'):
@@ -59,7 +61,9 @@ def test_uncertain_work_is_never_automatically_repeated(env, monkeypatch, err):
     with pytest.raises(ValueError, match='результат неизвестен'):
         work(tools, 'Замена свечей', price=5000)
     assert calls == ['work/add']
-    assert not any(c['method'] == 'work/get_filtered' for c in session.calls)
+    # Снимок работ читается ДО записи (нужен для сравнения «до/после»), но после
+    # неудачной записи нет ни подтверждающего чтения, ни повтора.
+    assert calls_at_write and len(session.calls) == calls_at_write[0]
 
 
 def test_post_lost_after_server_write_is_not_mistaken_for_old_work(env, monkeypatch):
@@ -206,23 +210,33 @@ def test_failed_card_does_not_restart_via_model(env, monkeypatch):
 
 
 def test_success_response_without_id_cannot_confirm_old_service(env, monkeypatch):
+    """Ответ без номера и та же строка до/после записи — успех не подтверждается."""
     _, tools, _ = env
     draft = work(tools)
     monkeypatch.setattr(tools, '_call_step', lambda *a: {'ok': True})
     monkeypatch.setattr(tools, 'offer_works', lambda *a, **kw: [{'title':'Замена свечей', 'sum':4000}])
     result = tools.apply_draft(draft['token'])
     assert result['status'] == 'partial' and result['verified'] is False
-    assert 'не вернула номер' in result['warning']
+    assert 'уже была до записи' in result['warning']
     with pytest.raises(ValueError): work(tools)
 
 
 def test_existing_success_with_failed_readback_blocks_work_until_review(env, monkeypatch):
+    """Снимок до записи удался, после записи чтение упало — ручная проверка, без повтора."""
     _, tools, _ = env
     draft = work(tools)
     monkeypatch.setattr(tools, '_call_step', lambda *a: {'WORK_ID': 12345})
-    monkeypatch.setattr(tools, 'offer_works', lambda *a, **kw: (_ for _ in ()).throw(StocrmError('network down')))
+    calls = []
+    def works(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            return []                      # снимок ДО записи: работ ещё нет
+        raise StocrmError('network down')  # проверку после записи сделать нельзя
+    monkeypatch.setattr(tools, 'offer_works', works)
     result = tools.apply_draft(draft['token'])
     assert result['status'] == 'partial' and result['verified'] is False
+    assert 'перечитать работы' in result['warning']
+    assert len(calls) == 2                 # ровно один снимок + одна неудачная проверка
     with pytest.raises(ValueError): work(tools)
     tools.drafts.resolve_uncertain_manually(draft['token'], user_id=1)
     assert work(tools)['status'] == 'pending'
@@ -260,7 +274,8 @@ def test_work_name_mismatch_does_not_count_as_verified(env, monkeypatch):
     monkeypatch.setattr(tools, '_call_step', lambda *a: {'WORK_ID': 777})
     monkeypatch.setattr(tools, 'offer_works', lambda *a, **kw: [{'work_id':777, 'title':'Другая услуга', 'sum':4000}])
     result = tools.apply_draft(draft['token'])
-    assert result['status'] == 'partial' and not result['verified'] and 'Название' in result['warning']
+    assert result['status'] == 'partial' and not result['verified']
+    assert 'не видно' in result['warning']
 
 
 def test_uncertain_events_visible_in_safe_diagnostics(tmp_path):

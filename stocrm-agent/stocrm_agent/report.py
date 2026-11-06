@@ -188,6 +188,11 @@ def format_apply_result(method: str, result: Any, *, summary: str = "", warning:
     if supplier:
         lines.append(f"• поставщик: {supplier}")
 
+    verification = next((it.get("VERIFICATION_NOTE") for it in items
+                         if it.get("VERIFICATION_NOTE")), None)
+    if verification:
+        lines.append(str(verification))
+
     if method in ("booking", "existing_booking", "quick_deal"):
         if warning and not any(it.get("CONTACT_ID") or it.get("OFFER_ID") or it.get("CARD_ID") for it in items):
             lines.append("Номера созданных объектов неизвестны — проверьте панель перед повтором.")
